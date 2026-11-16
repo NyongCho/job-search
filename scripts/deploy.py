@@ -166,6 +166,8 @@ def activate(root, release, config):
             hermes('pause', config, reason)
         service('stop', 'job-availability.timer')
         wait_idle(config)
+        if fetch_main(root, config)[1] != (release / '.revision').read_text().strip():
+            raise RuntimeError('Main changed while waiting; deploy the newer workflow run')
         transaction['web_stopped'] = True
         write_json(journal, transaction)
         service('stop', 'job-dashboard.service')
@@ -187,8 +189,8 @@ def activate(root, release, config):
         raise
     finally:
         # If restoring schedules fails or the process is killed, retain the journal for recovery.
-        restore_schedules(transaction, config)
         if clear_journal:
+            restore_schedules(transaction, config)
             journal.unlink()
 
 
@@ -198,6 +200,10 @@ def recover(root, config):
     previous = Path(transaction['previous']).resolve(strict=True)
     if previous.parent != (root / 'releases').resolve():
         raise RuntimeError('Recovery release must belong to this installation')
+    if transaction['resume_job'] and hermes('get', config, transaction['reason'])['enabled']:
+        hermes('pause', config, transaction['reason'])
+    service('stop', 'job-availability.timer')
+    wait_idle(config)
     if transaction['web_stopped']:
         switch(root, previous)
         service('restart', 'job-dashboard.service')

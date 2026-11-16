@@ -21,6 +21,10 @@ class DeploymentTests(unittest.TestCase):
         self.new = self.root / 'releases/new'
         self.old.mkdir(parents=True)
         self.new.mkdir()
+        (self.new / '.revision').write_text('a' * 40 + '\n')
+        fetch = patch.object(deploy, 'fetch_main', return_value=(None, 'a' * 40))
+        self.fetch = fetch.start()
+        self.addCleanup(fetch.stop)
         (self.root / 'current').symlink_to(self.old)
         self.config = {'hermes_home': str(self.root / 'hermes'), 'job_id': 'test',
                        'base_url': 'https://jobs.example.ts.net'}
@@ -122,6 +126,39 @@ class DeploymentTests(unittest.TestCase):
                 deploy.activate(self.root, self.new, self.config)
         journal = json.loads((self.root / '.deploy/transaction.json').read_text())
         self.assertEqual(journal['previous'], str(self.old))
+
+    def test_main_advancing_during_idle_wait_never_stops_web_or_switches(self):
+        def finish_wait(config):
+            self.fetch.return_value = (None, 'b' * 40)
+        with patch.object(deploy, 'hermes', return_value={'enabled': True}) as control, \
+             patch.object(deploy, 'service', return_value='active') as services, \
+             patch.object(deploy, 'wait_idle', side_effect=finish_wait):
+            with self.assertRaisesRegex(RuntimeError, 'Main changed'):
+                deploy.activate(self.root, self.new, self.config)
+        self.assertEqual((self.root / 'current').resolve(), self.old)
+        self.assertNotIn(('stop', 'job-dashboard.service'), [c.args for c in services.call_args_list])
+        self.assertEqual(control.call_args_list[-1].args[0], 'resume')
+
+    def test_failed_rollback_keeps_writers_paused_and_recovery_journal(self):
+        with patch.object(deploy, 'hermes', return_value={'enabled': True}) as control, \
+             patch.object(deploy, 'service', return_value='active') as services, \
+             patch.object(deploy, 'wait_idle'), patch.object(deploy, 'healthy', return_value=False):
+            with self.assertRaisesRegex(RuntimeError, 'Rollback health failed'):
+                deploy.activate(self.root, self.new, self.config)
+        self.assertNotIn('resume', [c.args[0] for c in control.call_args_list])
+        self.assertNotIn(('start', 'job-availability.timer'), [c.args for c in services.call_args_list])
+        self.assertTrue((self.root / '.deploy/transaction.json').exists())
+
+    def test_recovery_waits_for_workers_after_partial_schedule_restore(self):
+        journal = self.root / '.deploy/transaction.json'
+        journal.write_text(json.dumps({'previous': str(self.old), 'resume_job': True,
+                                      'reason': 'test', 'restart_timer': True, 'web_stopped': True}))
+        with patch.object(deploy, 'hermes', return_value={'enabled': True}), \
+             patch.object(deploy, 'service'), \
+             patch.object(deploy, 'wait_idle', side_effect=TimeoutError('busy')):
+            with self.assertRaises(TimeoutError):
+                deploy.recover(self.root, self.config)
+        self.assertTrue(journal.exists())
 
 
 if __name__ == '__main__':
