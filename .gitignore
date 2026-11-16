@@ -8,6 +8,7 @@
 /PROJECT_INDEX.txt
 /deployment.json
 /hermes_job_prompt.txt
+/company_research.json
 **/instance.json
 *.sqlite
 *.sqlite-*

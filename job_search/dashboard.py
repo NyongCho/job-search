@@ -12,6 +12,7 @@ from flask import Flask, abort, jsonify, render_template, request, session, url_
 from werkzeug.exceptions import HTTPException, SecurityError
 
 from . import dashboard_store as store
+from .company_research import load_research, lookup_research
 
 ROOT = Path(__file__).resolve().parents[1]
 VIEW_LABELS = {"recommended": "추천", "interested": "관심", "preparing": "지원 준비",
@@ -32,6 +33,7 @@ def _environment():
         "ALLOWED_LOGIN": os.environ.get("DASHBOARD_ALLOWED_LOGIN", ""),
         "SECRET_KEY": os.environ.get("DASHBOARD_SECRET_KEY", ""),
         "DEV_MODE": dev in {"1", "true"},
+        "COMPANY_RESEARCH": Path(os.environ.get("COMPANY_RESEARCH", ROOT / "company_research.json")),
     }
 
 
@@ -39,6 +41,7 @@ def create_app(config=None):
     app = Flask(__name__)
     app.config.update(_environment())
     app.config.update(config or {})
+    research = load_research(app.config["COMPANY_RESEARCH"])
     base = app.config["BASE_URL"]
     if not store.safe_url(base):
         raise ValueError("A valid dashboard base URL is required")
@@ -107,6 +110,10 @@ def create_app(config=None):
         detail = store.get_job(source, state, post_id) if post_id is not None else None
         if post_id is not None and detail is None:
             abort(404)
+        for item in listing["items"]:
+            item["company_review"] = lookup_research(research, item["company"])
+        if detail is not None:
+            detail["company_review"] = lookup_research(research, detail["company"])
         session.setdefault("csrf_token", secrets.token_urlsafe(32))
         return render_template("dashboard.html", listing=listing, detail=detail, view=view, q=q,
                                views=VIEW_LABELS, statuses=STATUS_LABELS, decisions=DECISION_LABELS,
