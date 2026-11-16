@@ -7,10 +7,10 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-import collect_jobs
-import dashboard_store as store
-import import_profile_applications as importer
-from test_collect_jobs import posting
+from job_search import collect_jobs
+from job_search import dashboard_store as store
+from job_search import import_profile_applications as importer
+from tests.test_collect_jobs import posting
 
 
 class ApplicationTests(unittest.TestCase):
@@ -118,7 +118,7 @@ class ApplicationTests(unittest.TestCase):
 
     def test_cli_dry_run_does_not_create_state(self):
         state = self.root / 'not-created.sqlite'
-        result = subprocess.run([sys.executable, str(Path(importer.__file__)), '--profile-root',str(self.profile),
+        result = subprocess.run([sys.executable, "-m", "job_search.import_profile_applications", '--profile-root',str(self.profile),
             '--jobs-db',str(self.source),'--state-db',str(state),'--confirmed-on','2026-11-16'], capture_output=True,text=True,check=True)
         report = json.loads(result.stdout)
         self.assertEqual(report['count'], 1)

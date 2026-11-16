@@ -13,14 +13,14 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from prototype_job_evidence import Document, application_link
+from .evidence import Document, application_link
 
 API = "https://inthiswork.com/wp-json/wp/v2/posts"
 FIELDS = "id,date_gmt,modified_gmt,link,title,content,categories"
 JOB_CATEGORIES = {191700167, 191700168}
 CLOSED = 191700169
 KST = timezone(timedelta(hours=9))
-DEFAULT_DB = Path(__file__).resolve().parent / "data/jobs.sqlite"
+DEFAULT_DB = Path(__file__).resolve().parents[1] / "data/jobs.sqlite"
 
 
 def connect(path):

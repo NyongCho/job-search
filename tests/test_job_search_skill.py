@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-SKILL = Path(__file__).resolve().parent / "skills/job-search-pipeline"
+SKILL = Path(__file__).resolve().parents[1] / "skills/job-search-pipeline"
 
 
 class PortableSkillTests(unittest.TestCase):

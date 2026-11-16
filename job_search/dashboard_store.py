@@ -8,7 +8,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from job_availability import availability
+from .job_availability import availability
 
 STATUSES = {"unmarked", "interested", "preparing", "applied", "archived"}
 VIEWS = ("recommended", "interested", "preparing", "applied", "archived", "needs_review", "expired")

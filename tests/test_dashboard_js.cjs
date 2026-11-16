@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const test = require('node:test');
+const path = require('node:path');
 
 test('saving one stage retains sibling unsaved notes and updates its badge', async () => {
   const classList = { add() {}, remove() {} };
@@ -26,7 +27,7 @@ test('saving one stage retains sibling unsaved notes and updates its badge', asy
   const preview = {textContent:''};
   let reloads = 0;
   const writes = [];
-  vm.runInNewContext(fs.readFileSync('static/dashboard.js','utf8'), {
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../job_search/static/dashboard.js'),'utf8'), {
     document: {querySelector(selector) {return {'#job-detail':detail,'#save-status':message,
       'meta[name="csrf-token"]':{content:'csrf'}, '.job-row.selected .progress-preview':preview}[selector] || null;}},
     sessionStorage: {getItem(){return null;}, setItem(){}, removeItem(){}},

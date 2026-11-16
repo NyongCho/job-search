@@ -11,9 +11,9 @@ from urllib.parse import urlsplit
 from flask import Flask, abort, jsonify, render_template, request, session, url_for
 from werkzeug.exceptions import HTTPException, SecurityError
 
-import dashboard_store as store
+from . import dashboard_store as store
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 VIEW_LABELS = {"recommended": "추천", "interested": "관심", "preparing": "지원 준비",
                "applied": "지원 현황", "archived": "보관", "needs_review": "확인 필요", "expired": "만료"}
 STATUS_LABELS = {"unmarked": "미지정", "interested": "관심", "preparing": "지원 준비",

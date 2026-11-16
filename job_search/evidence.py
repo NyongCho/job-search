@@ -1,4 +1,4 @@
-"""공고 한 건의 JD 수집 가능성 검증: python3 prototype_job_evidence.py 419129
+"""공고 한 건의 JD 수집 가능성 검증: python3 -m job_search.evidence 419129
 
 검증용 코드. 저장된 본문은 적합성 판단의 자료이며 자동 추천 결과가 아니다.
 """
@@ -130,7 +130,7 @@ def main():
         "fetch_errors": fetch_errors,
         "scope": "JD와 출처 수집 가능성 검증. 개인 적합도 판단은 수행하지 않음.",
     }
-    output = Path(__file__).resolve().parent / "evidence" / str(args.post_id)
+    output = Path(__file__).resolve().parents[1] / "evidence" / str(args.post_id)
     output.mkdir(parents=True, exist_ok=True)
     (output / "sources.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
     for source in sources:

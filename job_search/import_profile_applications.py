@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from urllib.parse import quote
 
-import dashboard_store as store
+from . import dashboard_store as store
 
 
 def read_records(profile_root, repository_url, confirmed_on):

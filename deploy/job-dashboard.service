@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 WorkingDirectory=%h/job_search
 EnvironmentFile=%h/.config/job-dashboard/environment
-ExecStart=%h/job_search/.venv-dashboard/bin/waitress-serve --host=127.0.0.1 --port=8765 --call dashboard:create_production_app
+ExecStart=%h/job_search/.venv-dashboard/bin/waitress-serve --host=127.0.0.1 --port=8765 --call job_search.dashboard:create_production_app
 Restart=on-failure
 RestartSec=5
 UMask=0077

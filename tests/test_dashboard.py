@@ -8,9 +8,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-import collect_jobs
-import dashboard
-from test_collect_jobs import posting
+from job_search import collect_jobs
+from job_search import dashboard
+from tests.test_collect_jobs import posting
 
 
 class WebTests(unittest.TestCase):
@@ -150,7 +150,7 @@ class WebTests(unittest.TestCase):
         self.assertFalse(self.post("/jobs/1/seen", {"reviewed_at": "2026-11-15T00:00:00Z"}, token).json["recorded"])
 
     def test_reading_text_contrast(self):
-        css = (Path(__file__).parent / "static/dashboard.css").read_text()
+        css = (Path(dashboard.__file__).parent / "static/dashboard.css").read_text()
 
         def color(selector, property_name):
             block = re.search(re.escape(selector) + r"\s*\{([^}]+)\}", css).group(1)

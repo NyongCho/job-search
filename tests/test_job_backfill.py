@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import run_job_backfill as backfill
+from job_search import run_job_backfill as backfill
 
 
 class ExecutionResultTests(unittest.TestCase):

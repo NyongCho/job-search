@@ -9,9 +9,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import collect_jobs
+from . import collect_jobs
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 def configured_job_id():
     job_id = json.loads((ROOT / "deployment.json").read_text()).get("job_id")

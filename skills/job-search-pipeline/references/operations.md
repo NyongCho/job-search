@@ -2,6 +2,8 @@
 
 대상 앱의 `deployment.json`과 실제 Hermes cron 설정을 먼저 읽는다. 오래된 `validation`/`next_run_verified` 값은 과거 검증 기록이다. 현재 실행 상태를 대신하지 않는다. 구버전 앱은 `prepare-backfill` 명령이나 설정 가능한 경로가 없을 수 있으므로 `--help`와 파일 내용을 확인한다.
 
+앱에 `job_search/collect_jobs.py`가 있으면 패키지 구조다. 아래의 `python3 collect_jobs.py ...`는 프로젝트 루트에서 `python3 -m job_search.collect_jobs ...`로 실행하고, 기간 드라이버는 `python3 -m job_search.run_job_backfill`을 사용한다. 프리런 원본은 `scripts/hermes_collect.py`다. 이 스킬의 준비 도구가 만든 독립 수집 폴더는 기존 단일 파일 명령을 그대로 쓴다. 두 구조의 코드를 섞어 복사하지 않는다.
+
 ## 단일 실행
 
 - 수집만 요청하면 앱에서 `python3 collect_jobs.py collect`를 실행한다. 이 명령은 Hermes 검토나 Slack 전달을 하지 않는다.

@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import collect_jobs as jobs
+from job_search import collect_jobs as jobs
 
 
 def posting(post_id=1, content=None, categories=None):

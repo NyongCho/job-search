@@ -8,9 +8,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-import collect_jobs
-import dashboard_store as store
-from test_collect_jobs import posting
+from job_search import collect_jobs
+from job_search import dashboard_store as store
+from tests.test_collect_jobs import posting
 
 
 class StoreTests(unittest.TestCase):

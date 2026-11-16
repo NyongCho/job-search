@@ -24,7 +24,7 @@ def public_dashboard_url(value):
 def main():
     root = Path.home() / "job_search"
     sys.path.insert(0, str(root))
-    from collect_jobs import reconcile_outbox
+    from job_search.collect_jobs import reconcile_outbox
 
     config = json.loads((root / "deployment.json").read_text())
     job_id = config["job_id"]
@@ -42,7 +42,7 @@ def main():
     if dashboard_url:
         payload["dashboard_url"] = dashboard_url
     if not retry:
-        result = subprocess.run(["/usr/bin/python3", str(root / "collect_jobs.py"), "collect"],
+        result = subprocess.run(["/usr/bin/python3", "-m", "job_search.collect_jobs", "collect"],
                                 cwd=root, capture_output=True, text=True, timeout=240, check=True)
         payload.update(json.loads(result.stdout))
     print(json.dumps(payload, ensure_ascii=False))

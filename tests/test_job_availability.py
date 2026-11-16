@@ -6,11 +6,11 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-import collect_jobs
-import dashboard_store as store
-from job_availability import availability, inspect_document
-from refresh_job_availability import refresh
-from test_collect_jobs import posting
+from job_search import collect_jobs
+from job_search import dashboard_store as store
+from job_search.job_availability import availability, inspect_document
+from job_search.refresh_job_availability import refresh
+from tests.test_collect_jobs import posting
 
 
 def document(*lines, published="2026-11-01T02:15:44"):

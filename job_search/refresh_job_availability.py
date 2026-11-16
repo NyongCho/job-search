@@ -7,11 +7,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
-from collect_jobs import API, FIELDS, extract, request_json
-from dashboard_store import init_state_db
-from job_availability import availability, inspect_document
+from .collect_jobs import API, FIELDS, extract, request_json
+from .dashboard_store import init_state_db
+from .job_availability import availability, inspect_document
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def refresh(jobs_db, state_db, fetch_page=request_json, now=None):

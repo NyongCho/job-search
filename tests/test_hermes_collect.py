@@ -1,15 +1,19 @@
 import contextlib
 import io
 import json
+import os
+import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import collect_jobs
-import hermes_collect
+from job_search import collect_jobs
+from scripts import hermes_collect
 
 
 class HermesDashboardTests(unittest.TestCase):
@@ -62,6 +66,20 @@ class HermesDashboardTests(unittest.TestCase):
         self.assertNotIn("dashboard_url", payload)
         self.assertEqual(payload["retry_digests"], [original])
         self.assertEqual(calls, 0)
+
+    def test_installed_launcher_finds_package_from_another_directory(self):
+        shutil.copytree(Path(collect_jobs.__file__).parent, self.root / 'job_search',
+                        ignore=shutil.ignore_patterns('__pycache__'))
+        (self.root / 'deployment.json').write_text(json.dumps({'job_id': 'fixture-job'}))
+        with sqlite3.connect(self.root / 'data/jobs.sqlite') as db:
+            db.execute('INSERT INTO outbox VALUES(?,?,?,0)', ('prior', 'saved digest', '["prior"]'))
+        installed = self.home / '.hermes/scripts/collect.py'
+        installed.parent.mkdir()
+        shutil.copyfile(hermes_collect.__file__, installed)
+        result = subprocess.run([sys.executable, str(installed)], cwd=self.home,
+            env={**os.environ, 'HOME': str(self.home), 'PYTHONPATH': ''}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['retry_digests'], ['saved digest'])
 
 
 if __name__ == "__main__":
