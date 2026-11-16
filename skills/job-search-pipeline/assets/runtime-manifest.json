@@ -1,0 +1,9 @@
+{
+  "collect_jobs.py": "095bb5d5118a7e2a3ea86c7ebb36925861dbe87441162ac15ed93097c8871f79",
+  "hermes_collect.py.tpl": "07e1bf99b6e6c51b1409d41fda144f5d6d34a932253e4f99ad3c94c3805d7283",
+  "hermes_job_prompt.txt.tpl": "19948a2ee6026d7c40ee05a03fff46f2badfd5133ff2932ebd66a9983753a459",
+  "prototype_job_evidence.py": "a49596af7db36083493f221515b0caccd47bba94e024322a6256381f1aa13ae3",
+  "run_job_backfill.py": "6072c8f9231269613b85f025f642641ccbdd1161bfaa8edd7b27d741af037b65",
+  "test_collect_jobs.py": "2a771d0779223d1c83e467df760ec75cac3828926b4a5d00a90002206e8139ac",
+  "test_job_backfill.py": "9f63e42427005dc07943638202194d94fa51bc3f5354392a0cad6ac9a94f7253"
+}

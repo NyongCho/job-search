@@ -1,0 +1,4 @@
+interface:
+  display_name: "Job Search Pipeline"
+  short_description: "채용 공고 수집·JD 검토·Hermes와 Slack 추천 파이프라인"
+  default_prompt: "$job-search-pipeline으로 현재 채용 파이프라인의 상태와 미전달 추천을 확인해줘."

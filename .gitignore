@@ -1,0 +1,47 @@
+# Local runtime data and personal career records
+/data/
+/evidence/
+/comparison/
+/research/
+/job_postings*.txt
+/JOB_*_USAGE.txt
+/PROJECT_INDEX.txt
+/deployment.json
+/hermes_job_prompt.txt
+**/instance.json
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.jsonl
+
+# Internal plans can include personal profile and deployment details
+/docs/superpowers/
+/.superpowers/
+
+# Credentials and machine-specific settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+token*.json
+
+# Generated files and development environments
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+/dist/
+/build/
+*.egg-info/
+*.log
+.DS_Store
+.idea/
+.vscode/

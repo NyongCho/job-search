@@ -1,0 +1,10 @@
+[Unit]
+Description=Check job closures twice daily
+
+[Timer]
+OnCalendar=*-*-* 09,18:10:00 Asia/Seoul
+Persistent=true
+Unit=job-availability.service
+
+[Install]
+WantedBy=timers.target

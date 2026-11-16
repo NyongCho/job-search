@@ -1,0 +1,7 @@
+{
+  "job_id": "replace-with-your-hermes-job-id",
+  "slack_channel_id": "replace-with-your-slack-channel-id",
+  "schedule": "0 9,18 * * *",
+  "timezone": "Asia/Seoul",
+  "dashboard_url": "https://your-device.your-tailnet.ts.net"
+}
