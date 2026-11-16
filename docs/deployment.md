@@ -37,7 +37,13 @@
 
 1. GitHub에 `production` Environment를 만들고 배포 가능한 브랜치를 `main`으로 제한합니다.
 2. Tailscale에서 `tag:job-search-ci`를 만들고 해당 태그가 배포 서버의 TCP 22에 접근하도록 허용합니다. 기존 `* → *` 허용 규칙이 있으면 좁은 규칙을 추가하는 것만으로 접근이 제한되지는 않습니다. 다른 장치의 기존 접근을 보존하면서 CI 태그의 접근 범위를 점검합니다.
-3. [Tailscale OIDC 설정](https://tailscale.com/docs/features/workload-identity-federation)에서 GitHub 발급자를 선택합니다. Subject는 `repo:YOUR_ACCOUNT/job-search:environment:production`, 추가 claim `ref`는 `refs/heads/main`으로 제한합니다. 권한은 **Auth Keys → Write**, 태그는 `tag:job-search-ci`만 지정합니다.
+3. [Tailscale OIDC 설정](https://tailscale.com/docs/features/workload-identity-federation)에서 GitHub 발급자를 선택합니다. **Subject를 저장소 이름만으로 추측하지 않습니다.** 아래 GitHub API에서 실제 `sub_claim_prefix`를 확인합니다. 기본 템플릿(`use_default: true`)이면 그 값 뒤에 `:environment:production`을 붙여 Subject로 사용합니다. 새 저장소는 `repo:YOUR_ACCOUNT@OWNER_ID/job-search@REPOSITORY_ID:environment:production`처럼 숫자 ID가 포함될 수 있습니다. 사용자 정의 템플릿이면 그 템플릿이 발급하는 전체 Subject에 맞춥니다. 추가 claim `ref`는 `refs/heads/main`으로 제한하고, 권한은 **Auth Keys → Write**, 태그는 `tag:job-search-ci`만 지정합니다.
+
+   ```sh
+   gh api repos/YOUR_ACCOUNT/job-search/actions/oidc/customization/sub
+   ```
+
+   [GitHub의 immutable Subject 안내](https://github.blog/changelog/2026-04-23-immutable-subject-claims-for-GitHub-actions-oidc-tokens/)를 참고합니다. 토큰 교환이 403으로 거부되면 Tailscale의 해당 OIDC 항목을 View/Edit로 열어 인증 오류와 Subject·Audience·추가 claim을 대조합니다. 이 단계의 실패를 서버 sudo 오류로 판단하지 않습니다.
 4. Client ID와 Audience를 GitHub `production` 환경의 `TS_CLIENT_ID`, `TS_AUDIENCE` secret으로 저장합니다. 이 두 식별자는 장기 비밀번호가 아닙니다.
 5. 별도 Ed25519 SSH 키를 생성합니다. 서버 `authorized_keys`에는 아래처럼 **강제 명령과 restrict**를 붙인 공개키만 추가하고, 개인키는 GitHub `production`의 `DEPLOY_SSH_KEY`로 저장합니다.
 
