@@ -2,6 +2,9 @@ import importlib.util
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -42,6 +45,19 @@ class DeploymentTests(unittest.TestCase):
                         'deploy ' + sha + '\n', 'deploy ' + sha.upper()]:
             with self.subTest(command=command), self.assertRaises(ValueError):
                 deploy.parse_revision(command)
+
+    def test_regular_hermes_dispatcher_executes_current_release_from_any_directory(self):
+        current = self.root / 'job_search/current/scripts'
+        current.mkdir(parents=True)
+        (current / 'hermes_collect.py').write_text("print('current-release-dispatched')\n")
+        installed = self.root / '.hermes/scripts/hermes_collect.py'
+        installed.parent.mkdir(parents=True)
+        installed.write_bytes((Path(__file__).parents[1] / 'scripts/hermes_dispatch.py').read_bytes())
+        self.assertFalse(installed.is_symlink())
+        result = subprocess.run([sys.executable, str(installed)], cwd=self.root,
+                                env=dict(os.environ, HOME=str(self.root)),
+                                text=True, capture_output=True, check=True)
+        self.assertEqual(result.stdout.strip(), 'current-release-dispatched')
 
     def test_backup_is_consistent_and_schema_changes_are_detected(self):
         src = self.root / 'data/jobs.sqlite'

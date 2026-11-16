@@ -17,7 +17,7 @@
 
 각 릴리스의 `data`, `deployment.json`, `hermes_job_prompt.txt`는 루트의 기존 파일을 참조합니다. 서버의 별도 기업 조사 파일 등은 유지합니다. 기존 단일 폴더 설치는 최초 한 번 서비스를 `current` 경로로 전환하고 Hermes 프롬프트를 모듈 명령으로 옮겨야 합니다. 일반 업데이트에서는 개인 프롬프트를 덮어쓰지 않습니다.
 
-`~/.hermes/scripts/hermes_collect.py`는 `current/scripts/hermes_collect.py`를 실행하도록 연결합니다. 웹 서비스는 `current/.venv-dashboard/bin/waitress-serve --host=127.0.0.1 --port=8765 --call job_search.dashboard:create_production_app`, 작업 디렉터리는 `current`로 설정합니다. 마감 갱신은 같은 가상환경의 `python -m job_search.refresh_job_availability`입니다. 기존 systemd 단위에 drop-in을 추가해 설정할 수 있습니다.
+`scripts/hermes_dispatch.py`를 `~/.hermes/scripts/hermes_collect.py`에 **일반 파일로 복사**합니다. 이 파일이 `current/scripts/hermes_collect.py`를 실행합니다. Hermes는 scripts 폴더 밖으로 향하는 심볼릭 링크를 거부하므로 링크를 만들지 않습니다. 웹 서비스는 `current/.venv-dashboard/bin/waitress-serve --host=127.0.0.1 --port=8765 --call job_search.dashboard:create_production_app`, 작업 디렉터리는 `current`로 설정합니다. 마감 갱신은 같은 가상환경의 `python -m job_search.refresh_job_availability`입니다. 기존 systemd 단위에 drop-in을 추가해 설정할 수 있습니다.
 
 서버의 `.deploy/config.json`은 `0600` 권한으로 작성합니다. 다음 값은 실제 경로로 바꾸며 Git에 넣지 않습니다.
 
