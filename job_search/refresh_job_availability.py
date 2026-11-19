@@ -9,9 +9,27 @@ from urllib.parse import urlencode, urlsplit
 
 from .collect_jobs import API, FIELDS, extract, request_json
 from .dashboard_store import init_state_db
-from .job_availability import availability, inspect_document
+from .job_availability import _stamp, availability, document_version, inspect_document
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def write_facts(db, post_id, document, facts, started, source_modified, source_url):
+    old = db.execute("SELECT checked_at FROM job_availability WHERE post_id=?", (post_id,)).fetchone()
+    previous = _stamp(old[0]) if old else None
+    if previous and started < previous:
+        return False
+    checked_at = started.isoformat(timespec="microseconds")
+    db.execute("""INSERT INTO job_availability VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(post_id) DO UPDATE SET closed=excluded.closed,deadline_at=excluded.deadline_at,
+        evidence=excluded.evidence,checked_at=excluded.checked_at,source_modified_at=excluded.source_modified_at,
+        source_url=excluded.source_url""",
+        (post_id, int(facts["closed"]), facts["deadline_at"], facts["evidence"], checked_at, source_modified, source_url))
+    db.execute("""INSERT INTO job_deadline_facts VALUES(?,?,?,?,?)
+        ON CONFLICT(post_id) DO UPDATE SET checked_at=excluded.checked_at,document_version=excluded.document_version,
+        deadline_kind=excluded.deadline_kind,deadline_word=excluded.deadline_word""",
+        (post_id, checked_at, document_version(document), facts["deadline_kind"], facts["deadline_word"]))
+    return True
 
 
 def refresh(jobs_db, state_db, fetch_page=request_json, now=None):
@@ -22,6 +40,7 @@ def refresh(jobs_db, state_db, fetch_page=request_json, now=None):
     with closing(sqlite3.connect(Path(jobs_db).resolve().as_uri() + "?mode=ro", uri=True)) as db:
         candidates = [(r[0], json.loads(r[2])) for r in db.execute("SELECT id,decision,document FROM posts")
                       if r[1] == "recommend" or r[0] in saved]
+    stored = dict(candidates)
     ids = sorted(i for i, doc in candidates if doc.get("source", "inthiswork") == "inthiswork"
                  and urlsplit(doc.get("url", "")).hostname == "inthiswork.com")
     unsupported = sorted(i for i, _ in candidates if i not in ids)
@@ -46,12 +65,9 @@ def refresh(jobs_db, state_db, fetch_page=request_json, now=None):
             checked[post["id"]] = (doc, inspect_document(doc))
     # Fetch every batch before starting the write transaction. A failed request preserves previous facts.
     with closing(sqlite3.connect(Path(state_db).resolve().as_uri() + "?mode=rw", uri=True, timeout=30)) as db, db:
+        db.execute("BEGIN IMMEDIATE")
         for post_id, (doc, facts) in checked.items():
-            db.execute("""INSERT INTO job_availability VALUES(?,?,?,?,?,?,?)
-                ON CONFLICT(post_id) DO UPDATE SET closed=excluded.closed,deadline_at=excluded.deadline_at,
-                evidence=excluded.evidence,checked_at=excluded.checked_at,source_modified_at=excluded.source_modified_at,
-                source_url=excluded.source_url""", (post_id, int(facts["closed"]), facts["deadline_at"],
-                facts["evidence"], now.isoformat(), doc.get("modified_gmt"), API + "/" + str(post_id)))
+            write_facts(db, post_id, stored[post_id], facts, now, doc.get("modified_gmt"), API + "/" + str(post_id))
     return {"requested": len(ids), "checked": len(checked), "unsupported_ids": unsupported,
             "missing_ids": sorted(set(ids) - checked.keys()),
             "expired_in_checked": [i for i, (doc, _) in checked.items() if availability(doc, now=now)["is_expired"]]}

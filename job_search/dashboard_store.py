@@ -8,6 +8,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .card_metadata import create_deadline_tables, has_table
 from .job_availability import availability
 
 STATUSES = {"unmarked", "interested", "preparing", "applied", "archived"}
@@ -69,9 +70,10 @@ def init_state_db(jobs_db: Path, state_db: Path) -> None:
     try:
         fd = os.open(state, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
-        pass
+        fresh = False
     else:
         os.close(fd)
+        fresh = True
     state.chmod(0o600)
     with closing(_connect(state, "rw")) as db, db:
         db.execute("""CREATE TABLE IF NOT EXISTS job_state (
@@ -98,6 +100,8 @@ def init_state_db(jobs_db: Path, state_db: Path) -> None:
             evidence TEXT NOT NULL, checked_at TEXT NOT NULL,
             source_modified_at TEXT, source_url TEXT NOT NULL
         )""")
+        if fresh:
+            create_deadline_tables(db)
 
 
 def _json(value, default):
@@ -105,6 +109,15 @@ def _json(value, default):
         return json.loads(value)
     except (TypeError, ValueError):
         return default
+
+
+def _availability_rows(db, post_id=None):
+    where, args = (" WHERE a.post_id=?", (post_id,)) if post_id is not None else ("", ())
+    query = "SELECT a.* FROM job_availability a"
+    if has_table(db, "job_deadline_facts"):
+        query = """SELECT a.*, f.document_version, f.deadline_kind, f.deadline_word FROM job_availability a
+            LEFT JOIN job_deadline_facts f ON a.post_id=f.post_id AND a.checked_at=f.checked_at"""
+    return {r["post_id"]: dict(r) for r in db.execute(query + where, args)}
 
 
 def _job(row, state, cached_availability=None):
@@ -196,7 +209,7 @@ def list_jobs(jobs_db: Path, state_db: Path, *, view="recommended", q="", page=1
     with closing(_connect(state, "ro")) as db:
         states = {r["post_id"]: dict(r) for r in db.execute("SELECT * FROM job_state")}
         profiles = db.execute("SELECT * FROM profile_posts").fetchall()
-        availability_rows = {r["post_id"]: dict(r) for r in db.execute("SELECT * FROM job_availability")}
+        availability_rows = _availability_rows(db)
         stages = {}
         for row in db.execute("SELECT * FROM application_stages"):
             stages.setdefault(row["post_id"], []).append(row)
@@ -227,7 +240,7 @@ def get_job(jobs_db: Path, state_db: Path, post_id: int):
         personal = db.execute("SELECT * FROM job_state WHERE post_id=?", (post_id,)).fetchone()
         profile = db.execute("SELECT * FROM profile_posts WHERE id=?", (post_id,)).fetchone() if post_id < 0 else None
         stages = db.execute("SELECT * FROM application_stages WHERE post_id=?", (post_id,)).fetchall()
-        cached = db.execute("SELECT * FROM job_availability WHERE post_id=?", (post_id,)).fetchone()
+        cached = _availability_rows(db, post_id).get(post_id)
     if row is None and profile is None:
         return None
     personal = dict(personal) if personal else {}
