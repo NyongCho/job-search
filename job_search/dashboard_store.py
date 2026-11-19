@@ -2,14 +2,16 @@
 
 import json
 import os
+import re
 import sqlite3
 from contextlib import closing
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .card_metadata import create_deadline_tables, has_table
-from .job_availability import availability
+from .job_availability import KST, ROLLING, availability
+from .job_sources import source_locator, source_name
 
 STATUSES = {"unmarked", "interested", "preparing", "applied", "archived"}
 VIEWS = ("recommended", "interested", "preparing", "applied", "archived", "needs_review", "expired")
@@ -120,7 +122,14 @@ def _availability_rows(db, post_id=None):
     return {r["post_id"]: dict(r) for r in db.execute(query + where, args)}
 
 
-def _job(row, state, cached_availability=None):
+def _deadline_overrides(db, post_id=None):
+    if not has_table(db, "job_deadline_overrides"):
+        return {}
+    where, args = (" WHERE post_id=?", (post_id,)) if post_id is not None else ("", ())
+    return {r["post_id"]: dict(r) for r in db.execute("SELECT * FROM job_deadline_overrides" + where, args)}
+
+
+def _job(row, state, cached_availability=None, override=None):
     document = _json(row["document"], None)
     error = not isinstance(document, dict)
     doc = document if isinstance(document, dict) else {}
@@ -140,8 +149,9 @@ def _job(row, state, cached_availability=None):
         images = []
     reviewed = timestamp(row["reviewed_at"])
     seen = timestamp(state.get("seen_reviewed_at"))
+    source_kind = source_name(doc)
     return {
-        **availability(doc if row["id"] > 0 else {}, cached_availability),
+        **availability(doc if row["id"] > 0 else {}, cached_availability, override=override),
         "id": row["id"], "title": title,
         "company": company.strip() if separator else "기업명 미기재",
         "role": role.strip() if separator else title,
@@ -153,21 +163,22 @@ def _job(row, state, cached_availability=None):
         "images": [{"url": safe_url(item.get("url")), "alt": item.get("alt", "")}
                    for item in images if isinstance(item, dict) and safe_url(item.get("url"))],
         "status": state.get("status", "unmarked"),
-        "source_kind": "inthiswork", "source_label": "INTHISWORK", "recorded_at": None,
+        "source_kind": source_kind, "source_label": source_kind.upper(), "recorded_at": None,
+        "can_refresh_deadline": row["id"] > 0 and source_locator(doc) is not None,
         "state_updated_at": timestamp(state.get("updated_at")),
         "is_unread": bool(reviewed and (not seen or reviewed > seen)),
         "display_error": "저장된 본문 일부를 표시할 수 없습니다. 원문을 확인해 주세요." if error else "",
     }
 
 
-def _profile_job(row, state):
+def _profile_job(row, state, override=None):
     doc = _json(row["document"], {})
     note = doc.get("record_note") if isinstance(doc, dict) else None
     reason = note.strip() if isinstance(note, str) and note.strip() else (
         f"사용자가 지원 완료를 확인한 기록입니다. (확인일 {row['confirmed_on']}, 실제 지원일 미기록)")
     item = _job({"id": row["id"], "document": row["document"], "fingerprint": "",
                  "reason": reason,
-                 "decision": None, "evidence_lines": "[]", "reviewed_at": None}, state)
+                 "decision": None, "evidence_lines": "[]", "reviewed_at": None}, state, override=override)
     item.update(source_kind="profile", source_label="personal-profile", recorded_at=timestamp(row["imported_at"]))
     return item
 
@@ -210,12 +221,14 @@ def list_jobs(jobs_db: Path, state_db: Path, *, view="recommended", q="", page=1
         states = {r["post_id"]: dict(r) for r in db.execute("SELECT * FROM job_state")}
         profiles = db.execute("SELECT * FROM profile_posts").fetchall()
         availability_rows = _availability_rows(db)
+        overrides = _deadline_overrides(db)
         stages = {}
         for row in db.execute("SELECT * FROM application_stages"):
             stages.setdefault(row["post_id"], []).append(row)
     # The current personal corpus is small (~1,000); parse once, never hold a source lock while rendering.
-    items = [_job(row, states.get(row["id"], {}), availability_rows.get(row["id"])) for row in rows]
-    items += [_profile_job(row, states.get(row["id"], {})) for row in profiles]
+    items = [_job(row, states.get(row["id"], {}), availability_rows.get(row["id"]), overrides.get(row["id"]))
+             for row in rows]
+    items += [_profile_job(row, states.get(row["id"], {}), overrides.get(row["id"])) for row in profiles]
     items = [_with_progress(item, stages.get(item["id"], [])) for item in items]
     counts = {v: sum(_matches(item, v) for item in items) for v in VIEWS}
     needle = q.strip().casefold()
@@ -241,10 +254,11 @@ def get_job(jobs_db: Path, state_db: Path, post_id: int):
         profile = db.execute("SELECT * FROM profile_posts WHERE id=?", (post_id,)).fetchone() if post_id < 0 else None
         stages = db.execute("SELECT * FROM application_stages WHERE post_id=?", (post_id,)).fetchall()
         cached = _availability_rows(db, post_id).get(post_id)
+        override = _deadline_overrides(db, post_id).get(post_id)
     if row is None and profile is None:
         return None
     personal = dict(personal) if personal else {}
-    item = _profile_job(profile, personal) if profile is not None else _job(row, personal, dict(cached) if cached else None)
+    item = _profile_job(profile, personal, override) if profile is not None else _job(row, personal, cached, override)
     return _with_progress(item, stages)
 
 
@@ -254,6 +268,79 @@ def _date(value):
     if value and date.fromisoformat(value).isoformat() != value:
         raise ValueError("날짜는 YYYY-MM-DD 형식으로 입력해 주세요.")
     return value
+
+
+class DeadlineChanged(Exception):
+    """The automatic choice expired before the user confirmed it."""
+
+
+def _manual_deadline(data):
+    kind = data.get("kind")
+    fields = {"datetime": {"date", "time"}, "date": {"date"}, "rolling": {"word"}, "unknown": set()}
+    if not isinstance(kind, str) or kind not in fields or set(data) != {"mode", "kind"} | fields[kind]:
+        raise ValueError("마감 유형과 입력 항목을 확인해 주세요.")
+    at, word = None, ""
+    if kind in {"datetime", "date"}:
+        try:
+            day = date.fromisoformat(data["date"])
+            if day.isoformat() != data["date"] or day.year < 1000:
+                raise ValueError
+            clock = time(23, 59, 59)
+            if kind == "datetime":
+                if not isinstance(data["time"], str) or not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", data["time"]):
+                    raise ValueError
+                clock = time.fromisoformat(data["time"]).replace(second=59)
+        except (TypeError, ValueError):
+            raise ValueError("한국 시간 기준의 날짜와 시각을 확인해 주세요.") from None
+        at = datetime.combine(day, clock, tzinfo=KST).isoformat()
+    elif kind == "rolling":
+        word = data["word"]
+        if word not in [text for text, _ in ROLLING]:
+            raise ValueError("상시 채용 또는 채용 시 마감을 선택해 주세요.")
+    return {"deadline_at": at, "deadline_kind": kind, "deadline_word": word}
+
+
+def read_job_document(jobs_db, post_id):
+    with closing(_connect(jobs_db, "ro")) as db:
+        row = db.execute("SELECT document FROM posts WHERE id=?", (post_id,)).fetchone()
+    if row is None:
+        raise LookupError("공고를 찾을 수 없습니다.")
+    doc = _json(row["document"], {})
+    return doc if isinstance(doc, dict) else {}
+
+
+def set_deadline(jobs_db, state_db, post_id, data):
+    if not isinstance(data, dict) or data.get("mode") not in ("auto", "manual"):
+        raise ValueError("마감 정보 적용 방식을 확인해 주세요.")
+    version = data.get("version")
+    override = None
+    if data["mode"] == "manual":
+        override = _manual_deadline(data)
+    elif set(data) - {"mode", "version"} or ("version" in data and
+            (not isinstance(version, str) or not re.fullmatch(r"[a-f0-9]{64}", version))):
+        raise ValueError("자동 수집값을 다시 확인해 주세요.")
+    source, state = _validate_paths(jobs_db, state_db)
+    with closing(_connect(state, "rw")) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        if post_id < 0:
+            if db.execute("SELECT 1 FROM profile_posts WHERE id=?", (post_id,)).fetchone() is None:
+                raise LookupError("공고를 찾을 수 없습니다.")
+            doc = {}
+        else:
+            doc = read_job_document(source, post_id)
+        cached = _availability_rows(db, post_id).get(post_id)
+        result = availability(doc, cached, override=override)
+        if override is None:
+            auto = result["deadline_auto"]
+            if version and version != auto["version"] and auto["is_expired"]:
+                raise DeadlineChanged("자동 수집값이 바뀌었어요. 최신 마감 정보를 확인한 뒤 다시 저장해 주세요.")
+            db.execute("DELETE FROM job_deadline_overrides WHERE post_id=?", (post_id,))
+        else:
+            db.execute("""INSERT INTO job_deadline_overrides VALUES(?,?,?,?)
+                ON CONFLICT(post_id) DO UPDATE SET deadline_at=excluded.deadline_at,
+                deadline_kind=excluded.deadline_kind,deadline_word=excluded.deadline_word""",
+                (post_id, override["deadline_at"], override["deadline_kind"], override["deadline_word"]))
+    return result
 
 
 def set_stage(jobs_db, state_db, post_id, stage, result, event_date, note):

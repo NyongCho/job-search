@@ -79,6 +79,12 @@ class DeadlineTests(unittest.TestCase):
                 self.assertIsNone(result["deadline_at"])
                 self.assertFalse(result["closed"])
 
+    def test_dated_and_rolling_deadlines_for_different_roles_are_ambiguous(self):
+        doc = document("A직무 지원 마감 2026.12.11", "B직무 채용 시 마감")
+        self.assertEqual(availability(doc)["deadline_label"], "마감일 미확인")
+        doc = document("지원 기한 2026.12.11 (채용 시 조기 마감될 수 있음)")
+        self.assertEqual(availability(doc)["deadline_label"], "12.11 마감")
+
     def test_yearless_dates_require_publication_and_roll_december_forward(self):
         self.assertEqual(inspect_document(document("지원 마감: 1/10", published="2026-12-20T00:00:00"))["deadline_at"],
                          "2027-01-10T23:59:59+09:00")

@@ -77,7 +77,7 @@ def inspect_document(doc):
             if deadline:
                 candidates[deadline] = context[:1000]
     at, kind, word, evidence = None, "unknown", "", ""
-    if len(candidates) == 1:
+    if len(candidates) == 1 and not rolling:
         (at, kind, word), evidence = next(iter(candidates.items()))
     elif not candidates and len(rolling) == 1:
         word, evidence = next(iter(rolling.items()))

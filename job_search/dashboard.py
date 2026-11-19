@@ -13,6 +13,7 @@ from werkzeug.exceptions import HTTPException, SecurityError
 
 from . import dashboard_store as store
 from .company_research import load_research, lookup_research
+from .refresh_job_availability import SourceCheckFailed, refresh_one
 
 ROOT = Path(__file__).resolve().parents[1]
 VIEW_LABELS = {"recommended": "추천", "interested": "관심", "preparing": "지원 준비",
@@ -102,6 +103,8 @@ def create_app(config=None):
             page = int(request.args.get("page", "1"))
         except ValueError:
             raise ValueError("페이지 번호를 확인해 주세요.") from None
+        if view not in store.VIEWS or len(q) > 200 or page < 1:
+            raise ValueError("보기, 검색어 또는 페이지를 확인해 주세요.")
         return view, q, page
 
     def screen(post_id=None):
@@ -149,6 +152,25 @@ def create_app(config=None):
             raise ValueError("전형 정보를 확인해 주세요.")
         return jsonify(store.set_stage(source, state, post_id, data.get("stage"), data.get("result"),
                                        data.get("event_date", ""), data.get("note", "")))
+
+    @app.post("/jobs/<int(signed=True):post_id>/deadline")
+    def change_deadline(post_id):
+        context()
+        try:
+            result = store.set_deadline(source, state, post_id, request.get_json(silent=True))
+        except store.DeadlineChanged as error:
+            return jsonify(error=409, message=str(error), html=screen(post_id)), 409
+        return jsonify(**result, html=screen(post_id), message="마감 정보를 저장했어요.")
+
+    @app.post("/jobs/<int(signed=True):post_id>/deadline/refresh")
+    def refresh_deadline(post_id):
+        context()
+        try:
+            updated = refresh_one(source, state, post_id)
+        except SourceCheckFailed as error:
+            return error_response(502, str(error))
+        message = "마감 정보를 다시 확인했어요." if updated else "더 최근에 확인한 마감 정보를 표시했어요."
+        return jsonify(html=screen(post_id), message=message)
 
     @app.get("/healthz")
     def health():

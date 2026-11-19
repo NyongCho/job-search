@@ -14,8 +14,9 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .evidence import Document, application_link
+from .job_sources import INTHISWORK_API
 
-API = "https://inthiswork.com/wp-json/wp/v2/posts"
+API = INTHISWORK_API
 FIELDS = "id,date_gmt,modified_gmt,link,title,content,categories"
 JOB_CATEGORIES = {191700167, 191700168}
 CLOSED = 191700169

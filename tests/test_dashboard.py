@@ -70,6 +70,28 @@ class WebTests(unittest.TestCase):
         for bad in [{"status": []}, {"status": "hired"}, [], None]:
             self.assertEqual(self.post("/jobs/1/state", bad, token).status_code, 400)
 
+    def test_deadline_update_requires_csrf_and_valid_type_specific_fields(self):
+        path = "/jobs/1/deadline"
+        future = {"mode": "manual", "kind": "datetime", "date": "2099-12-02", "time": "23:59"}
+        token = self.csrf()
+        self.assertEqual(self.post(path, future).status_code, 403)
+        for invalid in [{**future, "date": "2099-02-29"}, {**future, "time": "24:00"},
+                        {**future, "kind": "date"}, {"mode": "manual", "kind": []}]:
+            self.assertEqual(self.post(path, invalid, token).status_code, 400)
+        saved = self.post(path + "?view=recommended&q=Agent&page=1", future, token)
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json["deadline_label"], "12.02 23:59 마감")
+
+    def test_imported_application_can_edit_deadline_but_cannot_refresh_source(self):
+        dashboard.store.import_profile_jobs(self.source, self.state, [{
+            "source_key": "applications/legacy", "company": "회사", "role": "직무", "summary": "기존 지원",
+            "confirmed_on": "2026-11-15", "source_url": "https://inthiswork.com/archives/1",
+        }])
+        token = self.csrf()
+        self.assertEqual(self.post("/jobs/-1/deadline", {"mode": "manual", "kind": "unknown"}, token).status_code, 200)
+        self.assertIsNotNone(dashboard.store.get_job(self.source, self.state, -1)["deadline_manual"])
+        self.assertEqual(self.post("/jobs/-1/deadline/refresh", {}, token).status_code, 400)
+
     def test_unknown_job_and_db_failure(self):
         self.assertEqual(self.get("/jobs/999").status_code, 404)
         token = self.csrf()
