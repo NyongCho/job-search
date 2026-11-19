@@ -10,7 +10,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .card_metadata import create_deadline_tables, has_table
-from .job_availability import KST, ROLLING, availability
+from .company_logos import logo_references
+from .job_availability import KST, ROLLING, availability, document_version
 from .job_sources import source_locator, source_name
 
 STATUSES = {"unmarked", "interested", "preparing", "applied", "archived"}
@@ -129,7 +130,7 @@ def _deadline_overrides(db, post_id=None):
     return {r["post_id"]: dict(r) for r in db.execute("SELECT * FROM job_deadline_overrides" + where, args)}
 
 
-def _job(row, state, cached_availability=None, override=None):
+def _job(row, state, cached_availability=None, override=None, logo_version=None):
     document = _json(row["document"], None)
     error = not isinstance(document, dict)
     doc = document if isinstance(document, dict) else {}
@@ -165,6 +166,7 @@ def _job(row, state, cached_availability=None, override=None):
         "status": state.get("status", "unmarked"),
         "source_kind": source_kind, "source_label": source_kind.upper(), "recorded_at": None,
         "can_refresh_deadline": row["id"] > 0 and source_locator(doc) is not None,
+        "has_company_logo": logo_version is not None and logo_version == document_version(doc),
         "state_updated_at": timestamp(state.get("updated_at")),
         "is_unread": bool(reviewed and (not seen or reviewed > seen)),
         "display_error": "저장된 본문 일부를 표시할 수 없습니다. 원문을 확인해 주세요." if error else "",
@@ -217,6 +219,7 @@ def list_jobs(jobs_db: Path, state_db: Path, *, view="recommended", q="", page=1
     with closing(_connect(source, "ro")) as db:
         rows = db.execute("SELECT * FROM posts").fetchall()
         checkpoint = db.execute("SELECT value FROM metadata WHERE key='last_success'").fetchone()
+        logos = logo_references(db)
     with closing(_connect(state, "ro")) as db:
         states = {r["post_id"]: dict(r) for r in db.execute("SELECT * FROM job_state")}
         profiles = db.execute("SELECT * FROM profile_posts").fetchall()
@@ -226,7 +229,8 @@ def list_jobs(jobs_db: Path, state_db: Path, *, view="recommended", q="", page=1
         for row in db.execute("SELECT * FROM application_stages"):
             stages.setdefault(row["post_id"], []).append(row)
     # The current personal corpus is small (~1,000); parse once, never hold a source lock while rendering.
-    items = [_job(row, states.get(row["id"], {}), availability_rows.get(row["id"]), overrides.get(row["id"]))
+    items = [_job(row, states.get(row["id"], {}), availability_rows.get(row["id"]), overrides.get(row["id"]),
+                  logos.get(row["id"]))
              for row in rows]
     items += [_profile_job(row, states.get(row["id"], {}), overrides.get(row["id"])) for row in profiles]
     items = [_with_progress(item, stages.get(item["id"], [])) for item in items]

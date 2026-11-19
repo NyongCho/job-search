@@ -8,10 +8,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from flask import Flask, abort, jsonify, render_template, request, session, url_for
+from flask import Flask, Response, abort, jsonify, render_template, request, session, url_for
 from werkzeug.exceptions import HTTPException, SecurityError
 
 from . import dashboard_store as store
+from .company_logos import read_logo
 from .company_research import load_research, lookup_research
 from .refresh_job_availability import SourceCheckFailed, refresh_one
 
@@ -130,6 +131,13 @@ def create_app(config=None):
     @app.get("/jobs/<int(signed=True):post_id>")
     def detail(post_id):
         return screen(post_id)
+
+    @app.get("/jobs/<int:post_id>/logo")
+    def company_logo(post_id):
+        image = read_logo(source, post_id)
+        if image is None:
+            abort(404)
+        return Response(image, mimetype="image/png")
 
     @app.post("/jobs/<int(signed=True):post_id>/state")
     def change_state(post_id):

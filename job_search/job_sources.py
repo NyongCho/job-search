@@ -5,7 +5,7 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from .evidence import Document
 
@@ -105,6 +105,24 @@ def same_inthiswork_post(locator, fresh):
     return (match and match.source == locator.source and match.original_id == locator.original_id
             and company_key(match.company) == company_key(locator.company)
             and role_key(match.role) == role_key(locator.role))
+
+
+def linked_job_locator(doc, url):
+    host, path = _parts(url)
+    post = re.search(r"/([1-9][0-9]*)(?:/apply)?$", path)
+    if not post:
+        return None
+    if host in _GREENHOUSE:
+        source = "greenhouse"
+    elif host.endswith(".career.greetinghr.com"):
+        source = "greeting"
+    elif host in _WANTED:
+        source = "wanted"
+    else:
+        return None
+    parsed = urlsplit(url)
+    canonical = urlunsplit((parsed.scheme, parsed.netloc, path.removesuffix("/apply"), "", ""))
+    return source_locator({**doc, "source": source, "source_job_id": post[1], "url": canonical})
 
 
 @dataclass(frozen=True)

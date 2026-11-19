@@ -47,7 +47,7 @@
           <section id="job-list" class="job-list" aria-label="공고 목록" data-scroll-key="{{ view }}:{{ q }}:{{ listing.page }}">
             {% for item in listing['items'] %}
             <a class="job-row {% if detail and detail.id == item.id %}selected{% endif %}" href="{{ url_for('detail',post_id=item.id,view=view,q=q,page=listing.page) }}" {% if detail and detail.id == item.id %}aria-current="true"{% endif %}>
-              <div class="company-line"><span class="company-avatar" aria-hidden="true">{{ item.company[0] }}</span><span class="company-name">{{ item.company }}</span><span class="deadline-badge {{ item.deadline_kind }}">{{ deadline_content(item) }}</span></div>
+              <div class="company-line">{% if item.has_company_logo %}<img class="company-logo" src="{{ url_for('company_logo', post_id=item.id) }}" alt="" width="24" height="24" loading="lazy">{% else %}<span class="company-avatar" aria-hidden="true">{{ item.company[0] }}</span>{% endif %}<span class="company-name">{{ item.company }}</span><span class="deadline-badge {{ item.deadline_kind }}">{{ deadline_content(item) }}</span></div>
               <div class="job-row-title">{{ item.role }}</div>
               {% if item.company_review %}{% set review = item.company_review %}
               <div class="company-rating-preview">
