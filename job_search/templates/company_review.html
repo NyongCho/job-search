@@ -14,11 +14,11 @@
       <dl class="review-metrics"><div><dt>복지·급여</dt><dd>{{ '%.1f'|format(review.benefits_rating) }}</dd></div><div><dt>워라밸</dt><dd>{{ '%.1f'|format(review.work_life_rating) }}</dd></div></dl>
       <div class="review-summary"><h4>긍정적인 의견</h4><p>{{ review.pros }}</p><h4>아쉬운 의견</h4><p>{{ review.cons }}</p></div>
     {% elif review.status == 'no_reviews' %}
-      <p class="review-empty-title">등록된 리뷰 없음 <span>리뷰 0건</span></p>
+      <p class="review-empty-title">등록된 리뷰 없음</p>
     {% else %}
       <p class="review-empty-title">동일 기업 확인 불가</p>
     {% endif %}
-    <div class="review-caveat"><strong>함께 확인하세요</strong><p>{{ review.caveat }}</p></div>
+    {% if review.caveat %}<p class="review-caveat">{{ review.caveat }}</p>{% endif %}
     <p class="review-method">{% if review.latest_review_month %}확인한 최신 리뷰 {{ review.latest_review_month }} · {% endif %}조사일 기준 스냅샷이며 자동 갱신되지 않습니다.{% if review.status == 'reviewed' %} 평점은 전체 기간 누적, 요약은 최근 확인한 직원 리뷰의 의견입니다. 실제 지원팀·고용 형태와 다를 수 있습니다.{% endif %}</p>
   {% else %}
     <p class="review-empty-title">아직 조사한 기업 정보가 없어요</p>
