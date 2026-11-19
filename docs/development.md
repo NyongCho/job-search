@@ -31,6 +31,8 @@ make test-live
 
 ## Git과 배포
 
+브랜치 이름과 커밋·PR 작성법은 [브랜치·커밋·PR 작성 규칙](git-conventions.md)에 정리했습니다.
+
 기능별 브랜치에서 수정 → 테스트 → 검토 → 병합 순서로 작업합니다. [자동 배포](deployment.md)를 설정하고 `DEPLOY_ENABLED=true`로 켜면 `main` push의 테스트가 통과한 뒤 서버에 배포합니다. 데이터와 서버별 설정은 Git에서 제외하고 서버에 보존·백업합니다.
 
 ### 기존 단일 폴더 설치에서 이동
