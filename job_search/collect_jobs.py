@@ -1,4 +1,4 @@
-"""Inthiswork JD collection and evidence-backed review queue (stdlib only)."""
+"""Inthiswork JD collection and evidence-backed review queue."""
 
 import argparse
 import hashlib
