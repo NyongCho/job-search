@@ -96,9 +96,17 @@ def refresh_one(jobs_db, state_db, post_id, *, fetch=fetch_public, now=None):
 
 
 def write_facts(db, post_id, document, facts, started, source_modified, source_url):
-    old = db.execute("SELECT checked_at FROM job_availability WHERE post_id=?", (post_id,)).fetchone()
+    version = document_version(document)
+    old = db.execute("""SELECT a.checked_at,a.source_modified_at,f.document_version FROM job_availability a
+        LEFT JOIN job_deadline_facts f ON a.post_id=f.post_id AND a.checked_at=f.checked_at WHERE a.post_id=?""",
+        (post_id,)).fetchone()
     previous = _stamp(old[0]) if old else None
     if previous and started < previous:
+        return False
+    incoming = _stamp(source_modified)
+    stored = _stamp(document.get("modified_gmt"))
+    previous_source = _stamp(old[1]) if old and old[2] == version else None
+    if incoming and any(value and incoming < value for value in (stored, previous_source)):
         return False
     checked_at = started.isoformat(timespec="microseconds")
     db.execute("""INSERT INTO job_availability VALUES(?,?,?,?,?,?,?)
@@ -109,7 +117,7 @@ def write_facts(db, post_id, document, facts, started, source_modified, source_u
     db.execute("""INSERT INTO job_deadline_facts VALUES(?,?,?,?,?)
         ON CONFLICT(post_id) DO UPDATE SET checked_at=excluded.checked_at,document_version=excluded.document_version,
         deadline_kind=excluded.deadline_kind,deadline_word=excluded.deadline_word""",
-        (post_id, checked_at, document_version(document), facts["deadline_kind"], facts["deadline_word"]))
+        (post_id, checked_at, version, facts["deadline_kind"], facts["deadline_word"]))
     return True
 
 

@@ -27,7 +27,9 @@ def _deadline(text, published):
     matches = list(DATE.finditer(text))
     if not matches:
         return None
-    if len(matches) > 1 and not re.search(r"~|～|–|부터", text):
+    if len(matches) > 2:
+        return None
+    if len(matches) == 2 and not re.search(r"~|～|–|—|부터|\s-\s", text[matches[0].end():matches[1].start()]):
         return None
     last = matches[-1]
     year, month, day = last.groups()

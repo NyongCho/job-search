@@ -84,6 +84,8 @@ class DeadlineTests(unittest.TestCase):
         self.assertEqual(availability(doc)["deadline_label"], "마감일 미확인")
         doc = document("지원 기한 2026.12.11 (채용 시 조기 마감될 수 있음)")
         self.assertEqual(availability(doc)["deadline_label"], "12.11 마감")
+        doc = document("A직무 접수 2026.11.10 ~ 2026.11.25, B직무 접수 2026.11.18 ~ 2026.12.11 마감")
+        self.assertEqual(availability(doc)["deadline_label"], "마감일 미확인")
 
     def test_yearless_dates_require_publication_and_roll_december_forward(self):
         self.assertEqual(inspect_document(document("지원 마감: 1/10", published="2026-12-20T00:00:00"))["deadline_at"],
@@ -247,6 +249,15 @@ class RefreshTests(unittest.TestCase):
         self.assertFalse(job["is_expired"])
         self.assertEqual(job["deadline_label"], "상시 채용")
         self.assertIsNone(job["availability_checked_at"])
+
+    def test_later_request_with_older_source_version_does_not_erase_extension(self):
+        extended = posting(1, content="<p>지원 마감: 2099-11-27</p>")
+        extended["modified_gmt"] = "2026-11-16T11:00:00"
+        refresh(self.source, self.state, lambda _: ([extended], 1), self.now)
+        old = posting(1, content="<p>지원 마감: 2020-11-15</p>")
+        old["modified_gmt"] = "2026-11-15T11:00:00"
+        refresh(self.source, self.state, lambda _: ([old], 1), datetime(2026, 11, 19, tzinfo=timezone.utc))
+        self.assertEqual(store.get_job(self.source, self.state, 1)["deadline_label"], "11.27 마감")
 
 
 if __name__ == '__main__':
