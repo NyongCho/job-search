@@ -109,3 +109,23 @@ class SourceRefreshTests(unittest.TestCase):
         job = store.get_job(self.jobs, self.state, 1)
         self.assertEqual(job["deadline_label"], "채용 시 마감")
         self.assertEqual(job["deadline_auto"]["label"], "11.29 마감")
+
+    def test_wanted_uses_only_the_selected_pages_explicit_rolling_deadline_field(self):
+        source, job_id, title, url, _, body, _ = self.cases[-1]
+        self.document(1, source, job_id, title, url)
+        body += '<article class="JobDueTime_JobDueTime__example"><h2>마감일</h2><span>상시채용</span></article>'
+        self.refresh(1, url, body)
+        self.assertEqual(store.get_job(self.jobs, self.state, 1)["deadline_label"], "상시 채용")
+
+    def test_inthiswork_with_repurposed_identity_preserves_previous_facts(self):
+        url = "https://inthiswork.com/wp-json/wp/v2/posts/1?" + refreshing.urlencode({"_fields": refreshing.FIELDS})
+        original = posting(1, content="<p>지원 마감: 2099-11-27</p>")
+        self.refresh(1, url, json.dumps(original))
+        saved = store.get_job(self.jobs, self.state, 1)
+        changed = posting(1, content="<p>상시 채용</p>")
+        changed["title"]["rendered"] = "다른 기업｜엔지니어"
+        with self.assertRaises(refreshing.SourceCheckFailed):
+            self.refresh(1, url, json.dumps(changed), datetime(2026, 11, 20, tzinfo=timezone.utc))
+        current = store.get_job(self.jobs, self.state, 1)
+        self.assertEqual(current["deadline_label"], "11.27 마감")
+        self.assertEqual(current["availability_checked_at"], saved["availability_checked_at"])

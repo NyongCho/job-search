@@ -11,7 +11,7 @@ from urllib.parse import urlencode, urlsplit
 from .collect_jobs import API, FIELDS, extract, request_json
 from .dashboard_store import init_state_db, read_job_document
 from .job_availability import KST, _stamp, availability, document_version, inspect_document
-from .job_sources import fetch_posting, source_locator, source_name
+from .job_sources import fetch_posting, same_inthiswork_post, source_locator
 from .public_fetch import fetch_public
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,7 +73,7 @@ def refresh_one(jobs_db, state_db, post_id, *, fetch=fetch_public, now=None):
             if urlsplit(final_url).hostname != "inthiswork.com" or urlsplit(final_url).path != urlsplit(url).path:
                 raise ValueError("Inthiswork API redirected away from requested posting")
             fresh = _inthiswork(json.loads(raw), {post_id})
-            if not source_locator(fresh):
+            if not same_inthiswork_post(locator, fresh):
                 raise ValueError("Inthiswork posting did not match")
             modified = fresh.get("modified_gmt")
             old_modified = _stamp(document.get("modified_gmt"))
@@ -122,10 +122,12 @@ def refresh(jobs_db, state_db, fetch_page=request_json, now=None):
         candidates = [(r[0], json.loads(r[2])) for r in db.execute("SELECT id,decision,document FROM posts")
                       if r[1] == "recommend" or r[0] in saved]
     stored = dict(candidates)
-    ids = sorted(i for i, doc in candidates if source_name(doc) == "inthiswork"
-                 and urlsplit(doc.get("url", "")).hostname == "inthiswork.com")
+    locators = {i: locator for i, doc in candidates if (locator := source_locator(doc))
+                and locator.source == "inthiswork" and locator.original_id == str(i)}
+    ids = sorted(locators)
     unsupported = sorted(i for i, _ in candidates if i not in ids)
     checked = {}
+    seen = set()
     for start in range(0, len(ids), 100):
         batch = ids[start:start + 100]
         url = API + "?" + urlencode({"include": ",".join(map(str, batch)), "per_page": 100, "_fields": FIELDS})
@@ -133,8 +135,11 @@ def refresh(jobs_db, state_db, fetch_page=request_json, now=None):
         if not isinstance(posts, list):
             raise ValueError("Expected Inthiswork posts")
         for post in posts:
-            doc = _inthiswork(post, set(batch) - checked.keys())
-            checked[post["id"]] = (doc, inspect_document(doc))
+            doc = _inthiswork(post, set(batch) - seen)
+            post_id = post["id"]
+            seen.add(post_id)
+            if same_inthiswork_post(locators[post_id], doc):
+                checked[post_id] = (doc, inspect_document(doc))
     # Fetch every batch before starting the write transaction. A failed request preserves previous facts.
     with closing(sqlite3.connect(Path(state_db).resolve().as_uri() + "?mode=rw", uri=True, timeout=30)) as db, db:
         db.execute("BEGIN IMMEDIATE")

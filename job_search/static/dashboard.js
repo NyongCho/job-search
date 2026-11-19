@@ -21,7 +21,7 @@ if (list) {
   }
   window.addEventListener("pagehide", () => {
     if (getComputedStyle(list).display !== "none") {
-      storage.set(key, JSON.stringify({ list: list.scrollTop, page: window.scrollY }));
+      storage.set(`job-list:${list.dataset.scrollKey}`, JSON.stringify({ list: list.scrollTop, page: window.scrollY }));
     }
   });
 }
@@ -33,12 +33,148 @@ async function post(url, data) {
     body: JSON.stringify(data),
   });
   const result = await response.json();
-  if (!response.ok) throw new Error(result.message || "저장하지 못했어요. 다시 시도해 주세요.");
+  if (!response.ok) {
+    const error = new Error(result.message || "저장하지 못했어요. 다시 시도해 주세요.");
+    error.result = result;
+    throw error;
+  }
   return result;
+}
+
+function deadlinePreview(input, automatic, now = Date.now()) {
+  if (input.kind === "unknown") return automatic.closed;
+  if (input.kind === "rolling") return false;
+  if (!input.date || (input.kind === "datetime" && !input.time)) return null;
+  if (input.kind === "date") {
+    const koreaDate = new Date(now + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    return koreaDate > input.date;
+  }
+  return now >= Date.parse(`${input.date}T${input.time}:00+09:00`) + 60000;
+}
+
+function deadlineWarning(expired, next) {
+  if (next === true && !expired) return "저장하면 이 공고가 다시 만료로 표시됩니다.";
+  if (next === false && expired) return "저장하면 이 공고의 만료 표시가 해제됩니다.";
+  return "";
+}
+
+function wireDeadline(dialog, id) {
+  const edit = document.querySelector("#deadline-edit");
+  const refresh = document.querySelector("#deadline-refresh");
+  const status = document.querySelector("#deadline-status");
+  const form = dialog.querySelector("form");
+  const fields = form.querySelector(".deadline-fields");
+  const warning = form.querySelector("#deadline-warning");
+  const error = form.querySelector("#deadline-error");
+  const save = form.querySelector('button[type="submit"]');
+  const cancel = form.querySelector("[data-deadline-cancel]");
+  const controls = form.elements;
+  let snapshot = JSON.parse(dialog.dataset.deadline);
+  let pending = false;
+
+  function drawFields() {
+    const manual = controls.mode.value === "manual";
+    fields.hidden = !manual;
+    for (const label of fields.querySelectorAll("[data-deadline-kinds]")) {
+      label.hidden = !label.dataset.deadlineKinds.split(" ").includes(controls.kind.value);
+      label.querySelector("input, select").disabled = !manual || label.hidden;
+    }
+    controls.kind.disabled = !manual;
+    const input = {kind: controls.kind.value, date: controls.date.value, time: controls.time.value};
+    const next = manual ? deadlinePreview(input, snapshot.auto) : snapshot.auto.is_expired;
+    warning.textContent = deadlineWarning(snapshot.expired, next);
+  }
+
+  function applyScreen(html) {
+    const updated = new DOMParser().parseFromString(html, "text/html");
+    const freshDialog = updated.querySelector("#deadline-dialog");
+    snapshot = JSON.parse(freshDialog.dataset.deadline);
+    for (const selector of ["#deadline-auto-value", "#deadline-manual-value"]) {
+      dialog.querySelector(selector).replaceChildren(...freshDialog.querySelector(selector).childNodes);
+    }
+    const freshBadge = updated.querySelector("#deadline-edit");
+    edit.className = freshBadge.className;
+    edit.setAttribute("aria-label", freshBadge.getAttribute("aria-label"));
+    edit.replaceChildren(...freshBadge.childNodes);
+    for (const selector of [".detail-meta", ".detail-actions", ".list-title > span", ".summary-strip"]) {
+      document.querySelector(selector).replaceWith(updated.querySelector(selector));
+    }
+    const counts = updated.querySelectorAll(".nav-count");
+    document.querySelectorAll(".nav-count").forEach((count, i) => { count.textContent = counts[i].textContent; });
+    const freshList = updated.querySelector("#job-list");
+    const scrollTop = list.scrollTop;
+    list.replaceChildren(...freshList.childNodes);
+    list.dataset.scrollKey = freshList.dataset.scrollKey;
+    list.scrollTop = scrollTop;
+    detail.querySelector(".back-link").href = updated.querySelector(".back-link").href;
+    drawFields();
+  }
+
+  function showStatus(message, failed = false) {
+    status.textContent = message;
+    status.classList.toggle("error", failed);
+  }
+
+  edit.addEventListener("click", () => {
+    if (pending || dialog.open) return;
+    const initial = snapshot.manual || snapshot.auto;
+    controls.mode.value = snapshot.manual ? "manual" : "auto";
+    for (const key of ["kind", "date", "time", "word"]) controls[key].value = initial[key];
+    if (!controls.word.value) controls.word.value = "상시 채용";
+    error.textContent = "";
+    drawFields();
+    dialog.showModal();
+    edit.setAttribute("aria-expanded", "true");
+    form.querySelector('input[name="mode"]:checked').focus();
+  });
+  form.addEventListener("input", drawFields);
+  cancel.addEventListener("click", () => { if (!pending) dialog.close(); });
+  dialog.addEventListener("cancel", event => { if (pending) event.preventDefault(); });
+  dialog.addEventListener("close", () => {
+    edit.setAttribute("aria-expanded", "false");
+    edit.focus({preventScroll: true});
+  });
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    if (pending) return;
+    const payload = Object.fromEntries(new FormData(form));
+    if (payload.mode === "auto") payload.version = snapshot.auto.version;
+    pending = save.disabled = cancel.disabled = true;
+    error.textContent = "";
+    try {
+      const result = await post(`/jobs/${id}/deadline${location.search}`, payload);
+      applyScreen(result.html);
+      showStatus(result.message);
+      dialog.close();
+    } catch (failure) {
+      if (failure.result?.error === 409) applyScreen(failure.result.html);
+      error.textContent = failure instanceof TypeError ? "연결을 확인한 뒤 다시 시도해 주세요." : failure.message;
+    } finally {
+      pending = save.disabled = cancel.disabled = false;
+    }
+  });
+  refresh?.addEventListener("click", async () => {
+    if (pending) return;
+    pending = true;
+    refresh.setAttribute("aria-disabled", "true");
+    showStatus("출처 확인 중…");
+    try {
+      const result = await post(`/jobs/${id}/deadline/refresh${location.search}`, {});
+      applyScreen(result.html);
+      showStatus(result.message + (snapshot.manual ? " 직접 입력값을 유지했어요." : ""));
+    } catch (failure) {
+      showStatus(failure instanceof TypeError ? "연결을 확인한 뒤 다시 시도해 주세요." : failure.message, true);
+    } finally {
+      pending = false;
+      refresh.removeAttribute("aria-disabled");
+    }
+  });
 }
 
 if (detail) {
   const id = detail.dataset.jobId;
+  const deadlineDialog = document.querySelector("#deadline-dialog");
+  if (deadlineDialog) wireDeadline(deadlineDialog, id);
   const message = document.querySelector("#save-status");
   const buttons = [...detail.querySelectorAll("[data-status]")];
   const forms = [...detail.querySelectorAll(".progress-form")];

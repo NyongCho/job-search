@@ -4,6 +4,23 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const test = require('node:test');
 const path = require('node:path');
+const script = fs.readFileSync(path.join(__dirname, '../job_search/static/dashboard.js'), 'utf8');
+
+test('deadline preview applies the same closure and Korea time rules as saving', () => {
+  const {deadlinePreview, deadlineWarning} = vm.runInNewContext(
+    script + '\n;({deadlinePreview, deadlineWarning});', {document: {querySelector() { return null; }}});
+  const beforeMidnight = Date.parse('2026-11-15T14:59:59.995Z');
+  const auto = {kind: 'unknown', closed: true, is_expired: true};
+  const input = kind => ({kind, date: '2026-11-15', time: '23:59'});
+  assert.equal(deadlinePreview(input('date'), auto, beforeMidnight), false);
+  assert.equal(deadlinePreview(input('date'), auto, beforeMidnight + 10), true);
+  assert.equal(deadlinePreview(input('datetime'), auto, beforeMidnight), false);
+  assert.equal(deadlinePreview(input('rolling'), auto, beforeMidnight), false);
+  assert.equal(deadlinePreview(input('unknown'), auto, beforeMidnight), true);
+  assert.match(deadlineWarning(false, true), /다시 만료/);
+  assert.match(deadlineWarning(true, false), /만료 표시가 해제/);
+  assert.equal(deadlineWarning(false, false), '');
+});
 
 test('saving one stage retains sibling unsaved notes and updates its badge', async () => {
   const classList = { add() {}, remove() {} };
@@ -27,7 +44,7 @@ test('saving one stage retains sibling unsaved notes and updates its badge', asy
   const preview = {textContent:''};
   let reloads = 0;
   const writes = [];
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../job_search/static/dashboard.js'),'utf8'), {
+  vm.runInNewContext(script, {
     document: {querySelector(selector) {return {'#job-detail':detail,'#save-status':message,
       'meta[name="csrf-token"]':{content:'csrf'}, '.job-row.selected .progress-preview':preview}[selector] || null;}},
     sessionStorage: {getItem(){return null;}, setItem(){}, removeItem(){}},

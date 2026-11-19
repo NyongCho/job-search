@@ -78,7 +78,8 @@ def source_locator(doc):
     company, _, role = title.partition("｜") if isinstance(title, str) else ("", "", "")
     if source == "inthiswork":
         post_id = _id(doc.get("id"))
-        if host in {"inthiswork.com", "www.inthiswork.com"} and post_id and path == f"/archives/{post_id}":
+        if (host in {"inthiswork.com", "www.inthiswork.com"} and post_id and path == f"/archives/{post_id}"
+                and company_key(company) and role_key(role)):
             return SourceLocator(source, url, post_id, host, company.strip(), role.strip())
         return None
     original_id = _id(doc.get("source_job_id"))
@@ -97,6 +98,13 @@ def source_locator(doc):
     if scope:
         return SourceLocator(source, url, original_id, scope, company.strip(), role.strip())
     return None
+
+
+def same_inthiswork_post(locator, fresh):
+    match = source_locator(fresh)
+    return (match and match.source == locator.source and match.original_id == locator.original_id
+            and company_key(match.company) == company_key(locator.company)
+            and role_key(match.role) == role_key(locator.role))
 
 
 @dataclass(frozen=True)
@@ -185,7 +193,14 @@ def _wanted(locator, url, page):
     lines = []
     for field in ("intro", "main_tasks", "requirements", "hire_rounds"):
         lines.extend(_lines(posting.get(field), url))
-    return SourcePosting(lines, posting.get("due_time"), status == "closed", company.get("logo_image"),
+    due = posting.get("due_time")
+    if not due:
+        articles = re.findall(r"<article\b[^>]*\bJobDueTime_JobDueTime__\w+[^>]*>(.*?)</article\s*>", page, re.S)
+        if len(articles) == 1:
+            field = _lines(articles[0], url)
+            if len(field) == 2 and field[0] == "마감일":
+                lines.insert(0, "접수 마감: " + field[1])
+    return SourcePosting(lines, due, status == "closed", company.get("logo_image"),
                          f"wanted:{company_id}")
 
 
