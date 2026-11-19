@@ -44,6 +44,11 @@ def write_json(path, value):
         output.flush()
         os.fsync(output.fileno())
     os.replace(temporary, path)
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def switch(root, release):
@@ -147,7 +152,25 @@ def restore_schedules(transaction, config):
         service('start', 'job-availability.timer')
 
 
-def activate(root, release, config):
+def restore_web(transaction, root, previous, config):
+    switch(root, previous)
+    if transaction.get('web_was_active', True):
+        service('restart', 'job-dashboard.service')
+        return healthy(config)
+    service('stop', 'job-dashboard.service')
+    return True
+
+
+def database_paths(root):
+    return root / 'data/jobs.sqlite', root / 'data/dashboard/dashboard.sqlite'
+
+
+def migrate_database(release, path, kind):
+    code = 'import sys; from job_search.migrate_card_metadata import migrate_database; migrate_database(*sys.argv[1:])'
+    run([release / '.venv-dashboard/bin/python', '-c', code, path, kind], cwd=release)
+
+
+def activate(root, release, config, *, migrate_cards=False):
     journal = root / '.deploy/transaction.json'
     if journal.exists():
         raise RuntimeError('Interrupted deployment: run local --recover before deploying again')
@@ -155,11 +178,18 @@ def activate(root, release, config):
     if not (root / 'current').is_symlink():
         raise RuntimeError('Bootstrap a current release before enabling deployment')
     reason = 'job-search-deploy:' + release.name
+    backup = root / '.deploy/backups' / release.name
     transaction = {'previous': str(previous), 'release': str(release), 'reason': reason,
                    'resume_job': bool(hermes('get', config, reason)['enabled']),
-                   'restart_timer': service('is-active', 'job-availability.timer') == 'active',
-                   'web_stopped': False}
-    write_json(journal, transaction)
+                   'restart_timer': service('is-active', 'job-availability.timer') in {'active', 'activating'},
+                   'web_was_active': service('is-active', 'job-dashboard.service') in {'active', 'activating'},
+                   'web_stopped': False, 'backup': str(backup), 'migrate_cards': migrate_cards}
+
+    def checkpoint(phase):
+        transaction['phase'] = phase
+        write_json(journal, transaction)
+
+    checkpoint('pausing_writers')
     clear_journal = False
     try:
         if transaction['resume_job']:
@@ -169,22 +199,30 @@ def activate(root, release, config):
         if fetch_main(root, config)[1] != (release / '.revision').read_text().strip():
             raise RuntimeError('Main changed while waiting; deploy the newer workflow run')
         transaction['web_stopped'] = True
-        write_json(journal, transaction)
+        checkpoint('backing_up')
         service('stop', 'job-dashboard.service')
-        backup = root / '.deploy/backups' / release.name
-        backup_database(root / 'data/jobs.sqlite', backup / 'jobs.sqlite')
-        backup_database(root / 'data/dashboard/dashboard.sqlite', backup / 'dashboard.sqlite')
+        jobs, state = database_paths(root)
+        backup_database(jobs, backup / 'jobs.sqlite')
+        backup_database(state, backup / 'dashboard.sqlite')
+        if migrate_cards:
+            checkpoint('migrating_jobs')
+            migrate_database(release, jobs, 'jobs')
+            checkpoint('migrating_state')
+            migrate_database(release, state, 'state')
+            checkpoint('checking_migration')
+            validate_startup(root, release, config)
+        checkpoint('starting_candidate')
         switch(root, release)
         service('start', 'job-dashboard.service')
         if not healthy(config):
             raise RuntimeError('New release failed health check')
+        if not transaction['web_was_active']:
+            service('stop', 'job-dashboard.service')
+        checkpoint('restoring_schedules')
         clear_journal = True
     except BaseException:
-        if transaction['web_stopped']:
-            switch(root, previous)
-            service('restart', 'job-dashboard.service')
-            if not healthy(config):
-                raise RuntimeError('Rollback health failed; inspect transaction.json and recover')
+        if transaction['web_stopped'] and not restore_web(transaction, root, previous, config):
+            raise RuntimeError('Rollback health failed; inspect transaction.json and recover')
         clear_journal = True
         raise
     finally:
@@ -205,9 +243,7 @@ def recover(root, config):
     service('stop', 'job-availability.timer')
     wait_idle(config)
     if transaction['web_stopped']:
-        switch(root, previous)
-        service('restart', 'job-dashboard.service')
-        if not healthy(config):
+        if not restore_web(transaction, root, previous, config):
             raise RuntimeError('Recovery health check failed')
     restore_schedules(transaction, config)
     journal.unlink()
@@ -226,11 +262,7 @@ def environment(path):
     return values
 
 
-def validate_startup(root, release, config):
-    check = root / '.deploy/checks' / release.name
-    jobs, state = check / 'jobs.sqlite', check / 'dashboard.sqlite'
-    backup_database(root / 'data/jobs.sqlite', jobs)
-    backup_database(root / 'data/dashboard/dashboard.sqlite', state)
+def check_release(root, release, config, jobs, state):
     before = [schema(jobs), schema(state)]
     env = environment(config['environment_file'])
     env.update(JOBS_DB=str(jobs), DASHBOARD_STATE_DB=str(state))
@@ -247,6 +279,55 @@ with app.test_client() as client:
         raise RuntimeError('Schema change requires an explicit migration; automatic deployment refused')
 
 
+def check_previous_writer(release, jobs, state):
+    code = '''
+import sqlite3,sys
+from contextlib import closing
+from datetime import datetime,timezone
+from urllib.parse import parse_qs,urlsplit
+from job_search.collect_jobs import collect
+from job_search.refresh_job_availability import refresh
+
+jobs,state=sys.argv[1:]
+with closing(sqlite3.connect(jobs)) as db:
+    item=db.execute("SELECT coalesce(max(id), 0)+1 FROM posts").fetchone()[0]
+now=datetime.now(timezone.utc)
+stamp=now.replace(tzinfo=None).isoformat()
+post={"id":item,"link":f"https://inthiswork.com/archives/{item}","date_gmt":stamp,"modified_gmt":stamp,
+      "title":{"rendered":"Migration Check Company｜Test role"},"content":{"rendered":"<p>지원 마감: 2099-12-01</p>"},
+      "categories":[191700167]}
+collect(jobs,lambda _:([post],1),now,advance_checkpoint=False)
+with closing(sqlite3.connect(jobs)) as db,db:
+    db.execute("UPDATE posts SET decision='recommend' WHERE id=?",(item,))
+def fetch(url):
+    ids=parse_qs(urlsplit(url).query).get("include",[""])[0].split(",")
+    return ([post] if str(item) in ids else []),1
+refresh(jobs,state,fetch,now)
+with closing(sqlite3.connect(state)) as db:
+    saved=db.execute("SELECT deadline_at FROM job_availability WHERE post_id=?",(item,)).fetchone()
+    assert saved and saved[0].startswith("2099-12-01")
+'''
+    before = [schema(jobs), schema(state)]
+    run([release / '.venv-dashboard/bin/python', '-c', code, jobs, state], cwd=release)
+    if before != [schema(jobs), schema(state)]:
+        raise RuntimeError('Previous release modified the migrated schema')
+
+
+def validate_startup(root, release, config, *, migrate_cards=False):
+    check = root / '.deploy/checks' / release.name
+    jobs, state = check / 'jobs.sqlite', check / 'dashboard.sqlite'
+    source, personal = database_paths(root)
+    backup_database(source, jobs)
+    backup_database(personal, state)
+    if migrate_cards:
+        run([release / '.venv-dashboard/bin/python', '-m', 'job_search.migrate_card_metadata',
+             '--jobs-db', jobs, '--state-db', state], cwd=release)
+        previous = (root / 'current').resolve(strict=True)
+        check_release(root, previous, config, jobs, state)
+        check_previous_writer(previous, jobs, state)
+    check_release(root, release, config, jobs, state)
+
+
 def fetch_main(root, config):
     repository = root / '.deploy/repository.git'
     if not repository.exists():
@@ -256,7 +337,7 @@ def fetch_main(root, config):
     return repository, run(['git', '--git-dir', repository, 'rev-parse', 'refs/heads/main'])
 
 
-def deploy(root, revision, config):
+def deploy(root, revision, config, *, migrate_cards=False):
     if (root / '.deploy/transaction.json').exists():
         raise RuntimeError('Interrupted deployment: run local --recover first')
     repository, latest = fetch_main(root, config)
@@ -277,7 +358,7 @@ def deploy(root, revision, config):
     run([python, '-m', 'pip', 'install', '-r', release / 'requirements.txt'])
     print('Testing candidate release', flush=True)
     run(['make', 'test', 'PYTHON=' + str(python)], cwd=release)
-    validate_startup(root, release, config)
+    validate_startup(root, release, config, migrate_cards=migrate_cards)
     for name in ['data', 'deployment.json', 'hermes_job_prompt.txt', 'company_research.json']:
         if (release / name).exists() or (release / name).is_symlink():
             raise RuntimeError('Release must not contain private runtime files')
@@ -286,7 +367,7 @@ def deploy(root, revision, config):
     if fetch_main(root, config)[1] != revision:
         raise RuntimeError('Main changed during preparation; deploy the newer workflow run')
     print('Waiting for jobs, backing up data, and activating', flush=True)
-    activate(root, release, config)
+    activate(root, release, config, migrate_cards=migrate_cards)
     print('Deployed ' + revision + '; health verified', flush=True)
 
 
@@ -298,7 +379,9 @@ def main():
     config = json.loads((state / 'config.json').read_text())
     command = os.environ.get('SSH_ORIGINAL_COMMAND')
     recovery = command is None and sys.argv[1:] == ['--recover']
-    revision = None if recovery else parse_revision(command if command is not None else 'deploy ' + ' '.join(sys.argv[1:]))
+    migrate_cards = command is None and sys.argv[1:2] == ['--migrate-card-metadata']
+    arguments = sys.argv[2:] if migrate_cards else sys.argv[1:]
+    revision = None if recovery else parse_revision(command if command is not None else 'deploy ' + ' '.join(arguments))
     (state / 'logs').mkdir(exist_ok=True)
     LOG = state / 'logs' / (time.strftime('%Y%m%d-%H%M%S') + '.log')
     with (state / 'deploy.lock').open('a') as lock:
@@ -310,7 +393,7 @@ def main():
             recover(root, config)
             print('Previous release and schedules recovered')
         else:
-            deploy(root, revision, config)
+            deploy(root, revision, config, migrate_cards=migrate_cards)
 
 
 if __name__ == '__main__':

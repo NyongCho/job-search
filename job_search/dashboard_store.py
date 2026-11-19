@@ -64,6 +64,14 @@ def _connect(path, mode):
     return db
 
 
+def check_card_metadata(jobs_db, state_db):
+    with closing(_connect(jobs_db, "ro")) as jobs, closing(_connect(state_db, "ro")) as state:
+        jobs.execute("SELECT company_key,source_page,image_url,image,checked_at FROM company_logos LIMIT 0")
+        jobs.execute("SELECT post_id,company_key,document_version,outcome FROM job_company_logos LIMIT 0")
+        state.execute("SELECT post_id,checked_at,document_version,deadline_kind,deadline_word FROM job_deadline_facts LIMIT 0")
+        state.execute("SELECT post_id,deadline_at,deadline_kind,deadline_word FROM job_deadline_overrides LIMIT 0")
+
+
 def init_state_db(jobs_db: Path, state_db: Path) -> None:
     source, state = _validate_paths(jobs_db, state_db)
     with closing(_connect(source, "ro")) as db:

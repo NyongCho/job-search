@@ -183,6 +183,7 @@ def create_app(config=None):
     @app.get("/healthz")
     def health():
         try:
+            store.check_card_metadata(source, state)
             store.list_jobs(source, state)
         except (OSError, sqlite3.Error, ValueError):
             return jsonify(status="unavailable"), 503
@@ -224,7 +225,14 @@ def create_production_app():
     config = _environment()
     if config["DEV_MODE"]:
         raise ValueError("Development bypass is disabled in the production entry point")
-    return create_app(config)
+    app = create_app(config)
+    try:
+        store.check_card_metadata(config["JOBS_DB"], config["STATE_DB"])
+    except sqlite3.OperationalError as error:
+        if str(error).startswith(("no such table:", "no such column:")):
+            raise RuntimeError("Run job_search.migrate_card_metadata before starting this release") from error
+        raise
+    return app
 
 
 if __name__ == "__main__":

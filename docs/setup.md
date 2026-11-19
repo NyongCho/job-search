@@ -26,11 +26,17 @@ export DASHBOARD_SECRET_KEY="$(.venv-dashboard/bin/python -c 'import secrets; pr
 
 기본 데이터 경로는 `data/jobs.sqlite`, `data/dashboard/dashboard.sqlite`입니다. 앱 코드 폴더 안에 DB를 생성하지 않습니다. 웹앱에서는 `JOBS_DB`, `DASHBOARD_STATE_DB`로 변경할 수 있고, 수집기에서는 `--db`를 하위 명령 앞에 지정합니다.
 
+기존 DB를 다시 사용하는 경우 먼저 [마감·기업 로고 테이블 이전](deployment.md#마감기업-로고-테이블을-추가하는-첫-배포)을 진행합니다. 이전을 마친 공고의 기업 로고는 다음 명령을 반복 실행해 나눠 채울 수 있습니다. 새로 수집하거나 변경된 공고는 수집이 끝난 뒤 일부씩 처리합니다.
+
+```sh
+.venv-dashboard/bin/python -m job_search.company_logos --db data/jobs.sqlite --limit 20
+```
+
 ## Hermes와 Slack
 
 루트 `deployment.json`에 실제 작업 ID·Slack 채널·웹 주소를 기록합니다. [설정 예시](../deploy/deployment.example.json)를 참고하며 기존 설정은 보존합니다. JSON만 작성하면 예약되는 것은 아닙니다. Hermes에서 작업을 만들고 그 ID와 실행 설정을 일치시켜야 합니다.
 
-이 저장소용 프리런은 [scripts/hermes_collect.py](../scripts/hermes_collect.py)입니다. 기본 앱 위치 `~/job_search`, 기본 Hermes 홈 `~/.hermes`를 사용하며, Hermes의 `scripts/`에 복사해 실행해도 앱 패키지를 찾습니다. 프리런은 실제 활성 실행 ID를 요구하므로 수동 시험 대신 Hermes 작업을 통해 실행합니다.
+이 저장소용 프리런은 [scripts/hermes_collect.py](../scripts/hermes_collect.py)입니다. 기본 앱 위치 `~/job_search`, 기본 Hermes 홈 `~/.hermes`를 사용하며, Hermes의 `scripts/`에 복사해 실행해도 앱 패키지를 찾습니다. 프리런은 설치된 릴리스의 `.venv-dashboard`에서 수집과 로고 처리를 실행합니다. 프리런은 실제 활성 실행 ID를 요구하므로 수동 시험 대신 Hermes 작업을 통해 실행합니다.
 
 새 설치에서 기본 프롬프트를 만들 때는 루트에서 다음 명령을 사용합니다. 이미 `hermes_job_prompt.txt`가 있으면 덮어쓰지 않고 실패합니다.
 
