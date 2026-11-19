@@ -23,10 +23,15 @@
       </a>
       {% endfor %}
     </nav>
-    <div class="sidebar-footer">{% if dev_mode %}로컬 미리보기{% else %}PRIVATE · TAILSCALE{% endif %}</div>
+    {% if g.profile_name %}
+    <div class="sidebar-footer">
+      <span class="profile-avatar" aria-hidden="true"></span>
+      <span class="profile-name" title="{{ g.profile_name }}">{{ g.profile_name }}</span>
+      <span class="profile-settings" role="img" aria-label="설정" title="설정">⚙︎</span>
+    </div>
+    {% endif %}
   </aside>
   <main id="main" class="main-shell">
-    <header class="topbar"><div class="breadcrumb">워크스페이스 <span>/</span> 채용함</div><div class="profile-chip"><span>N</span>MY SPACE</div></header>
     {% if error %}
       <section class="error-page"><span class="eyebrow">{{ error.code }}</span><h1>{{ error.message }}</h1><a class="primary-button" href="{{ url_for('index') }}">채용함으로 돌아가기</a></section>
     {% else %}
