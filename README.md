@@ -29,6 +29,7 @@ python3 -m venv .venv-dashboard
 
 - [로컬 웹앱 · Hermes · 서버 설치](docs/setup.md)
 - [개발 · 테스트 · 구조 변경 안내](docs/development.md)
+- [브랜치·커밋·PR 작성 규칙](docs/git-conventions.md)
 - [GitHub Actions · Tailscale 자동 배포](docs/deployment.md)
 - [Codex·Hermes에서 사용하는 스킬](skills/job-search-pipeline/SKILL.md)
 
