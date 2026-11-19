@@ -67,7 +67,8 @@ def _connect(path, mode):
 def check_card_metadata(jobs_db, state_db):
     with closing(_connect(jobs_db, "ro")) as jobs, closing(_connect(state_db, "ro")) as state:
         jobs.execute("SELECT company_key,source_page,image_url,image,checked_at FROM company_logos LIMIT 0")
-        jobs.execute("SELECT post_id,company_key,document_version,outcome FROM job_company_logos LIMIT 0")
+        jobs.execute("""SELECT post_id,fingerprint,document_version,identity,company_key,outcome,attempted_at,lease_until
+            FROM job_company_logos LIMIT 0""")
         state.execute("SELECT post_id,checked_at,document_version,deadline_kind,deadline_word FROM job_deadline_facts LIMIT 0")
         state.execute("SELECT post_id,deadline_at,deadline_kind,deadline_word FROM job_deadline_overrides LIMIT 0")
 

@@ -62,7 +62,11 @@ class LogoTests(unittest.TestCase):
             self.assertEqual(image.size, (48, 36))
 
     def test_body_logo_avoids_page_fetch_and_same_company_reuses_verified_copy(self):
-        self.collect([self.body_logo(1), self.body_logo(2)], logo_fetch=self.fetch)
+        def after_commit(url, **options):
+            with closing(sqlite3.connect(self.jobs)) as db:
+                self.assertEqual(db.execute("SELECT count(*) FROM posts").fetchone()[0], 2)
+            return self.fetch(url, **options)
+        self.collect([self.body_logo(1), self.body_logo(2)], logo_fetch=after_commit)
         self.assertEqual(self.calls, [self.acme_image])
         self.assert_logo(1)
         self.assert_logo(2)
@@ -117,6 +121,17 @@ class LogoTests(unittest.TestCase):
         company_logos.refresh_logos(self.jobs, limit=1, fetch=fetch)
         self.assertIsNone(company_logos.read_logo(self.jobs, 1))
         self.assert_logo(2)
+
+    def test_temporary_failure_keeps_verified_logo_on_same_company_post_revision(self):
+        self.collect([self.body_logo(1)], logo_fetch=self.fetch)
+        saved = company_logos.read_logo(self.jobs, 1)
+        new = "https://assets.example.com/updated.png"
+        def failed(url, **_):
+            if url == new or url == self.acme_page:
+                raise TimeoutError("temporary")
+            self.fail(f"Unexpected request: {url}")
+        self.collect([self.body_logo(1, new)], logo_fetch=failed)
+        self.assertEqual(company_logos.read_logo(self.jobs, 1), saved)
 
     def test_recollection_during_download_cannot_link_old_logo_to_different_company(self):
         self.collect([branded_post(1, content=f'<img alt="Acme 로고" src="{self.acme_image}">')])
