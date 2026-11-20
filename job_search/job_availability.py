@@ -155,8 +155,14 @@ def availability(doc, cached=None, now=None, *, override=None):
     manual = deadline_view({**override, "closed": bool(facts["closed"] and override["deadline_kind"] == "unknown")},
                            now) if override else None
     effective = manual or auto
+    closure_confirmed = None
+    if effective["closed"]:
+        # A later refresh of the same closed posting does not move its closure forward.
+        modified = facts.get("source_modified_at") if checked else doc.get("modified_gmt")
+        closure_confirmed = min(filter(None, (_stamp(checked), _stamp(modified))), default=None)
     return {"is_expired": effective["is_expired"], "deadline_kind": effective["kind"],
             "deadline_label": effective["label"],
             "deadline_at": (override or facts).get("deadline_at"),
+            "closure_confirmed_at": closure_confirmed.isoformat() if closure_confirmed else None,
             "availability_evidence": facts["evidence"], "availability_checked_at": checked,
             "deadline_auto": auto, "deadline_manual": manual}

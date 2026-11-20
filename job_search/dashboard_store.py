@@ -255,8 +255,9 @@ def _company_order(item):
 def _deadline_order(item, now):
     stamp = timestamp(item["deadline_at"])
     if item["is_expired"]:
-        # An early closure can leave a future scheduled deadline on the card.
-        if stamp and stamp <= now:
+        # A scheduled deadline after a confirmed closure is not the actual closing date.
+        confirmed = timestamp(item["closure_confirmed_at"])
+        if stamp and stamp <= now and (not confirmed or stamp <= confirmed):
             return 3, -datetime.fromisoformat(stamp).timestamp()
         return 4, 0
     if stamp:
