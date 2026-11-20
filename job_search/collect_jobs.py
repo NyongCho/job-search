@@ -1,10 +1,11 @@
-"""Inthiswork JD collection and evidence-backed review queue (stdlib only)."""
+"""Inthiswork JD collection and evidence-backed review queue."""
 
 import argparse
 import hashlib
 import html
 import json
 import sqlite3
+import sys
 import time
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -13,9 +14,12 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .card_metadata import create_logo_tables, has_table
+from .company_logos import enqueue_logo, refresh_logos
 from .evidence import Document, application_link
+from .job_sources import INTHISWORK_API
 
-API = "https://inthiswork.com/wp-json/wp/v2/posts"
+API = INTHISWORK_API
 FIELDS = "id,date_gmt,modified_gmt,link,title,content,categories"
 JOB_CATEGORIES = {191700167, 191700168}
 CLOSED = 191700169
@@ -27,6 +31,7 @@ def connect(path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path, timeout=30)
     db.row_factory = sqlite3.Row
+    fresh = not has_table(db, "posts")
     db.executescript("""
         CREATE TABLE IF NOT EXISTS posts (
             id INTEGER PRIMARY KEY, document TEXT NOT NULL, fingerprint TEXT NOT NULL,
@@ -38,6 +43,10 @@ def connect(path):
             delivered INTEGER NOT NULL DEFAULT 0
         );
     """)
+    if fresh:
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            create_logo_tables(db)
     return db
 
 
@@ -77,7 +86,8 @@ def extract(post):
     }
 
 
-def collect(path, fetch_page=request_json, now=None, *, start=None, advance_checkpoint=True):
+def collect(path, fetch_page=request_json, now=None, *, start=None, advance_checkpoint=True, logo_fetch=None):
+    started = time.monotonic()
     now = now or datetime.now(timezone.utc)
     previous = checkpoint(path)
     if start is None:
@@ -99,22 +109,34 @@ def collect(path, fetch_page=request_json, now=None, *, start=None, advance_chec
 
     result = {"new": 0, "changed": 0, "fetched_jobs": len(documents)}
     with closing(connect(path)) as db, db:
+        logos_available = has_table(db, "job_company_logos")
         for post_id, doc in documents.items():
             serialized = json.dumps(doc, ensure_ascii=False, sort_keys=True)
             fingerprint = hashlib.sha256(serialized.encode()).hexdigest()
             old = db.execute("SELECT fingerprint FROM posts WHERE id=?", (post_id,)).fetchone()
+            if old is not None and old[0] == fingerprint:
+                continue
             if old is None:
                 db.execute("INSERT INTO posts(id,document,fingerprint) VALUES(?,?,?)",
                            (post_id, serialized, fingerprint))
                 result["new"] += 1
-            elif old[0] != fingerprint:
+            else:
                 db.execute("""UPDATE posts SET document=?,fingerprint=?,decision=NULL,reason=NULL,
                            evidence_lines=NULL,reviewed_at=NULL WHERE id=?""", (serialized, fingerprint, post_id))
                 result["changed"] += 1
+            if logos_available and post_id > 0:
+                enqueue_logo(db, post_id, doc, fingerprint)
         if advance_checkpoint:
             db.execute("INSERT OR REPLACE INTO metadata VALUES('last_success',?)", (now.isoformat(),))
     if not advance_checkpoint:
         result["ids"] = sorted(documents)
+    if logos_available and (logo_fetch is not None or fetch_page is request_json):
+        deadline = min(started + 220, time.monotonic() + 8)
+        options = {"fetch": logo_fetch} if logo_fetch is not None else {}
+        try:
+            refresh_logos(path, limit=3, deadline=deadline, seed=False, **options)
+        except (OSError, sqlite3.Error):
+            print("Company logos will be retried in a later run.", file=sys.stderr)
     return result
 
 

@@ -42,7 +42,9 @@ def main():
     if dashboard_url:
         payload["dashboard_url"] = dashboard_url
     if not retry:
-        result = subprocess.run(["/usr/bin/python3", "-m", "job_search.collect_jobs", "collect"],
+        python = next((path for release in (root / "current", root)
+                       if (path := release / ".venv-dashboard/bin/python").is_file()), "/usr/bin/python3")
+        result = subprocess.run([str(python), "-m", "job_search.collect_jobs", "collect"],
                                 cwd=root, capture_output=True, text=True, timeout=240, check=True)
         payload.update(json.loads(result.stdout))
     print(json.dumps(payload, ensure_ascii=False))

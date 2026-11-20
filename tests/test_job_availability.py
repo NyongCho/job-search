@@ -19,6 +19,39 @@ def document(*lines, published="2026-11-01T02:15:44"):
 
 
 class DeadlineTests(unittest.TestCase):
+    def test_deadline_kind_and_display_follow_the_original_precision(self):
+        cases = [
+            ("접수기한2026.11.18 ~ 2026.12.02 23:59", "datetime", "12.02 23:59 마감"),
+            ("서류 접수 : 10월 30일 ~ 11월 15일", "date", "11.15 마감"),
+            ("지원 마감: 2026-11-15 24:00", "datetime", "11.15 24:00 마감"),
+            ("접수마감: 상시채용", "rolling", "상시 채용"),
+            ("채용시 마감", "rolling", "채용 시 마감"),
+            ("조기 마감될 수 있습니다", "unknown", "마감일 미확인"),
+            ("면접 일정: 11월 27일", "unknown", "마감일 미확인"),
+            ("공고 상세", "unknown", "마감일 미확인"),
+        ]
+        for line, kind, label in cases:
+            with self.subTest(line=line):
+                doc = document(line)
+                self.assertEqual(inspect_document(doc).get("deadline_kind"), kind)
+                self.assertEqual(availability(doc)["deadline_label"], label)
+
+    def test_date_remains_open_until_kst_midnight_at_subsecond_precision(self):
+        doc = document("11/15 접수 마감")
+        self.assertFalse(availability(doc, now=datetime(2026, 11, 15, 14, 59, 59, 500000,
+                                                        tzinfo=timezone.utc))["is_expired"])
+
+    def test_legacy_cache_only_displays_clock_confirmed_by_matching_source(self):
+        doc = document("지원 마감: 2026-11-15 23:59")
+        cached = {"deadline_at": "2026-11-15T23:59:59+09:00", "closed": False,
+                  "evidence": "Inthiswork에서 마감 공고로 분류됨", "source_modified_at": doc["modified_gmt"],
+                  "checked_at": "2026-11-02T00:00:00+00:00"}
+        self.assertEqual(availability(doc, cached).get("deadline_label"), "11.15 23:59 마감")
+        cached["source_modified_at"] = "2026-11-02T00:00:00"
+        self.assertEqual(availability(doc, cached).get("deadline_label"), "11.15 마감")
+        cached.update(source_modified_at=doc["modified_gmt"], deadline_at=None)
+        self.assertEqual(availability(doc, cached).get("deadline_label"), "11.15 23:59 마감")
+
     def test_explicit_application_deadlines(self):
         cases = [
             (["지원 접수 마감: 11/15 (일) 23:59"], "2026-11-15T23:59:59+09:00"),
@@ -45,6 +78,14 @@ class DeadlineTests(unittest.TestCase):
                 result = inspect_document(document(*lines))
                 self.assertIsNone(result["deadline_at"])
                 self.assertFalse(result["closed"])
+
+    def test_dated_and_rolling_deadlines_for_different_roles_are_ambiguous(self):
+        doc = document("A직무 지원 마감 2026.12.11", "B직무 채용 시 마감")
+        self.assertEqual(availability(doc)["deadline_label"], "마감일 미확인")
+        doc = document("지원 기한 2026.12.11 (채용 시 조기 마감될 수 있음)")
+        self.assertEqual(availability(doc)["deadline_label"], "12.11 마감")
+        doc = document("A직무 접수 2026.11.10 ~ 2026.11.25, B직무 접수 2026.11.18 ~ 2026.12.11 마감")
+        self.assertEqual(availability(doc)["deadline_label"], "마감일 미확인")
 
     def test_yearless_dates_require_publication_and_roll_december_forward(self):
         self.assertEqual(inspect_document(document("지원 마감: 1/10", published="2026-12-20T00:00:00"))["deadline_at"],
@@ -184,6 +225,39 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(parse_qs(urlsplit(urls[0]).query)['include'], ['1'])
         self.assertEqual(report['unsupported_ids'], [2])
         self.assertFalse(store.get_job(self.source, self.state, 2)['is_expired'])
+
+    def test_automatic_cache_rejects_a_late_write_and_old_writer_metadata(self):
+        refresh(self.source, self.state, lambda _: ([posting(1, content="<p>지원 마감: 2099-11-15 23:59</p>")], 1),
+                datetime(2026, 11, 17, tzinfo=timezone.utc))
+        refresh(self.source, self.state, lambda _: ([posting(1, content="<p>상시 채용</p>")], 1), self.now)
+        job = store.get_job(self.source, self.state, 1)
+        self.assertEqual(job.get("deadline_label"), "11.15 23:59 마감")
+        with closing(sqlite3.connect(self.state)) as db, db:
+            db.execute("INSERT OR REPLACE INTO job_availability VALUES(?,?,?,?,?,?,?)",
+                       (1, 0, "2099-11-20T23:59:59+09:00", "", "2026-11-18T00:00:00+00:00",
+                        "2026-11-18T00:00:00", "https://inthiswork.com/archives/1"))
+        self.assertEqual(store.get_job(self.source, self.state, 1)["deadline_label"], "11.20 마감")
+
+    def test_changed_document_invalidates_cache_even_with_the_same_source_timestamp(self):
+        refresh(self.source, self.state, lambda _: ([posting(1, content="<p>지원 마감: 2020-11-15</p>")], 1), self.now)
+        self.assertTrue(store.get_job(self.source, self.state, 1)["is_expired"])
+        with closing(sqlite3.connect(self.source)) as db, db:
+            doc = json.loads(db.execute("SELECT document FROM posts WHERE id=1").fetchone()[0])
+            doc["lines"] = ["상시 채용"]
+            db.execute("UPDATE posts SET document=? WHERE id=1", (json.dumps(doc),))
+        job = store.get_job(self.source, self.state, 1)
+        self.assertFalse(job["is_expired"])
+        self.assertEqual(job["deadline_label"], "상시 채용")
+        self.assertIsNone(job["availability_checked_at"])
+
+    def test_later_request_with_older_source_version_does_not_erase_extension(self):
+        extended = posting(1, content="<p>지원 마감: 2099-11-27</p>")
+        extended["modified_gmt"] = "2026-11-16T11:00:00"
+        refresh(self.source, self.state, lambda _: ([extended], 1), self.now)
+        old = posting(1, content="<p>지원 마감: 2020-11-15</p>")
+        old["modified_gmt"] = "2026-11-15T11:00:00"
+        refresh(self.source, self.state, lambda _: ([old], 1), datetime(2026, 11, 19, tzinfo=timezone.utc))
+        self.assertEqual(store.get_job(self.source, self.state, 1)["deadline_label"], "11.27 마감")
 
 
 if __name__ == '__main__':

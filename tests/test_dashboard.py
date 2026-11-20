@@ -87,6 +87,46 @@ class WebTests(unittest.TestCase):
         for bad in [{"status": []}, {"status": "hired"}, [], None]:
             self.assertEqual(self.post("/jobs/1/state", bad, token).status_code, 400)
 
+    def test_deadline_update_requires_csrf_and_valid_type_specific_fields(self):
+        path = "/jobs/1/deadline"
+        future = {"mode": "manual", "kind": "datetime", "date": "2099-12-02", "time": "23:59"}
+        token = self.csrf()
+        self.assertEqual(self.post(path, future).status_code, 403)
+        for invalid in [{**future, "date": "2099-02-29"}, {**future, "time": "24:00"},
+                        {**future, "kind": "date"}, {"mode": "manual", "kind": []}]:
+            self.assertEqual(self.post(path, invalid, token).status_code, 400)
+        saved = self.post(path + "?view=recommended&q=Agent&page=1", future, token)
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json["deadline_label"], "12.02 23:59 마감")
+        body = saved.json["html"]
+        self.assertIn('aria-label="마감 정보 수정 · 12.02 23:59 마감"', body)
+        self.assertIn('aria-label="마감 정보 다시 확인"', body)
+        self.assertIn('<dialog id="deadline-dialog"', body)
+        self.assertIn('name="q" value="Agent"', body)
+
+    def test_imported_application_can_edit_deadline_but_cannot_refresh_source(self):
+        dashboard.store.import_profile_jobs(self.source, self.state, [{
+            "source_key": "applications/legacy", "company": "회사", "role": "직무", "summary": "기존 지원",
+            "confirmed_on": "2026-11-15", "source_url": "https://inthiswork.com/archives/1",
+        }])
+        token = self.csrf()
+        self.assertEqual(self.post("/jobs/-1/deadline", {"mode": "manual", "kind": "unknown"}, token).status_code, 200)
+        self.assertIsNotNone(dashboard.store.get_job(self.source, self.state, -1)["deadline_manual"])
+        self.assertEqual(self.post("/jobs/-1/deadline/refresh", {}, token).status_code, 400)
+        self.assertNotIn('id="deadline-refresh"', self.get("/jobs/-1").get_data(as_text=True))
+
+    def test_failed_source_request_leaves_existing_manual_value_and_memo(self):
+        token = self.csrf()
+        self.post("/jobs/1/state", {"status": "applied"}, token)
+        self.post("/jobs/1/progress", {"stage": "interview1", "result": "in_progress", "note": "keep memo"}, token)
+        self.post("/jobs/1/deadline", {"mode": "manual", "kind": "rolling", "word": "상시 채용"}, token)
+        with patch.object(dashboard, "refresh_one", side_effect=dashboard.SourceCheckFailed("마지막 확인값을 유지했어요.")):
+            response = self.post("/jobs/1/deadline/refresh", {}, token)
+        self.assertEqual(response.status_code, 502)
+        job = dashboard.store.get_job(self.source, self.state, 1)
+        self.assertEqual(job["deadline_label"], "상시 채용")
+        self.assertEqual(job["progress"]["interview1"]["note"], "keep memo")
+
     def test_unknown_job_and_db_failure(self):
         self.assertEqual(self.get("/jobs/999").status_code, 404)
         token = self.csrf()
@@ -125,7 +165,7 @@ class WebTests(unittest.TestCase):
         result = self.get("/jobs/1")
         text = result.get_data(as_text=True)
         self.assertIn("2026.11.16 09:00", text)
-        self.assertIn("최신 모집 상태 확인 필요", text)
+        self.assertIn("마감일 미확인", text)
         self.assertIn("마지막 수집", text)
         self.assertIn("추천 검토", text)
         self.assertNotIn("D-day", text)
@@ -141,8 +181,9 @@ class WebTests(unittest.TestCase):
         self.assertEqual(listing.status_code, 200)
         self.assertIn('만료', listing.get_data(as_text=True))
         detail = self.get('/jobs/1?view=expired').get_data(as_text=True)
-        self.assertIn('마감이 지난 공고입니다', detail)
-        self.assertIn('2020.11.15 23:59', detail)
+        self.assertIn('>만료</span>', detail)
+        self.assertIn('11.15 마감', detail)
+        self.assertNotIn('23:59', detail)
         self.assertNotIn('지원 페이지 열기', detail)
         self.assertIn('원문 보기', detail)
 

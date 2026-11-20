@@ -176,6 +176,47 @@ class DeploymentTests(unittest.TestCase):
                 deploy.recover(self.root, self.config)
         self.assertTrue(journal.exists())
 
+    def test_card_cutover_records_backup_phase_and_can_roll_back_after_first_database(self):
+        journal = self.root / '.deploy/transaction.json'
+        changes = []
+        def migrate_database(release, path, kind):
+            current = json.loads(journal.read_text())
+            self.assertEqual(current['phase'], 'migrating_' + kind)
+            self.assertTrue((Path(current['backup']) / 'jobs.sqlite').is_file())
+            self.assertTrue((Path(current['backup']) / 'dashboard.sqlite').is_file())
+            self.assertEqual((self.root / 'current').resolve(), self.old)
+            changes.append(kind)
+            if kind == 'state':
+                raise RuntimeError('second migration failed')
+            with sqlite3.connect(path) as db:
+                db.execute('CREATE TABLE migrated_jobs(id INTEGER)')
+        with patch.object(deploy, 'migrate_database', side_effect=migrate_database), \
+             patch.object(deploy, 'hermes', return_value={'enabled': True}) as hermes, \
+             patch.object(deploy, 'service', return_value='active'), patch.object(deploy, 'wait_idle'), \
+             patch.object(deploy, 'healthy', return_value=True):
+            with self.assertRaisesRegex(RuntimeError, 'second migration failed'):
+                deploy.activate(self.root, self.new, self.config, migrate_cards=True)
+        self.assertEqual(changes, ['jobs', 'state'])
+        self.assertEqual((self.root / 'current').resolve(), self.old)
+        self.assertFalse(journal.exists())
+        self.assertEqual(hermes.call_args.args[0], 'resume')
+        with sqlite3.connect(self.root / 'data/jobs.sqlite') as db:
+            self.assertEqual(db.execute("SELECT value FROM private_data").fetchone()[0], 'preserve')
+            self.assertIsNotNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='migrated_jobs'").fetchone())
+
+    def test_card_cutover_failed_startup_restores_previously_disabled_services(self):
+        def service(action, unit):
+            if action == 'is-active':
+                return 'inactive'
+        with patch.object(deploy, 'migrate_database'), patch.object(deploy, 'hermes', return_value={'enabled': False}), \
+             patch.object(deploy, 'service', side_effect=service) as start_stop, patch.object(deploy, 'wait_idle'), \
+             patch.object(deploy, 'validate_startup', side_effect=RuntimeError('candidate validation failed')):
+            with self.assertRaisesRegex(RuntimeError, 'candidate validation failed'):
+                deploy.activate(self.root, self.new, self.config, migrate_cards=True)
+        self.assertEqual((self.root / 'current').resolve(), self.old)
+        self.assertNotIn(('restart', 'job-dashboard.service'), [c.args for c in start_stop.call_args_list])
+        self.assertNotIn(('start', 'job-availability.timer'), [c.args for c in start_stop.call_args_list])
+
 
 if __name__ == '__main__':
     unittest.main()

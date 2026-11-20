@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from job_search import collect_jobs
 from job_search import dashboard_store as store
+from job_search.refresh_job_availability import refresh
 from tests.test_collect_jobs import posting
 
 
@@ -66,6 +67,37 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(store.list_jobs(self.source, self.state, view="interested")["total"], 1)
         store.init_state_db(self.source, self.state)
         self.assertEqual(store.get_job(self.source, self.state, 1)["status"], "interested")
+
+    def test_manual_deadline_and_automatic_refresh_do_not_change_application_state(self):
+        closed = posting(categories=[collect_jobs.CLOSED])
+        refresh(self.source, self.state, lambda _: ([closed], 1), self.now)
+        store.set_status(self.source, self.state, 1, "interested")
+        self.assertEqual(store.list_jobs(self.source, self.state)["counts"]["expired"], 1)
+        store.set_deadline(self.source, self.state, 1, {"mode": "manual", "kind": "unknown"})
+        self.assertTrue(store.get_job(self.source, self.state, 1)["is_expired"])
+        store.set_deadline(self.source, self.state, 1, {"mode": "manual", "kind": "rolling", "word": "채용 시 마감"})
+        self.assertEqual(store.list_jobs(self.source, self.state)["counts"]["expired"], 0)
+        store.set_deadline(self.source, self.state, 1, {"mode": "manual", "kind": "datetime",
+                                                         "date": "2099-12-01", "time": "18:00"})
+        refresh(self.source, self.state, lambda _: ([closed], 1), self.now)
+        job = store.get_job(self.source, self.state, 1)
+        self.assertEqual(job["deadline_label"], "12.01 18:00 마감")
+        self.assertEqual(job["status"], "interested")
+        self.assertFalse(job["is_expired"])
+        self.assertTrue(job["deadline_auto"]["is_expired"])
+        store.set_deadline(self.source, self.state, 1, {"mode": "auto"})
+        self.assertTrue(store.get_job(self.source, self.state, 1)["is_expired"])
+
+    def test_restoring_automatic_requires_confirmation_when_new_expiry_is_unexpected(self):
+        store.set_deadline(self.source, self.state, 1, {"mode": "manual", "kind": "rolling", "word": "상시 채용"})
+        before = store.get_job(self.source, self.state, 1)["deadline_auto"]["version"]
+        refresh(self.source, self.state, lambda _: ([posting(categories=[collect_jobs.CLOSED])], 1), self.now)
+        with self.assertRaisesRegex(store.DeadlineChanged, "다시"):
+            store.set_deadline(self.source, self.state, 1, {"mode": "auto", "version": before})
+        latest = store.get_job(self.source, self.state, 1)
+        self.assertEqual(latest["deadline_label"], "상시 채용")
+        store.set_deadline(self.source, self.state, 1, {"mode": "auto", "version": latest["deadline_auto"]["version"]})
+        self.assertTrue(store.get_job(self.source, self.state, 1)["is_expired"])
 
     def test_pending_review_has_no_unread_badge(self):
         stamp = store.get_job(self.source, self.state, 1)["reviewed_at"]
