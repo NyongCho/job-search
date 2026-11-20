@@ -104,6 +104,55 @@ class WebTests(unittest.TestCase):
         self.assertIn('<dialog id="deadline-dialog"', body)
         self.assertIn('name="q" value="Agent"', body)
 
+    def test_sort_selection_and_navigation(self):
+        collect_jobs.collect(self.source, lambda _: ([posting(i) for i in range(2, 32)], 1),
+                             datetime(2026, 11, 16, tzinfo=timezone.utc))
+        with sqlite3.connect(self.source) as db:
+            db.execute("UPDATE posts SET decision='recommend', reason='Agent'")
+        listing = self.get("/?q=Agent&sort=company").get_data(as_text=True)
+        self.assertIn('<option value="company" selected>', listing)
+        self.assertNotIn('<option value="activity"', listing)
+        links = re.findall(r'href="([^"]+)"', listing)
+        for url in (next(u for u in links if "/jobs/" in u), next(u for u in links if "page=2" in u)):
+            self.assertIn("sort=company", url)
+            self.assertIn("q=Agent", url)
+        detail = self.get("/jobs/1?view=recommended&q=Agent&sort=company").get_data(as_text=True)
+        self.assertIn("sort=company", re.search(r'class="back-link" href="([^"]+)"', detail)[1])
+        for view, value, label in (("applied", "activity", "최근 기록순"), ("recommended", "reviewed", "최근 검토순"),
+                                   ("expired&sort=deadline", "deadline", "최근 마감순")):
+            page = self.get("/?view=" + view).get_data(as_text=True)
+            self.assertIn(f'<option value="{value}" selected>{label}</option>', page)
+
+    def test_invalid_sort_precedes_deadline_write_and_refresh(self):
+        token = self.csrf()
+        for sort in ("bad", "activity", ""):
+            query = "?view=recommended&sort=" + sort
+            self.assertEqual(self.get("/" + query).status_code, 400)
+            result = self.post("/jobs/1/deadline" + query, {"mode": "manual", "kind": "unknown"}, token)
+            self.assertEqual(result.status_code, 400)
+            self.assertIsNone(dashboard.store.get_job(self.source, self.state, 1)["deadline_manual"])
+            with patch.object(dashboard, "refresh_one") as refresh:
+                self.assertEqual(self.post("/jobs/1/deadline/refresh" + query, {}, token).status_code, 400)
+                refresh.assert_not_called()
+
+    def test_deadline_responses_keep_sorted_rows(self):
+        collect_jobs.collect(self.source, lambda _: ([posting(2, content="<p>지원 마감: 2099-12-02</p>")], 1),
+                             datetime(2026, 11, 16, tzinfo=timezone.utc))
+        with sqlite3.connect(self.source) as db:
+            db.execute("UPDATE posts SET decision='recommend', reason='Agent'")
+        token = self.csrf()
+        query = "?q=Agent&sort=deadline"
+        def row_ids(html):
+            return re.findall(r'class="job-row[^"]*" href="/jobs/(\d+)\?', html)
+        self.assertEqual(row_ids(self.get("/" + query).get_data(as_text=True)), ["2", "1"])
+        saved = self.post("/jobs/1/deadline" + query, {"mode": "manual", "kind": "date", "date": "2099-12-01"}, token)
+        with patch.object(dashboard, "refresh_one", return_value=True):
+            refreshed = self.post("/jobs/1/deadline/refresh" + query, {}, token)
+        for response in (saved, refreshed):
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(row_ids(response.json["html"]), ["1", "2"])
+            self.assertIn('<option value="deadline" selected>', response.json["html"])
+
     def test_imported_application_can_edit_deadline_but_cannot_refresh_source(self):
         dashboard.store.import_profile_jobs(self.source, self.state, [{
             "source_key": "applications/legacy", "company": "회사", "role": "직무", "summary": "기존 지원",

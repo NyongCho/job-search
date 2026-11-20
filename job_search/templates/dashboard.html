@@ -45,11 +45,23 @@
         <a href="{{ url_for('index',view='applied') }}"><span class="summary-icon violet">✓</span><span>지원한 공고<strong>{{ listing.counts.applied }}<small>건</small></strong></span></a>
       </section>
       <section class="inbox-panel">
-        <div class="inbox-toolbar"><div class="list-title">{{ views[view] }} 목록 <span>{{ listing.total }}</span></div><form class="search-form" action="{{ url_for('index') }}"><input type="hidden" name="view" value="{{ view }}"><span aria-hidden="true">⌕</span><input name="q" value="{{ q }}" maxlength="200" placeholder="현재 보기에서 검색" aria-label="현재 보기에서 회사·직무·추천 이유 검색"><button type="submit">검색</button></form><span class="sort-label">{{ '최근 기록순' if view == 'applied' else '최근 검토순' }} ↓</span></div>
+        <div class="inbox-toolbar">
+          <div class="list-title">{{ views[view] }} 목록 <span>{{ listing.total }}</span></div>
+          <form class="search-form" action="{{ url_for('index') }}" method="get">
+            <input type="hidden" name="view" value="{{ view }}">
+            <input name="q" value="{{ q }}" maxlength="200" placeholder="현재 보기에서 검색" aria-label="현재 보기에서 회사·직무·추천 이유 검색">
+            <select name="sort" aria-label="공고 정렬">
+              {% for key, label in sort_options.items() %}
+              <option value="{{ key }}"{% if listing.sort == key %} selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+            <button type="submit">적용</button>
+          </form>
+        </div>
         <div class="inbox-grid">
-          <section id="job-list" class="job-list" aria-label="공고 목록" data-scroll-key="{{ view }}:{{ q }}:{{ listing.page }}">
+          <section id="job-list" class="job-list" aria-label="공고 목록" data-scroll-key="{{ view }}:{{ listing.sort }}:{{ q }}:{{ listing.page }}">
             {% for item in listing['items'] %}
-            <a class="job-row {% if detail and detail.id == item.id %}selected{% endif %}" href="{{ url_for('detail',post_id=item.id,view=view,q=q,page=listing.page) }}" {% if detail and detail.id == item.id %}aria-current="true"{% endif %}>
+            <a class="job-row {% if detail and detail.id == item.id %}selected{% endif %}" href="{{ url_for('detail',post_id=item.id,view=view,q=q,sort=listing.sort,page=listing.page) }}" {% if detail and detail.id == item.id %}aria-current="true"{% endif %}>
               <div class="company-line">{% if item.has_company_logo %}<img class="company-logo" src="{{ url_for('company_logo', post_id=item.id) }}" alt="" width="24" height="24" loading="lazy">{% else %}<span class="company-avatar" aria-hidden="true">{{ item.company[0] }}</span>{% endif %}<span class="company-name">{{ item.company }}</span><span class="deadline-badge {{ item.deadline_kind }}">{{ deadline_content(item) }}</span></div>
               <div class="job-row-title">{{ item.role }}</div>
               {% if item.company_review %}{% set review = item.company_review %}
@@ -69,15 +81,15 @@
               <h2>{% if q %}검색 결과가 없어요{% else %}아직 공고가 없어요{% endif %}</h2>
               {% if q %}
               <p>다른 검색어나 보기를 선택해 보세요.</p>
-              <a href="{{ url_for('index',view=view) }}">검색 초기화</a>
+              <a href="{{ url_for('index',view=view,sort=listing.sort) }}">검색 초기화</a>
               {% endif %}
             </div>
             {% endfor %}
-            <div class="pagination"><span>{{ listing.page }} / {{ listing.total_pages }} 페이지</span><div>{% if listing.page > 1 %}<a href="{{ url_for('index',view=view,q=q,page=listing.page-1) }}" aria-label="이전 페이지">←</a>{% endif %}{% if listing.page < listing.total_pages %}<a href="{{ url_for('index',view=view,q=q,page=listing.page+1) }}" aria-label="다음 페이지">→</a>{% endif %}</div></div>
+            <div class="pagination"><span>{{ listing.page }} / {{ listing.total_pages }} 페이지</span><div>{% if listing.page > 1 %}<a href="{{ url_for('index',view=view,q=q,sort=listing.sort,page=listing.page-1) }}" aria-label="이전 페이지">←</a>{% endif %}{% if listing.page < listing.total_pages %}<a href="{{ url_for('index',view=view,q=q,sort=listing.sort,page=listing.page+1) }}" aria-label="다음 페이지">→</a>{% endif %}</div></div>
           </section>
           {% if detail %}
           <article id="job-detail" class="job-detail" data-job-id="{{ detail.id }}" data-reviewed-at="{{ detail.reviewed_at or '' }}">
-            <a class="back-link" href="{{ url_for('index',view=view,q=q,page=listing.page) }}">← 목록으로</a>
+            <a class="back-link" href="{{ url_for('index',view=view,q=q,sort=listing.sort,page=listing.page) }}">← 목록으로</a>
             <div class="detail-topline">
               <span class="detail-company">{{ detail.company }}</span>
               <div class="deadline-tools">
