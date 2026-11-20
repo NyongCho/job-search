@@ -53,6 +53,23 @@ class WebTests(unittest.TestCase):
         response = self.client.get("/", base_url="https://evil.example", headers=self.identity)
         self.assertEqual(response.status_code, 400)
 
+    def test_sidebar_shows_authenticated_username(self):
+        for path in ["/", "/jobs/1", "/jobs/999"]:
+            with self.subTest(path=path):
+                sidebar = self.get(path).get_data(as_text=True).split("</aside>", 1)[0]
+                self.assertIn(">owner<", sidebar)
+                self.assertIn('role="img" aria-label="설정"', sidebar)
+                self.assertNotIn(">설정<", sidebar)
+                self.assertNotIn("owner@example.com", sidebar)
+                self.assertNotIn("PRIVATE · TAILSCALE", sidebar)
+        denied = self.get(headers={}).get_data(as_text=True)
+        self.assertNotIn(">owner<", denied)
+
+    def test_local_preview_profile(self):
+        app = dashboard.create_app({**self.config, "DEV_MODE": True, "BASE_URL": "http://localhost"})
+        sidebar = app.test_client().get("/").get_data(as_text=True).split("</aside>", 1)[0]
+        self.assertIn(">로컬 사용자<", sidebar)
+
     def test_csrf_write_only(self):
         token = self.csrf()
         other = self.app.test_client()

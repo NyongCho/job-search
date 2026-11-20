@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from flask import Flask, Response, abort, jsonify, render_template, request, session, url_for
+from flask import Flask, Response, abort, g, jsonify, render_template, request, session, url_for
 from werkzeug.exceptions import HTTPException, SecurityError
 
 from . import dashboard_store as store
@@ -75,6 +75,7 @@ def create_app(config=None):
                 abort(403)
         elif request.headers.get("Tailscale-User-Login", "") != app.config["ALLOWED_LOGIN"]:
             abort(403)
+        g.profile_name = "로컬 사용자" if dev else app.config["ALLOWED_LOGIN"].partition("@")[0]
         if request.method == "POST":
             token, expected = request.headers.get("X-CSRF-Token", ""), session.get("csrf_token", "")
             if not token or not expected or not hmac.compare_digest(token, expected):
@@ -122,7 +123,7 @@ def create_app(config=None):
         return render_template("dashboard.html", listing=listing, detail=detail, view=view, q=q,
                                views=VIEW_LABELS, statuses=STATUS_LABELS, decisions=DECISION_LABELS,
                                stages=store.STAGE_LABELS, results=store.RESULT_LABELS,
-                               error=None, dev_mode=dev)
+                               error=None)
 
     @app.get("/")
     def index():
@@ -194,7 +195,7 @@ def create_app(config=None):
             return jsonify(error=code, message=message), code
         return render_template("dashboard.html", error={"code": code, "message": message},
                                listing=None, detail=None, view="recommended", q="", views=VIEW_LABELS,
-                               statuses=STATUS_LABELS, decisions=DECISION_LABELS, dev_mode=dev), code
+                               statuses=STATUS_LABELS, decisions=DECISION_LABELS), code
 
     @app.errorhandler(HTTPException)
     def http_error(error):
