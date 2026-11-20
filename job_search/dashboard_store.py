@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+import unicodedata
 from contextlib import closing
 from datetime import date, datetime, time, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from .job_sources import source_locator, source_name
 STATUSES = {"unmarked", "interested", "preparing", "applied", "archived"}
 VIEWS = ("recommended", "interested", "preparing", "applied", "archived", "needs_review", "expired")
 PAGE_SIZE = 30
+LIST_SORTS = {"reviewed": "최근 검토순", "deadline": "마감 임박순", "company": "기업 이름순"}
 STAGE_LABELS = {"document": "서류", "interview1": "1차 면접", "interview2": "2차 면접", "final": "최종 결과"}
 RESULT_LABELS = {"unknown": "미확인", "not_started": "미진행", "in_progress": "진행 중",
                  "passed": "합격", "failed": "불합격", "skipped": "해당 없음"}
@@ -221,9 +223,51 @@ def _matches(item, view):
     return item["status"] == view
 
 
-def list_jobs(jobs_db: Path, state_db: Path, *, view="recommended", q="", page=1) -> dict:
+def sort_options(view):
+    if view == "applied":
+        return {"activity": "최근 기록순", **LIST_SORTS}
+    if view == "expired":
+        return {**LIST_SORTS, "deadline": "최근 마감순"}
+    return LIST_SORTS
+
+
+def resolve_sort(view, sort):
+    options = sort_options(view)
+    if sort is None:
+        return next(iter(options))
+    if not isinstance(sort, str) or sort not in options:
+        raise ValueError("이 보기에서 사용할 정렬을 선택해 주세요.")
+    return sort
+
+
+def _company_order(item):
+    name = unicodedata.normalize("NFKC", item["company"]).strip()
+    name = re.sub(r"^(?:\(주\)|주식회사)\s*", "", name).casefold()
+    if not name or name == "기업명 미기재":
+        return 3, ""
+    if unicodedata.name(name[0], "").startswith("HANGUL "):
+        return 0, name
+    if "a" <= name[0] <= "z":
+        return 1, name
+    return 2, name
+
+
+def _deadline_order(item, now):
+    stamp = timestamp(item["deadline_at"])
+    if item["is_expired"]:
+        # An early closure can leave a future scheduled deadline on the card.
+        if stamp and stamp <= now:
+            return 3, -datetime.fromisoformat(stamp).timestamp()
+        return 4, 0
+    if stamp:
+        return 0, stamp
+    return (1 if item["deadline_kind"] == "rolling" else 2), 0
+
+
+def list_jobs(jobs_db: Path, state_db: Path, *, view="recommended", q="", page=1, sort=None) -> dict:
     if view not in VIEWS or not isinstance(q, str) or len(q) > 200 or type(page) is not int or page < 1:
         raise ValueError("보기, 검색어 또는 페이지를 확인해 주세요.")
+    sort = resolve_sort(view, sort)
     source, state = _validate_paths(jobs_db, state_db)
     with closing(_connect(source, "ro")) as db:
         rows = db.execute("SELECT * FROM posts").fetchall()
@@ -247,14 +291,23 @@ def list_jobs(jobs_db: Path, state_db: Path, *, view="recommended", q="", page=1
     needle = q.strip().casefold()
     filtered = [item for item in items if _matches(item, view)
                 and (not needle or needle in (item["title"] + " " + item["reason"]).casefold())]
-    filtered.sort(key=lambda item: ((item["activity_at"] if view == "applied" else None)
-                  or item["reviewed_at"] or item["published_at"] or item["recorded_at"] or "", item["id"]), reverse=True)
+    if sort == "activity":
+        filtered.sort(key=lambda item: (item["activity_at"] or item["published_at"] or "", item["id"]), reverse=True)
+    else:
+        # Stable secondary order for ties in the deadline and company sorts.
+        filtered.sort(key=lambda item: (bool(item["reviewed_at"]),
+                      item["reviewed_at"] or item["published_at"] or item["recorded_at"] or "", item["id"]), reverse=True)
+        if sort == "company":
+            filtered.sort(key=_company_order)
+        elif sort == "deadline":
+            now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+            filtered.sort(key=lambda item: _deadline_order(item, now))
     total = len(filtered)
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = min(page, total_pages)
     result = [{k: v for k, v in item.items() if k not in {"lines", "images", "progress"}}
               for item in filtered[(page - 1) * PAGE_SIZE:page * PAGE_SIZE]]
-    return {"items": result, "total": total, "page": page, "total_pages": total_pages,
+    return {"items": result, "sort": sort, "total": total, "page": page, "total_pages": total_pages,
             "counts": counts, "last_collected_at": timestamp(checkpoint[0]) if checkpoint else None}
 
 

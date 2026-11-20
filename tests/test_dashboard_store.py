@@ -197,13 +197,74 @@ class StoreTests(unittest.TestCase):
                 store.list_jobs(self.source, self.state)
             self.assertLess(time.monotonic() - start, 3.5)
 
-    def test_mixed_timestamp_formats(self):
+    def test_reviewed_sort_uses_actual_instant_and_puts_missing_reviews_last(self):
         self.collect([posting(1000)])
         self.review(1000, stamp=None)
         store.set_status(self.source, self.state, 1000, "interested")
         store.set_status(self.source, self.state, 1, "interested")
         self.review(1, stamp="2026-11-14T00:00:00+00:00")
-        self.assertEqual([j["id"] for j in store.list_jobs(self.source, self.state, view="interested")["items"]], [1000, 1])
+        def interested_ids():
+            return [j["id"] for j in store.list_jobs(self.source, self.state, view="interested")["items"]]
+
+        self.assertEqual(interested_ids(), [1, 1000])
+        self.review(1000, stamp="2026-11-14T08:59:00+09:00")
+        self.assertEqual(interested_ids(), [1, 1000])
+        self.review(1000, stamp="2026-11-14T09:00:00+09:00")
+        self.assertEqual(interested_ids(), [1000, 1])
+
+    def test_deadlines_use_effective_time_and_most_recent_known_expiry(self):
+        contents = ["지원 마감: 2099-12-02", "지원 마감: 2099-12-02 18:00", "상시 채용",
+                    "기한 미정", "지원 마감: 2020-11-20", "지원 마감: 2020-11-10",
+                    "접수 종료", "접수 종료</p><p>지원 마감: 2099-12-01"]
+        self.collect([posting(i, content=f"<p>{line}</p>") for i, line in enumerate(contents, 1)])
+        for i in range(1, 9):
+            store.set_status(self.source, self.state, i, "interested")
+
+        def ids(view):
+            return [j["id"] for j in store.list_jobs(self.source, self.state, view=view, sort="deadline")["items"]]
+
+        self.assertEqual(ids("interested"), [2, 1, 3, 4, 5, 6, 8, 7])
+        self.assertEqual(ids("expired"), [5, 6, 8, 7])
+        store.set_deadline(self.source, self.state, 1, {"mode": "manual", "kind": "datetime",
+                           "date": "2099-12-02", "time": "17:00"})
+        self.assertEqual(ids("interested")[:2], [1, 2])
+
+    def test_company_sort_uses_display_names_and_review_ties(self):
+        names = ["㈜카카오", "(주) 가온", "주식회사 나무", "Acme", "acme", "123", None, ""]
+        posts = []
+        for i, name in enumerate(names, 1):
+            post = posting(i)
+            post["title"]["rendered"] = f"{name}｜개발" if name is not None else "개발"
+            posts.append(post)
+        self.collect(posts)
+        for i in range(1, len(posts) + 1):
+            self.review(i)
+        rows = store.list_jobs(self.source, self.state, sort="company")["items"]
+        self.assertEqual([row["id"] for row in rows], [2, 3, 1, 5, 4, 6, 8, 7])
+        self.assertEqual(rows[0]["company"], "(주) 가온")
+
+    def test_legacy_deadline_orders_by_stored_time_when_card_shows_only_date(self):
+        self.collect([posting(2, content="<p>지원 마감: 2099-12-02 18:00</p>")])
+        self.review(2)
+        with sqlite3.connect(self.state) as db:
+            db.execute("""INSERT INTO job_availability
+                (post_id,closed,deadline_at,evidence,checked_at,source_modified_at,source_url)
+                VALUES (1,0,'2099-12-02T03:00:00Z','','2026-11-17','2026-11-16','')""")
+        rows = store.list_jobs(self.source, self.state, sort="deadline")["items"]
+        self.assertEqual([(j["id"], j["deadline_label"]) for j in rows],
+                         [(1, "12.02 마감"), (2, "12.02 18:00 마감")])
+
+    def test_deadline_sort_applies_to_all_matching_pages(self):
+        self.collect([posting(i) for i in range(2, 32)])
+        for i in range(2, 32):
+            self.review(i)
+        store.set_deadline(self.source, self.state, 1, {"mode": "manual", "kind": "date", "date": "2099-01-01"})
+        self.assertEqual(store.list_jobs(self.source, self.state, page=2)["items"][0]["id"], 1)
+        pages = [store.list_jobs(self.source, self.state, q="agent", sort="deadline", page=p)["items"]
+                 for p in (1, 2)]
+        self.assertEqual([len(page) for page in pages], [30, 1])
+        self.assertEqual(pages[0][0]["id"], 1)
+        self.assertEqual({job["id"] for page in pages for job in page}, set(range(1, 32)))
 
     def test_validation_and_private_permissions(self):
         self.assertEqual(self.state.stat().st_mode & 0o777, 0o600)
