@@ -107,11 +107,11 @@ def create_app(config=None):
             raise ValueError("페이지 번호를 확인해 주세요.") from None
         if view not in store.VIEWS or len(q) > 200 or page < 1:
             raise ValueError("보기, 검색어 또는 페이지를 확인해 주세요.")
-        return view, q, page
+        return view, q, page, store.resolve_sort(view, request.args.get("sort"))
 
     def screen(post_id=None):
-        view, q, page = context()
-        listing = store.list_jobs(source, state, view=view, q=q, page=page)
+        view, q, page, sort = context()
+        listing = store.list_jobs(source, state, view=view, q=q, page=page, sort=sort)
         detail = store.get_job(source, state, post_id) if post_id is not None else None
         if post_id is not None and detail is None:
             abort(404)
@@ -121,6 +121,7 @@ def create_app(config=None):
             detail["company_review"] = lookup_research(research, detail["company"])
         session.setdefault("csrf_token", secrets.token_urlsafe(32))
         return render_template("dashboard.html", listing=listing, detail=detail, view=view, q=q,
+                               sort_options=store.sort_options(view),
                                views=VIEW_LABELS, statuses=STATUS_LABELS, decisions=DECISION_LABELS,
                                stages=store.STAGE_LABELS, results=store.RESULT_LABELS,
                                error=None)

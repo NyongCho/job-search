@@ -6,6 +6,31 @@ const test = require('node:test');
 const path = require('node:path');
 const script = fs.readFileSync(path.join(__dirname, '../job_search/static/dashboard.js'), 'utf8');
 
+test('applying a list order starts at the top and returning from detail restores the list', () => {
+  const positions = new Map([['job-list:recommended:deadline::1', '{"list":600,"page":0}']]);
+  function open(detail, navigation = 'navigate') {
+    const list = {dataset: {scrollKey: 'recommended:deadline::1'}, scrollTop: 0};
+    const back = {addEventListener(type, handler) { this[type] = handler; }};
+    const selectors = {'#job-list': list, '.back-link': back};
+    if (detail) selectors['#job-detail'] = {dataset: {jobId: '1'}, querySelectorAll() { return []; }};
+    vm.runInNewContext(script, {
+      document: {querySelector(key) { return selectors[key] || null; }},
+      performance: {getEntriesByType() { return [{type: navigation}]; }},
+      sessionStorage: {getItem: k => positions.get(k), setItem: (k,v) => positions.set(k,v),
+                       removeItem: k => positions.delete(k)},
+      window: {addEventListener() {}}, matchMedia: () => ({matches: false}),
+    });
+    return {list, back};
+  }
+  assert.equal(open(false).list.scrollTop, 0);
+  const detail = open(true);
+  assert.equal(detail.list.scrollTop, 600);
+  detail.back.click();
+  assert.equal(open(false).list.scrollTop, 600);
+  assert.equal(open(false).list.scrollTop, 0);
+  assert.equal(open(false, 'back_forward').list.scrollTop, 600);
+});
+
 test('deadline preview applies the same closure and Korea time rules as saving', () => {
   const {deadlinePreview, deadlineWarning} = vm.runInNewContext(
     script + '\n;({deadlinePreview, deadlineWarning});', {document: {querySelector() { return null; }}});
@@ -47,7 +72,7 @@ test('deadline cancel writes nothing and failed saves retain editable input', as
   const calls = [];
   const wire = vm.runInNewContext(script + '\n;wireDeadline;', {
     document: {querySelector(selector) { return selector === '#deadline-edit' ? edit : null; }},
-    location: {search: '?view=expired&page=2'},
+    location: {search: '?view=expired&sort=deadline&page=2'},
     FormData: class {
       *[Symbol.iterator]() {
         for (const [name, {value}] of Object.entries(inputs)) yield [name, value];
@@ -70,7 +95,7 @@ test('deadline cancel writes nothing and failed saves retain editable input', as
   form.events.input();
   assert.match(warning.textContent, /만료 표시가 해제/);
   await form.events.submit({preventDefault() {}});
-  assert.equal(calls[0][0], '/jobs/1/deadline?view=expired&page=2');
+  assert.equal(calls[0][0], '/jobs/1/deadline?view=expired&sort=deadline&page=2');
   assert.equal(calls[0][1].date, '2099-12-11');
   assert.ok(dialog.open);
   assert.equal(inputs.date.value, '2099-12-11');

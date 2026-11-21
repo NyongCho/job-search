@@ -11,7 +11,13 @@ const storage = {
 
 if (list) {
   const key = `job-list:${list.dataset.scrollKey}`;
-  const saved = storage.get(key);
+  const navigation = performance.getEntriesByType("navigation")[0]?.type;
+  const returning = navigation === "back_forward" || navigation === "reload" || storage.get("return-to-list") === key;
+  const saved = (detail || returning) && storage.get(key);
+  storage.remove("return-to-list");
+  document.querySelector(".back-link")?.addEventListener("click", () => {
+    storage.set("return-to-list", `job-list:${list.dataset.scrollKey}`);
+  });
   if (saved) {
     try {
       const position = JSON.parse(saved);
@@ -106,7 +112,14 @@ function wireDeadline(dialog, id) {
     list.replaceChildren(...freshList.childNodes);
     list.dataset.scrollKey = freshList.dataset.scrollKey;
     list.scrollTop = scrollTop;
-    detail.querySelector(".back-link").href = updated.querySelector(".back-link").href;
+    const backUrl = new URL(updated.querySelector(".back-link").href);
+    detail.querySelector(".back-link").href = backUrl.href;
+    const detailUrl = new URL(location.href);
+    const page = backUrl.searchParams.get("page");
+    if (page !== (detailUrl.searchParams.get("page") || "1")) {
+      detailUrl.searchParams.set("page", page);
+      history.replaceState(history.state, "", detailUrl);
+    }
     drawFields();
   }
 
