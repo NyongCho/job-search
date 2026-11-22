@@ -1,6 +1,7 @@
 import io
 import json
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -320,6 +321,99 @@ class LogoTests(unittest.TestCase):
             with patch.object(sys, "argv", args + ["--drain"]), redirect_stdout(io.StringIO()) as output:
                 company_logos.main()
             self.assertEqual(json.loads(output.getvalue())["checked"], 2)
+
+    def run_drain_cli(self, fetch=None):
+        args = ["company_logos", "--db", str(self.jobs), "--drain"]
+        with patch.object(sys, "argv", args), patch.object(company_logos, "fetch_public", fetch or self.fetch), \
+             redirect_stdout(io.StringIO()) as output:
+            company_logos.main()
+        return json.loads(output.getvalue())
+
+    def test_module_and_manual_drain_work_without_posix_signal_support(self):
+        self.collect([])
+        code = """import os, sys
+sys.modules["fcntl"] = None
+if hasattr(os, "O_DIRECTORY"):
+    del os.O_DIRECTORY
+from job_search import collect_jobs, company_logos
+sys.argv = ["company_logos", "--db", sys.argv[1], "--drain"]
+company_logos.main()
+"""
+        process = subprocess.run([sys.executable, "-c", code, self.jobs], capture_output=True, text=True)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(json.loads(process.stdout)["checked"], 0)
+
+    def test_drain_preserves_signal_published_during_last_download(self):
+        requests = self.jobs.with_suffix(".sqlite.logo-requests")
+        requests.mkdir()
+        self.collect([self.body_logo(1)])
+        first_signals = set(requests.iterdir())
+        self.assertEqual(len(first_signals), 1)
+
+        def fetch(url, **options):
+            self.collect([])
+            return self.fetch(url, **options)
+
+        self.assertEqual(self.run_drain_cli(fetch)["ready"], 1)
+        remaining = set(requests.iterdir())
+        self.assertEqual(len(remaining), 1)
+        self.assertFalse(first_signals & remaining)
+        self.assertEqual(self.run_drain_cli()["checked"], 0)
+        self.assertEqual(list(requests.iterdir()), [])
+
+    def test_drain_uses_signal_creation_time_for_retry_cutoff(self):
+        requests = self.jobs.with_suffix(".sqlite.logo-requests")
+        requests.mkdir()
+        signal_time = time.time() - 100
+        self.collect([self.body_logo(1)])
+        for signal in requests.iterdir():
+            signal.unlink()
+        (requests / f"{int(signal_time * 1_000_000_000)}-{'0' * 32}").touch()
+        with closing(sqlite3.connect(self.jobs)) as db, db:
+            db.execute("UPDATE job_company_logos SET attempted_at=?", (signal_time + 1,))
+        self.assertEqual(self.run_drain_cli()["checked"], 0)
+        self.assertEqual(list(requests.iterdir()), [])
+
+    def test_drain_preserves_signal_when_database_is_write_locked(self):
+        requests = self.jobs.with_suffix(".sqlite.logo-requests")
+        requests.mkdir()
+        self.collect([self.body_logo(1)])
+        self.assertEqual(len(signals := list(requests.iterdir())), 1)
+        signal = signals[0]
+        with closing(sqlite3.connect(self.jobs)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                self.run_drain_cli()
+        self.assertTrue(signal.exists())
+        self.assertEqual(self.run_drain_cli()["ready"], 1)
+        self.assertFalse(signal.exists())
+
+    def test_drain_preserves_signal_when_tables_or_pillow_are_missing(self):
+        requests = self.jobs.with_suffix(".sqlite.logo-requests")
+        requests.mkdir()
+        self.collect([])
+        self.assertEqual(len(signals := list(requests.iterdir())), 1)
+        signal = signals[0]
+        with patch.dict(sys.modules, {"PIL": None}), self.assertRaises(ImportError):
+            self.run_drain_cli()
+        self.assertTrue(signal.exists())
+        with closing(sqlite3.connect(self.jobs)) as db, db:
+            db.execute("DROP TABLE company_logos")
+        with self.assertRaisesRegex(sqlite3.OperationalError, "company_logos"):
+            self.run_drain_cli()
+        self.assertTrue(signal.exists())
+
+    def test_drain_reports_unexpected_visible_entries_without_deleting_them(self):
+        requests = self.jobs.with_suffix(".sqlite.logo-requests")
+        requests.mkdir()
+        self.collect([])
+        unexpected = requests / f"123-{'0' * 32}"
+        unexpected.write_text("keep this file")
+        self.assertEqual(self.run_drain_cli()["checked"], 0)
+        with self.assertRaisesRegex(OSError, unexpected.name):
+            self.run_drain_cli()
+        self.assertEqual(list(requests.iterdir()), [unexpected])
+        self.assertEqual(unexpected.read_text(), "keep this file")
 
     def test_drain_defers_timeout_when_wall_clock_is_behind_round_cutoff(self):
         self.collect([branded_post(1, content=f'<img alt="Acme 로고" src="{self.acme_image}">')])

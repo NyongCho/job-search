@@ -1,8 +1,9 @@
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -43,6 +44,33 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(detail["lines"][:2], ["우대사항", "관련 경험 2년"])
         self.assertEqual(detail["apply_url"], "https://example.com/job")
         self.assertEqual(len(jobs.pending(self.db)), 1)
+
+    def test_successful_empty_collection_creates_one_empty_signal(self):
+        requests = self.db.with_suffix(".sqlite.logo-requests")
+        requests.mkdir()
+        self.assertEqual(self.collect([])["new"], 0)
+        self.assertEqual([signal.read_bytes() for signal in requests.iterdir()], [b""])
+
+    def test_rolled_back_collection_creates_no_signal(self):
+        requests = self.db.with_suffix(".sqlite.logo-requests")
+        requests.mkdir()
+        with closing(jobs.connect(self.db)) as db, db:
+            db.execute("""CREATE TRIGGER reject_checkpoint BEFORE INSERT ON metadata
+                          BEGIN SELECT RAISE(ABORT, 'rejected checkpoint'); END""")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "rejected checkpoint"):
+            self.collect([posting()])
+        self.assertEqual(list(requests.iterdir()), [])
+        self.assertEqual(jobs.pending(self.db), [])
+
+    def test_signal_write_failure_keeps_collection_result_and_reports_error(self):
+        requests = self.db.with_suffix(".sqlite.logo-requests")
+        requests.touch()
+        with redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO()) as output:
+            result = self.collect([posting()])
+        self.assertEqual(result["new"], 1)
+        self.assertEqual([row["id"] for row in jobs.get_posts(self.db, [1])], [1])
+        self.assertIn(str(requests), errors.getvalue())
+        self.assertEqual(output.getvalue(), "")
 
     def test_collection_queues_logo_without_downloading_before_hermes_review(self):
         post = posting(1, content='<img alt="회사 로고" src="https://cdn.example.com/logo.png">')

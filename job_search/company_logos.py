@@ -3,13 +3,16 @@
 import argparse
 import io
 import json
+import os
 import re
 import sqlite3
+import sys
 import time
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
+from uuid import uuid4
 
 from .card_metadata import has_table
 from .evidence import Document
@@ -20,6 +23,21 @@ from .public_fetch import PublicHTTPError, fetch_public
 MAX_PAGE = 2_000_000
 MAX_IMAGE = 1_000_000
 DEFAULT_LOGO_LIMIT = 20
+_SIGNAL_NAME = re.compile(r"([0-9]{1,20})-[0-9a-f]{32}")
+
+
+def _signal_directory(path):
+    return Path(f"{path}.logo-requests")
+
+
+def signal_logo_worker(path):
+    signal = _signal_directory(path) / f"{time.time_ns()}-{uuid4().hex}"
+    try:
+        signal.touch(exist_ok=False)
+    except FileNotFoundError:
+        pass  # The signal directory is opt-in.
+    except OSError as error:
+        print(f"Could not signal company logo worker: {error}", file=sys.stderr)
 
 
 @dataclass(frozen=True)
@@ -374,6 +392,39 @@ def drain_logos(path, *, limit=DEFAULT_LOGO_LIMIT, retry_before, fetch=fetch_pub
                 time.sleep(delay)
 
 
+def _drain_with_signals(path, *, limit, fetch):
+    invoked_at = time.time()
+    directory = _signal_directory(path)
+    try:
+        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except FileNotFoundError:
+        return drain_logos(path, limit=limit, retry_before=invoked_at, fetch=fetch)
+    try:
+        import fcntl
+
+        # A systemd activation and a manual drain can target the same DB.
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        signals = {}
+        unexpected = []
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                name = _SIGNAL_NAME.fullmatch(entry.name)
+                if name and entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_size == 0:
+                    signals[entry.name] = int(name[1])
+                elif not entry.name.startswith("."):
+                    unexpected.append(entry.name)
+        if not signals and unexpected:
+            raise OSError(f"Unexpected entries in {directory}: {', '.join(sorted(unexpected))}")
+        retry_before = max(signals.values()) / 1_000_000_000 if signals else invoked_at
+        summary = drain_logos(path, limit=limit, retry_before=retry_before, fetch=fetch)
+        # Keep the cutoff stable if acknowledgement is interrupted.
+        for name in sorted(signals, key=signals.__getitem__):
+            os.unlink(name, dir_fd=fd)
+        return summary
+    finally:
+        os.close(fd)
+
+
 def logo_references(db):
     if not has_table(db, "job_company_logos"):
         return {}
@@ -405,7 +456,7 @@ def main():
     parser.add_argument("--drain", action="store_true", help="Process all available logo requests in batches")
     args = parser.parse_args()
     if args.drain:
-        summary = drain_logos(args.db, limit=args.limit, retry_before=time.time(), fetch=fetch_public)
+        summary = _drain_with_signals(args.db, limit=args.limit, fetch=fetch_public)
     else:
         summary = refresh_logos(args.db, limit=args.limit, fetch=fetch_public)
     print(json.dumps(summary))

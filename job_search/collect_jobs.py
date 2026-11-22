@@ -14,7 +14,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .card_metadata import create_logo_tables, has_table
-from .company_logos import enqueue_logo
+from .company_logos import enqueue_logo, signal_logo_worker
 from .evidence import Document, application_link
 from .job_sources import INTHISWORK_API
 
@@ -126,6 +126,7 @@ def collect(path, fetch_page=request_json, now=None, *, start=None, advance_chec
                 enqueue_logo(db, post_id, doc, fingerprint)
         if advance_checkpoint:
             db.execute("INSERT OR REPLACE INTO metadata VALUES('last_success',?)", (now.isoformat(),))
+    signal_logo_worker(path)
     if not advance_checkpoint:
         result["ids"] = sorted(documents)
     return result
