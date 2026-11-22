@@ -1,11 +1,13 @@
-import tempfile
+import io
 import json
+import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from job_search import collect_jobs as jobs
+from job_search import collect_jobs as jobs, public_fetch
 
 
 def posting(post_id=1, content=None, categories=None):
@@ -42,16 +44,20 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(detail["apply_url"], "https://example.com/job")
         self.assertEqual(len(jobs.pending(self.db)), 1)
 
-    def test_logo_processing_is_deferred_when_collection_has_used_hermes_budget(self):
+    def test_collection_queues_logo_without_downloading_before_hermes_review(self):
         post = posting(1, content='<img alt="회사 로고" src="https://cdn.example.com/logo.png">')
-        def unexpected_download(url, **_):
-            self.fail("Downloads must be deferred when the pre-run budget is nearly spent")
-        with patch.object(jobs.time, "monotonic", side_effect=[0, 221, 221]):
-            result = jobs.collect(self.db, lambda _: ([post], 1), self.now, logo_fetch=unexpected_download)
+        response = io.BytesIO(json.dumps([post]).encode())
+        response.headers = {"X-WP-TotalPages": "1"}
+        with patch.object(jobs, "urlopen", return_value=response), patch.object(
+            public_fetch, "_fetch", side_effect=TimeoutError("unexpected logo download")
+        ) as download:
+            result = jobs.collect(self.db, now=self.now)
         self.assertEqual(result["new"], 1)
-        with jobs.connect(self.db) as db:
-            self.assertEqual(db.execute("SELECT outcome FROM job_company_logos WHERE post_id=1").fetchone()[0], "pending")
-        db.close()
+        self.assertEqual([row["id"] for row in jobs.pending(self.db)], [1])
+        with closing(jobs.connect(self.db)) as db:
+            row = db.execute("SELECT outcome, attempted_at FROM job_company_logos WHERE post_id=1").fetchone()
+            self.assertEqual(tuple(row), ("pending", None))
+        download.assert_not_called()
 
     def test_failed_second_page_does_not_advance_checkpoint_or_save_partial_window(self):
         self.collect([posting()])
@@ -68,6 +74,9 @@ class CollectorTests(unittest.TestCase):
             jobs.collect(self.db, failing_page, self.now + timedelta(hours=12))
         self.assertEqual(jobs.checkpoint(self.db), previous)
         self.assertEqual([row["id"] for row in jobs.pending(self.db)], [1])
+        with closing(jobs.connect(self.db)) as db:
+            queued = db.execute("SELECT post_id FROM job_company_logos ORDER BY post_id").fetchall()
+            self.assertEqual([row[0] for row in queued], [1])
 
     def test_reads_all_pages_and_overlaps_previous_success(self):
         self.collect([posting()])

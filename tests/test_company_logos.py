@@ -39,8 +39,8 @@ class LogoTests(unittest.TestCase):
         self.state = Path(self.temp.name) / "state.sqlite"
         self.calls = []
 
-    def collect(self, records, **kwargs):
-        return collect_jobs.collect(self.jobs, lambda _: (records, 1), self.now, **kwargs)
+    def collect(self, records):
+        return collect_jobs.collect(self.jobs, lambda _: (records, 1), self.now)
 
     def body_logo(self, post_id, url=None):
         return branded_post(post_id, content='<img alt="Acme 공식 로고" src="' + (url or self.acme_image) + '">'
@@ -66,12 +66,19 @@ class LogoTests(unittest.TestCase):
             with closing(sqlite3.connect(self.jobs)) as db:
                 self.assertEqual(db.execute("SELECT count(*) FROM posts").fetchone()[0], 2)
             return self.fetch(url, **options)
-        self.collect([self.body_logo(1), self.body_logo(2)], logo_fetch=after_commit)
+        self.collect([self.body_logo(1), self.body_logo(2)])
+        company_logos.refresh_logos(self.jobs, fetch=after_commit)
         self.assertEqual(self.calls, [self.acme_image])
         self.assert_logo(1)
         self.assert_logo(2)
         with closing(sqlite3.connect(self.jobs)) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM company_logos").fetchone()[0], 1)
+            query = "SELECT outcome, attempted_at FROM job_company_logos WHERE post_id=1"
+            outcome, attempted_at = db.execute(query).fetchone()
+            self.assertEqual(outcome, "ready")
+            self.assertIsNotNone(attempted_at)
+            self.assertEqual(self.collect([self.body_logo(1)])["changed"], 0)
+            self.assertEqual(db.execute(query).fetchone(), ("ready", attempted_at))
 
     def test_official_page_recovers_logo_when_body_contains_only_poster_and_platform_logo(self):
         self.collect([branded_post(1, content='<p>채용 중</p><img alt="Acme 채용 포스터" src="https://x.example/poster.png">'
@@ -123,14 +130,16 @@ class LogoTests(unittest.TestCase):
         self.assert_logo(2)
 
     def test_temporary_failure_keeps_verified_logo_on_same_company_post_revision(self):
-        self.collect([self.body_logo(1)], logo_fetch=self.fetch)
+        self.collect([self.body_logo(1)])
+        company_logos.refresh_logos(self.jobs, fetch=self.fetch)
         saved = company_logos.read_logo(self.jobs, 1)
         new = "https://assets.example.com/updated.png"
         def failed(url, **_):
             if url == new or url == self.acme_page:
                 raise TimeoutError("temporary")
             self.fail(f"Unexpected request: {url}")
-        self.collect([self.body_logo(1, new)], logo_fetch=failed)
+        self.collect([self.body_logo(1, new)])
+        company_logos.refresh_logos(self.jobs, fetch=failed)
         self.assertEqual(company_logos.read_logo(self.jobs, 1), saved)
 
     def test_recollection_during_download_cannot_link_old_logo_to_different_company(self):
@@ -154,7 +163,8 @@ class LogoTests(unittest.TestCase):
         self.assertIsNone(company_logos.read_logo(self.jobs, 1))
 
     def test_dashboard_serves_only_verified_logo_on_authenticated_local_path(self):
-        self.collect([self.body_logo(1), branded_post(2, "Other", "<p>본문</p>")], logo_fetch=self.fetch)
+        self.collect([self.body_logo(1), branded_post(2, "Other", "<p>본문</p>")])
+        company_logos.refresh_logos(self.jobs, fetch=self.fetch)
         dashboard_store.init_state_db(self.jobs, self.state)
         with closing(sqlite3.connect(self.jobs)) as db, db:
             db.execute("UPDATE posts SET decision='recommend'")
