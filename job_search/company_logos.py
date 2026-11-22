@@ -241,6 +241,7 @@ def _seed(db, limit):
             doc = {}
         enqueue_logo(db, post_id, doc if isinstance(doc, dict) else {}, fingerprint)
     db.commit()
+    return len(rows)
 
 
 def _attempt(db, plan, fetch, deadline, image_module):
@@ -265,58 +266,112 @@ def _attempt(db, plan, fetch, deadline, image_module):
     return ("pending" if retry else "missing"), None, None
 
 
-def refresh_logos(path, *, limit=DEFAULT_LOGO_LIMIT, deadline=None, fetch=fetch_public, seed=True):
+# A nonzero lease marks an interrupted or in-flight attempt, regardless of the cutoff.
+_RETRY_ELIGIBLE = "(j.lease_until>0 OR ? IS NULL OR j.attempted_at IS NULL OR j.attempted_at<?)"
+
+
+def _validate_limit(limit):
     if type(limit) is not int or not 1 <= limit <= 500:
         raise ValueError("Logo limit must be between 1 and 500")
+
+
+def _batch_deadline(limit):
+    return time.monotonic() + min(120, 6 * limit)
+
+
+def _refresh_batch(db, *, limit, deadline, fetch, image_module, retry_before=None):
     summary = {"checked": 0, "ready": 0, "missing": 0, "retry": 0}
-    deadline = deadline if deadline is not None else time.monotonic() + min(120, 6 * limit)
-    if time.monotonic() >= deadline:
-        return summary
-    try:
-        from PIL import Image
-    except ImportError:
-        return summary
-    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True, timeout=0.2)) as db, db:
-        if not has_table(db, "job_company_logos"):
-            return summary
-        if seed:
-            _seed(db, limit)
-        ids = db.execute("""SELECT post_id FROM job_company_logos WHERE outcome='pending' AND lease_until<=?
-            ORDER BY attempted_at IS NOT NULL, attempted_at, post_id LIMIT ?""", (time.time(), limit)).fetchall()
-        for (post_id,) in ids:
-            if time.monotonic() >= deadline:
-                break
-            started = time.time()
-            with db:
-                attempt = db.execute("""UPDATE job_company_logos SET attempted_at=?,lease_until=?
-                    WHERE post_id=? AND outcome='pending' AND lease_until<=?
-                    RETURNING document_version""", (started, started + 15, post_id, started)).fetchone()
+    ids = db.execute(f"""SELECT j.post_id FROM job_company_logos j JOIN posts p ON p.id=j.post_id
+        WHERE j.outcome='pending' AND j.lease_until<=? AND {_RETRY_ELIGIBLE}
+        ORDER BY attempted_at IS NOT NULL, attempted_at, post_id LIMIT ?""", (time.time(), retry_before, retry_before, limit)).fetchall()
+    for (post_id,) in ids:
+        if time.monotonic() >= deadline:
+            break
+        started = time.time()
+        with db:
+            attempt = db.execute(f"""UPDATE job_company_logos AS j SET attempted_at=?,lease_until=?
+                WHERE post_id=? AND outcome='pending' AND lease_until<=? AND {_RETRY_ELIGIBLE}
+                RETURNING document_version""",
+                (started, started + 15, post_id, started, retry_before, retry_before)).fetchone()
             if not attempt:
                 continue
-            serialized = db.execute("SELECT document FROM posts WHERE id=?", (post_id,)).fetchone()
+            post = db.execute("SELECT document,fingerprint FROM posts WHERE id=?", (post_id,)).fetchone()
+            if post is None:
+                continue
+            serialized, fingerprint = post
             try:
-                doc = json.loads(serialized[0]) if serialized else None
+                doc = json.loads(serialized)
             except ValueError:
                 doc = None
             if not isinstance(doc, dict) or document_version(doc) != attempt[0]:
+                enqueue_logo(db, post_id, doc if isinstance(doc, dict) else {}, fingerprint)
                 continue
-            outcome, candidate, png = _attempt(db, _plan(doc), fetch, min(deadline, time.monotonic() + 5), Image)
-            with db:
-                db.execute("BEGIN IMMEDIATE")
-                current = db.execute("""SELECT p.document, j.attempted_at FROM posts p JOIN job_company_logos j ON j.post_id=p.id
-                    WHERE p.id=? AND j.document_version=?""", (post_id, attempt[0])).fetchone()
-                if not current or current != (serialized[0], started):
-                    continue
-                if png is not None:
-                    db.execute("""INSERT INTO company_logos VALUES(?,?,?,?,?)
-                        ON CONFLICT(company_key) DO UPDATE SET source_page=excluded.source_page,image_url=excluded.image_url,
-                          image=excluded.image,checked_at=excluded.checked_at WHERE excluded.checked_at>=company_logos.checked_at""",
-                        (candidate.key, candidate.source_page, candidate.image_url, png, started))
-                db.execute("""UPDATE job_company_logos SET company_key=COALESCE(?,company_key), outcome=?,lease_until=0
-                    WHERE post_id=?""", (candidate.key if candidate else None, outcome, post_id))
-            summary["checked"] += 1
-            summary["retry" if outcome == "pending" else outcome] += 1
+        outcome, candidate, png = _attempt(db, _plan(doc), fetch, min(deadline, time.monotonic() + 5), image_module)
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute("""SELECT p.document, j.attempted_at FROM posts p JOIN job_company_logos j ON j.post_id=p.id
+                WHERE p.id=? AND j.document_version=?""", (post_id, attempt[0])).fetchone()
+            if not current or current != (serialized, started):
+                continue
+            if png is not None:
+                db.execute("""INSERT INTO company_logos VALUES(?,?,?,?,?)
+                    ON CONFLICT(company_key) DO UPDATE SET source_page=excluded.source_page,image_url=excluded.image_url,
+                      image=excluded.image,checked_at=excluded.checked_at WHERE excluded.checked_at>=company_logos.checked_at""",
+                    (candidate.key, candidate.source_page, candidate.image_url, png, started))
+            # Preserve the round boundary if the wall clock moved backward.
+            attempted = max(started, retry_before) if retry_before is not None else started
+            db.execute("""UPDATE job_company_logos SET company_key=COALESCE(?,company_key), outcome=?,
+                attempted_at=?,lease_until=0 WHERE post_id=?""",
+                (candidate.key if candidate else None, outcome, attempted, post_id))
+        summary["checked"] += 1
+        summary["retry" if outcome == "pending" else outcome] += 1
     return summary
+
+
+def refresh_logos(path, *, limit=DEFAULT_LOGO_LIMIT, deadline=None, fetch=fetch_public, seed=True):
+    _validate_limit(limit)
+    empty = {"checked": 0, "ready": 0, "missing": 0, "retry": 0}
+    deadline = deadline if deadline is not None else _batch_deadline(limit)
+    if time.monotonic() >= deadline:
+        return empty
+    try:
+        from PIL import Image
+    except ImportError:
+        return empty
+    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True, timeout=0.2)) as db:
+        if not has_table(db, "job_company_logos"):
+            return empty
+        if seed:
+            _seed(db, limit)
+        return _refresh_batch(db, limit=limit, deadline=deadline, fetch=fetch, image_module=Image)
+
+
+def drain_logos(path, *, limit=DEFAULT_LOGO_LIMIT, retry_before, fetch=fetch_public):
+    _validate_limit(limit)
+    from PIL import Image
+
+    summary = {"checked": 0, "ready": 0, "missing": 0, "retry": 0}
+    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True, timeout=0.2)) as db:
+        for table in ("posts", "job_company_logos", "company_logos"):
+            if not has_table(db, table):
+                raise sqlite3.OperationalError(f"Required table is missing: {table}")
+        while True:
+            deadline = _batch_deadline(limit)
+            with db:
+                seeded = _seed(db, limit)
+            batch = _refresh_batch(db, limit=limit, deadline=deadline, fetch=fetch,
+                                   image_module=Image, retry_before=retry_before)
+            for key, count in batch.items():
+                summary[key] += count
+            if seeded or batch["checked"]:
+                continue
+            lease = db.execute(f"""SELECT MIN(j.lease_until) FROM job_company_logos j JOIN posts p ON p.id=j.post_id
+                WHERE j.outcome='pending' AND {_RETRY_ELIGIBLE}""", (retry_before, retry_before)).fetchone()[0]
+            if lease is None:
+                return summary
+            delay = lease - time.time()
+            if delay > 0:
+                time.sleep(delay)
 
 
 def logo_references(db):
@@ -347,8 +402,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, type=Path)
     parser.add_argument("--limit", type=int, default=DEFAULT_LOGO_LIMIT)
+    parser.add_argument("--drain", action="store_true", help="Process all available logo requests in batches")
     args = parser.parse_args()
-    print(json.dumps(refresh_logos(args.db, limit=args.limit)))
+    if args.drain:
+        summary = drain_logos(args.db, limit=args.limit, retry_before=time.time(), fetch=fetch_public)
+    else:
+        summary = refresh_logos(args.db, limit=args.limit, fetch=fetch_public)
+    print(json.dumps(summary))
 
 
 if __name__ == "__main__":

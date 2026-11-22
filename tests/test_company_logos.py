@@ -1,11 +1,14 @@
 import io
 import json
 import sqlite3
+import sys
 import tempfile
+import time
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -202,3 +205,169 @@ class LogoTests(unittest.TestCase):
         self.assertEqual(seen, [url, self.acme_image, url])
         self.assert_logo(1)
         self.assertIsNone(company_logos.read_logo(self.jobs, 2))
+
+    def test_drain_processes_53_jobs_and_retries_timeout_once_per_round(self):
+        timeout_url = "https://assets.example.com/timeout.png"
+        posts = [branded_post(1, content=f'<img alt="Acme 로고" src="{timeout_url}">')]
+        posts.extend(self.body_logo(i) for i in range(2, 54))
+        self.collect(posts)
+        with closing(sqlite3.connect(self.jobs)) as db, db:
+            db.execute("DELETE FROM job_company_logos WHERE post_id > 10")
+
+        def fetch(url, **options):
+            if url == timeout_url:
+                self.calls.append(url)
+                raise TimeoutError("temporary")
+            return self.fetch(url, **options)
+
+        cutoff = time.time()
+        self.assertEqual(company_logos.drain_logos(self.jobs, retry_before=cutoff, fetch=fetch),
+                         {"checked": 53, "ready": 52, "missing": 0, "retry": 1})
+        self.assertEqual(self.calls, [timeout_url, self.acme_image])
+        with closing(sqlite3.connect(self.jobs)) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM job_company_logos").fetchone()[0], 53)
+            outcome, attempted_at, lease_until = db.execute(
+                "SELECT outcome, attempted_at, lease_until FROM job_company_logos WHERE post_id=1"
+            ).fetchone()
+            self.assertEqual((outcome, lease_until), ("pending", 0))
+            self.assertGreaterEqual(attempted_at, cutoff)
+
+        self.calls.clear()
+        self.assertEqual(company_logos.drain_logos(self.jobs, retry_before=cutoff, fetch=fetch)["checked"], 0)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(company_logos.drain_logos(self.jobs, retry_before=attempted_at + 1e-6, fetch=fetch)["retry"], 1)
+        self.assertEqual(self.calls, [timeout_url])
+
+    def test_drain_seeds_past_batch_without_logo_clues(self):
+        self.collect([branded_post(i, content="<p>공고</p>") for i in range(1, 21)] + [self.body_logo(21)])
+        with closing(sqlite3.connect(self.jobs)) as db, db:
+            db.execute("DELETE FROM job_company_logos")
+        company_logos.drain_logos(self.jobs, retry_before=time.time(), fetch=self.fetch)
+        self.assertEqual(self.calls, [self.acme_image])
+        self.assert_logo(21)
+        with closing(sqlite3.connect(self.jobs)) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM job_company_logos WHERE outcome='missing'").fetchone()[0], 20)
+
+    def test_drain_waits_for_interrupted_claim_from_same_round(self):
+        self.collect([self.body_logo(1)])
+        cutoff = time.time()
+        claimed = cutoff + 1
+        lease = cutoff + 15
+        with closing(sqlite3.connect(self.jobs)) as db, db:
+            db.execute("UPDATE job_company_logos SET attempted_at=?, lease_until=?", (claimed, lease))
+        clock = claimed
+
+        def wait(seconds):
+            nonlocal clock
+            self.assertGreater(seconds, 0)
+            clock += seconds
+
+        with patch.object(company_logos.time, "time", side_effect=lambda: clock), \
+             patch.object(company_logos.time, "sleep", side_effect=wait):
+            company_logos.drain_logos(self.jobs, retry_before=cutoff, fetch=self.fetch)
+        self.assertEqual(clock, lease)
+        self.assertEqual(self.calls, [self.acme_image])
+        self.assert_logo(1)
+
+    def test_drain_detects_company_changed_during_download(self):
+        replacement = "https://assets.example.com/different.png"
+        self.collect([self.body_logo(1)])
+
+        def fetch(url, **_):
+            self.calls.append(url)
+            if url == self.acme_image:
+                self.collect([branded_post(1, "Different", f'<img alt="Different logo" src="{replacement}">')])
+            return url, logo_png(), "image/png"
+
+        result = company_logos.drain_logos(self.jobs, limit=1, retry_before=time.time(), fetch=fetch)
+        self.assertEqual(result["ready"], 1)
+        self.assertEqual(self.calls, [self.acme_image, replacement])
+        self.assert_logo(1)
+        with closing(sqlite3.connect(self.jobs)) as db:
+            self.assertEqual(db.execute("SELECT image_url FROM company_logos").fetchall(), [(replacement,)])
+
+    def test_drain_reconciles_inconsistent_existing_queue_rows(self):
+        self.collect([self.body_logo(1), self.body_logo(2)])
+        with closing(sqlite3.connect(self.jobs)) as db, db:
+            db.execute("DELETE FROM posts WHERE id=1")
+            db.execute("UPDATE job_company_logos SET document_version='stale' WHERE post_id=2")
+        with patch.object(company_logos.time, "sleep", side_effect=AssertionError("unexpected wait")):
+            company_logos.drain_logos(self.jobs, limit=1, retry_before=time.time(), fetch=self.fetch)
+        self.assertEqual(self.calls, [self.acme_image])
+        self.assert_logo(2)
+
+    def test_drain_fails_when_required_table_is_missing(self):
+        self.collect([])
+        with closing(sqlite3.connect(self.jobs)) as db, db:
+            db.execute("DROP TABLE company_logos")
+        with self.assertRaisesRegex(sqlite3.OperationalError, "company_logos"):
+            company_logos.drain_logos(self.jobs, retry_before=time.time(), fetch=self.fetch)
+
+    def test_drain_fails_when_pillow_is_missing(self):
+        self.collect([])
+        with patch.dict(sys.modules, {"PIL": None}):
+            with self.assertRaises(ImportError):
+                company_logos.drain_logos(self.jobs, retry_before=time.time(), fetch=self.fetch)
+
+    def test_cli_limit_is_batch_size_only_with_drain(self):
+        self.collect([self.body_logo(1), self.body_logo(2)])
+        args = ["company_logos", "--db", str(self.jobs), "--limit", "1"]
+        with patch.object(company_logos, "fetch_public", self.fetch):
+            with patch.object(sys, "argv", args), redirect_stdout(io.StringIO()) as output:
+                company_logos.main()
+            self.assertEqual(json.loads(output.getvalue())["checked"], 1)
+            self.collect([self.body_logo(3)])
+            with patch.object(sys, "argv", args + ["--drain"]), redirect_stdout(io.StringIO()) as output:
+                company_logos.main()
+            self.assertEqual(json.loads(output.getvalue())["checked"], 2)
+
+    def test_drain_defers_timeout_when_wall_clock_is_behind_round_cutoff(self):
+        self.collect([branded_post(1, content=f'<img alt="Acme 로고" src="{self.acme_image}">')])
+        now = time.time()
+        cutoff = now + 30
+
+        def timeout(url, **_):
+            self.assertEqual(self.calls, [])
+            self.calls.append(url)
+            raise TimeoutError("temporary")
+
+        with patch.object(company_logos.time, "time", return_value=now):
+            result = company_logos.drain_logos(self.jobs, retry_before=cutoff, fetch=timeout)
+        self.assertEqual(result["retry"], 1)
+        self.assertEqual(self.calls, [self.acme_image])
+
+    def test_drain_does_not_claim_a_timeout_completed_after_selection(self):
+        self.collect([self.body_logo(1)])
+        cutoff = time.time()
+        clock_reads = 0
+
+        def clock():
+            nonlocal clock_reads
+            clock_reads += 1
+            if clock_reads == 2:
+                with closing(sqlite3.connect(self.jobs)) as db, db:
+                    db.execute("UPDATE job_company_logos SET attempted_at=?, lease_until=0", (cutoff + 1,))
+            return cutoff + 2
+
+        with patch.object(company_logos.time, "time", side_effect=clock):
+            result = company_logos.drain_logos(self.jobs, retry_before=cutoff, fetch=self.fetch)
+        self.assertEqual(result["checked"], 0)
+        self.assertEqual(self.calls, [])
+
+    def test_drain_resets_the_batch_deadline(self):
+        urls = [f"https://assets.example.com/{i}.png" for i in range(1, 4)]
+        self.collect([branded_post(i, str(i), f'<img alt="{i} logo" src="{url}">')
+                      for i, url in enumerate(urls, 1)])
+        clock = 0
+
+        def fetch(url, *, deadline, **_):
+            nonlocal clock
+            self.calls.append(url)
+            self.assertEqual(deadline - clock, 5)
+            clock += 5
+            return url, logo_png(), "image/png"
+
+        with patch.object(company_logos.time, "monotonic", side_effect=lambda: clock):
+            result = company_logos.drain_logos(self.jobs, limit=1, retry_before=time.time(), fetch=fetch)
+        self.assertEqual(result["ready"], 3)
+        self.assertEqual(self.calls, urls)
