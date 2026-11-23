@@ -163,7 +163,9 @@ def save_document(db, doc):
         clear_stamp = "" if has_table(db, "fit_delivery") else ",reviewed_at=NULL"
         db.execute(f"""UPDATE posts SET document=?,fingerprint=?,decision=NULL,reason=NULL,
             evidence_lines=NULL{clear_fit}{clear_stamp} WHERE id=?""", (serialized, fingerprint, post_id))
-    if post_id > 0 and has_table(db, "job_company_logos"):
+    # Keep an existing employer image versioned with the JD. The worker discovers newly eligible jobs.
+    if old and has_table(db, "job_company_logos") and db.execute(
+            "SELECT 1 FROM job_company_logos WHERE post_id=? AND company_key IS NOT NULL", (post_id,)).fetchone():
         enqueue_logo(db, post_id, doc, fingerprint)
     return fingerprint
 
@@ -302,6 +304,7 @@ def record_reviews(path, entries, digest=None, execution_id=None, *, dashboard_u
             if saved_digest is not None:
                 return saved_digest
         seen = set()
+        wake_logos = False
         reviews = []
         for entry in entries:
             post_id, decision = entry.get("id"), entry.get("decision")
@@ -329,6 +332,8 @@ def record_reviews(path, entries, digest=None, execution_id=None, *, dashboard_u
                 if decision == "recommend" and entry.get("apply_url") is not None:
                     fit["apply_url"] = checked_link(entry["apply_url"])
                 reviews.append((doc, entry, decision, fit))
+            if decision == "recommend":
+                wake_logos = True
             if decision != "needs_review" and not lines:
                 raise ValueError(f"Decision requires JD evidence: {post_id}")
             if has_table(db, "fit_delivery"):
@@ -344,7 +349,9 @@ def record_reviews(path, entries, digest=None, execution_id=None, *, dashboard_u
         if digest is not None and digest != "[SILENT]":
             db.execute("INSERT INTO outbox(id,digest,attempts) VALUES(?,?,?)",
                        (execution_id, digest, json.dumps([execution_id])))
-        return digest
+    if wake_logos:
+        signal_logo_worker(path)
+    return digest
 
 
 def reconcile_outbox(path, outcomes, execution_id):

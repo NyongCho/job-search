@@ -10,6 +10,7 @@ import sys
 import time
 from contextlib import closing
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
@@ -22,6 +23,7 @@ from .job_sources import (
     _next_data, company_key, company_names, fetch_posting, linked_job_locator, matches_jd_source, parse_posting,
     role_key, source_locator,
 )
+from .logo_scope import default_state_path, eligible_post_ids
 from .public_fetch import PublicHTTPError, fetch_public
 
 MAX_PAGE = 2_000_000
@@ -421,10 +423,11 @@ def enqueue_logo(db, post_id, doc, fingerprint):
         (post_id, fingerprint, document_version(doc), identity, "pending" if identity else "missing"))
 
 
-def _seed(db, limit):
+def _seed(db, limit, eligible):
     db.execute("BEGIN IMMEDIATE")
     rows = db.execute("""SELECT p.id,p.document,p.fingerprint FROM posts p LEFT JOIN job_company_logos j ON p.id=j.post_id
-        WHERE p.id>0 AND (j.post_id IS NULL OR p.fingerprint<>j.fingerprint) ORDER BY p.id LIMIT ?""", (limit,)).fetchall()
+        WHERE p.id IN (SELECT value FROM json_each(?)) AND (j.post_id IS NULL OR p.fingerprint<>j.fingerprint)
+        ORDER BY p.id LIMIT ?""", (eligible, limit)).fetchall()
     for post_id, serialized, fingerprint in rows:
         try:
             doc = json.loads(serialized)
@@ -609,14 +612,19 @@ def _refresh_post(db, post_id, *, deadline, fetch, image_module, retry_before=No
     return outcome
 
 
-def _refresh_batch(db, *, limit, deadline, fetch, image_module, retry_before=None):
+def _refresh_batch(db, eligible, select_eligible, *, limit, deadline, fetch, image_module, retry_before=None):
     summary = {"checked": 0, "ready": 0, "missing": 0, "retry": 0}
     ids = db.execute(f"""SELECT j.post_id FROM job_company_logos j JOIN posts p ON p.id=j.post_id
-        WHERE j.outcome='pending' AND j.lease_until<=? AND {_RETRY_ELIGIBLE}
-        ORDER BY attempted_at IS NOT NULL, attempted_at, post_id LIMIT ?""", (time.time(), retry_before, retry_before, limit)).fetchall()
+        WHERE j.post_id IN (SELECT value FROM json_each(?)) AND j.outcome='pending'
+        AND j.lease_until<=? AND {_RETRY_ELIGIBLE}
+        ORDER BY attempted_at IS NOT NULL, attempted_at, post_id LIMIT ?""",
+        (eligible, time.time(), retry_before, retry_before, limit)).fetchall()
     for (post_id,) in ids:
         if time.monotonic() >= deadline:
             break
+        # A user can archive a job while an earlier download in this batch is running.
+        if not select_eligible(post_id):
+            continue
         outcome = _refresh_post(db, post_id, deadline=min(deadline, time.monotonic() + 5),
                                 fetch=fetch, image_module=image_module, retry_before=retry_before)
         if outcome:
@@ -625,7 +633,7 @@ def _refresh_batch(db, *, limit, deadline, fetch, image_module, retry_before=Non
     return summary
 
 
-def refresh_logos(path, *, limit=DEFAULT_LOGO_LIMIT, deadline=None, fetch=fetch_public, seed=True):
+def refresh_logos(path, *, state_path=None, limit=DEFAULT_LOGO_LIMIT, deadline=None, fetch=fetch_public, seed=True):
     _validate_limit(limit)
     empty = {"checked": 0, "ready": 0, "missing": 0, "retry": 0}
     deadline = deadline if deadline is not None else _batch_deadline(limit)
@@ -638,12 +646,15 @@ def refresh_logos(path, *, limit=DEFAULT_LOGO_LIMIT, deadline=None, fetch=fetch_
     with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True, timeout=0.2)) as db:
         if not has_table(db, "job_company_logos"):
             return empty
+        select_eligible = partial(eligible_post_ids, path, state_path or default_state_path(path))
+        eligible = json.dumps(list(select_eligible()))
         if seed:
-            _seed(db, limit)
-        return _refresh_batch(db, limit=limit, deadline=deadline, fetch=fetch, image_module=Image)
+            _seed(db, limit, eligible)
+        return _refresh_batch(db, eligible, select_eligible, limit=limit, deadline=deadline,
+                              fetch=fetch, image_module=Image)
 
 
-def drain_logos(path, *, limit=DEFAULT_LOGO_LIMIT, retry_before, fetch=fetch_public):
+def drain_logos(path, *, state_path=None, limit=DEFAULT_LOGO_LIMIT, retry_before, fetch=fetch_public):
     _validate_limit(limit)
     from PIL import Image
 
@@ -652,18 +663,21 @@ def drain_logos(path, *, limit=DEFAULT_LOGO_LIMIT, retry_before, fetch=fetch_pub
         for table in ("posts", "job_company_logos", "company_logos"):
             if not has_table(db, table):
                 raise sqlite3.OperationalError(f"Required table is missing: {table}")
+        select_eligible = partial(eligible_post_ids, path, state_path or default_state_path(path))
         while True:
             deadline = _batch_deadline(limit)
+            eligible = json.dumps(list(select_eligible()))
             with db:
-                seeded = _seed(db, limit)
-            batch = _refresh_batch(db, limit=limit, deadline=deadline, fetch=fetch,
+                seeded = _seed(db, limit, eligible)
+            batch = _refresh_batch(db, eligible, select_eligible, limit=limit, deadline=deadline, fetch=fetch,
                                    image_module=Image, retry_before=retry_before)
             for key, count in batch.items():
                 summary[key] += count
             if seeded or batch["checked"]:
                 continue
             lease = db.execute(f"""SELECT MIN(j.lease_until) FROM job_company_logos j JOIN posts p ON p.id=j.post_id
-                WHERE j.outcome='pending' AND {_RETRY_ELIGIBLE}""", (retry_before, retry_before)).fetchone()[0]
+                WHERE j.post_id IN (SELECT value FROM json_each(?)) AND j.outcome='pending' AND {_RETRY_ELIGIBLE}""",
+                (eligible, retry_before, retry_before)).fetchone()[0]
             if lease is None:
                 return summary
             delay = lease - time.time()
@@ -671,13 +685,13 @@ def drain_logos(path, *, limit=DEFAULT_LOGO_LIMIT, retry_before, fetch=fetch_pub
                 time.sleep(delay)
 
 
-def _drain_with_signals(path, *, limit, fetch):
+def _drain_with_signals(path, *, state_path, limit, fetch):
     invoked_at = time.time()
     directory = _signal_directory(path)
     try:
         fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     except FileNotFoundError:
-        return drain_logos(path, limit=limit, retry_before=invoked_at, fetch=fetch)
+        return drain_logos(path, state_path=state_path, limit=limit, retry_before=invoked_at, fetch=fetch)
     try:
         import fcntl
 
@@ -695,7 +709,7 @@ def _drain_with_signals(path, *, limit, fetch):
         if not signals and unexpected:
             raise OSError(f"Unexpected entries in {directory}: {', '.join(sorted(unexpected))}")
         retry_before = max(signals.values()) / 1_000_000_000 if signals else invoked_at
-        summary = drain_logos(path, limit=limit, retry_before=retry_before, fetch=fetch)
+        summary = drain_logos(path, state_path=state_path, limit=limit, retry_before=retry_before, fetch=fetch)
         # Keep the cutoff stable if acknowledgement is interrupted.
         for name in sorted(signals, key=signals.__getitem__):
             os.unlink(name, dir_fd=fd)
@@ -728,10 +742,12 @@ def read_logo(path, post_id):
     return None
 
 
-def requeue_missing(path):
+def requeue_missing(path, *, state_path=None):
+    eligible = json.dumps(list(eligible_post_ids(path, state_path or default_state_path(path))))
     with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True)) as db, db:
         count = db.execute("""UPDATE job_company_logos SET outcome='pending',attempted_at=NULL
-            WHERE outcome='missing' AND company_key IS NULL AND lease_until<=?""", (time.time(),)).rowcount
+            WHERE post_id IN (SELECT value FROM json_each(?)) AND outcome='missing'
+            AND company_key IS NULL AND lease_until<=?""", (eligible, time.time())).rowcount
     if count:
         signal_logo_worker(path)
     return count
@@ -740,17 +756,19 @@ def requeue_missing(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, type=Path)
+    parser.add_argument("--state-db", type=Path,
+                        help="Dashboard state DB (default: DASHBOARD_STATE_DB or dashboard/dashboard.sqlite next to the jobs DB)")
     parser.add_argument("--limit", type=int, default=DEFAULT_LOGO_LIMIT)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--drain", action="store_true", help="Process all available logo requests in batches")
     mode.add_argument("--retry-missing", action="store_true", help="Queue previously missing logos and notify the worker")
     args = parser.parse_args()
     if args.retry_missing:
-        summary = {"requeued": requeue_missing(args.db)}
+        summary = {"requeued": requeue_missing(args.db, state_path=args.state_db)}
     elif args.drain:
-        summary = _drain_with_signals(args.db, limit=args.limit, fetch=fetch_public)
+        summary = _drain_with_signals(args.db, state_path=args.state_db, limit=args.limit, fetch=fetch_public)
     else:
-        summary = refresh_logos(args.db, limit=args.limit, fetch=fetch_public)
+        summary = refresh_logos(args.db, state_path=args.state_db, limit=args.limit, fetch=fetch_public)
     print(json.dumps(summary))
 
 

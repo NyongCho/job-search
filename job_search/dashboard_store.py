@@ -12,7 +12,8 @@ from urllib.parse import urlsplit
 
 from . import refresh_queue
 from .card_metadata import create_deadline_tables, has_table
-from .company_logos import logo_references
+from .company_logos import logo_references, signal_logo_worker
+from .logo_scope import TRACKED_STATUSES
 from .job_availability import KST, ROLLING, availability, document_version
 from .job_fit import group_before_closure, profile_jd, read_fit, recommendation_group, stable_hash
 from .job_sources import source_locator, source_name
@@ -585,6 +586,9 @@ def set_status(jobs_db: Path, state_db: Path, post_id: int, status: str) -> dict
         db.execute("""INSERT INTO job_state(post_id,status,updated_at) VALUES(?,?,?)
             ON CONFLICT(post_id) DO UPDATE SET status=excluded.status,updated_at=excluded.updated_at""",
                    (post_id, status, now))
+    if post_id > 0 and status != job["status"] and not job["has_company_logo"] and (
+            status in TRACKED_STATUSES or (status == "unmarked" and _matches({**job, "status": status}, "recommended"))):
+        signal_logo_worker(jobs_db)
     return {"status": status}
 
 

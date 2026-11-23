@@ -85,6 +85,15 @@ class FitWorkTests(unittest.TestCase):
             **args,
         )
 
+    def test_new_manual_recommendation_wakes_logo_worker_after_publication(self):
+        signals = Path(str(self.path) + ".logo-requests")
+        signals.mkdir()
+        task = {"id": 1, "post_id": 1, "run_id": 7}
+        for _ in range(2):
+            self.fit.refresh_fit_tasks(self.path, self.state, [task], lambda *args: None,
+                                       runner=response, profile=self.profile)
+            self.assertEqual(len(list(signals.iterdir())), 1)
+
     def legacy(self, post_id, status="met"):
         doc = jobs.get_posts(self.path, [post_id])[0]
         fit = assessment(criterion("필수", "required", status))

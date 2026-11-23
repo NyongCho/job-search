@@ -73,7 +73,7 @@ class CollectorTests(unittest.TestCase):
         self.assertIn(str(requests), errors.getvalue())
         self.assertEqual(output.getvalue(), "")
 
-    def test_collection_queues_logo_without_downloading_before_hermes_review(self):
+    def test_collection_defers_logo_queueing_until_the_post_is_eligible(self):
         post = posting(1, content='<img alt="회사 로고" src="https://cdn.example.com/logo.png">')
         response = io.BytesIO(json.dumps([post]).encode())
         response.headers = {"X-WP-TotalPages": "1"}
@@ -85,7 +85,7 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in jobs.pending(self.db)], [1])
         with closing(jobs.connect(self.db)) as db:
             row = db.execute("SELECT outcome, attempted_at FROM job_company_logos WHERE post_id=1").fetchone()
-            self.assertEqual(tuple(row), ("pending", None))
+            self.assertIsNone(row)
         download.assert_not_called()
 
     def test_failed_second_page_does_not_advance_checkpoint_or_save_partial_window(self):
@@ -105,7 +105,7 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in jobs.pending(self.db)], [1])
         with closing(jobs.connect(self.db)) as db:
             queued = db.execute("SELECT post_id FROM job_company_logos ORDER BY post_id").fetchall()
-            self.assertEqual([row[0] for row in queued], [1])
+            self.assertEqual(queued, [])
 
     def test_reads_all_pages_and_overlaps_previous_success(self):
         self.collect([posting()])

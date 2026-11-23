@@ -30,6 +30,10 @@ export DASHBOARD_SECRET_KEY="$(.venv-dashboard/bin/python -c 'import secrets; pr
 
 ### 기업 로고 워커
 
+로고는 대시보드의 추천, 관심, 지원 준비, 지원한 공고에 대해 수집합니다. 추천 목록에 함께 표시되는 ‘확인 질문’ 공고는 관심이나 지원 상태로 옮기면 대상이 됩니다. 마감된 공고도 관심·지원 준비·지원 상태로 관리 중이면 포함됩니다. 원본 채용 공고가 없는 personal-profile 지원 기록은 건너뜁니다.
+
+자동 수집, 누락 재시도, 대시보드의 목록·개별 새로고침이 같은 범위를 사용합니다. 이미 대기 중인 작업도 실행 전에 현재 분류를 확인합니다. 로고 워커의 개인 상태 DB는 기본적으로 공고 DB 옆의 `dashboard/dashboard.sqlite`입니다. 다른 경로에서는 `--state-db` 또는 워커의 `DASHBOARD_STATE_DB`로 지정합니다.
+
 아래 명령은 코드와 가상환경을 `~/job_search`에 둔 단일 폴더 설치용입니다. 워커는 이 폴더에서 `.venv-dashboard/bin/python`과 `data/jobs.sqlite`를 사용합니다. `current`로 버전을 전환하는 서버는 [릴리스 설치 절차](deployment.md#기업-로고-워커를-추가하는-첫-배포)를 따릅니다.
 
 ```sh

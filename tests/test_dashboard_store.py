@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from job_search import collect_jobs
 from job_search import dashboard_store as store
+from job_search.logo_scope import eligible_post_ids
 from job_search.refresh_job_availability import refresh
 from tests.test_collect_jobs import posting
 
@@ -121,6 +122,18 @@ class StoreTests(unittest.TestCase):
         store.set_status(self.source, self.state, 5, "unmarked")
         store.set_deadline(self.source, self.state, 5, {"mode": "manual", "kind": "date", "date": "2000-01-01"})
         self.assertEqual(store.list_jobs(self.source, self.state)["question_total"], 0)
+
+    def test_logo_scope_uses_recommendation_membership_and_personal_marks(self):
+        collect_fit_examples(self.source)
+        store.set_deadline(self.source, self.state, 3, {"mode": "manual", "kind": "date", "date": "2000-01-01"})
+        store.set_status(self.source, self.state, 2, "archived")
+        self.assertEqual(eligible_post_ids(self.source, self.state), {1, 6})
+        store.set_status(self.source, self.state, 3, "applied")  # Expired, but still tracked.
+        store.set_status(self.source, self.state, 4, "preparing")  # Below the recommendation threshold.
+        store.set_status(self.source, self.state, 5, "interested")  # Has an unanswered fit question.
+        self.assertEqual(eligible_post_ids(self.source, self.state), {1, 3, 4, 5, 6})
+        for i in range(1, 7):
+            self.assertEqual(eligible_post_ids(self.source, self.state, i), {i} if i != 2 else set())
 
     def test_inbox_fit_sort_ranks_all_search_matches_before_pagination(self):
         collect_fit_examples(self.source, (

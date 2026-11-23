@@ -24,11 +24,14 @@ class RefreshSourceTests(unittest.TestCase):
         self.jobs = Path(self.temp.name) / "jobs.sqlite"
         self.state = Path(self.temp.name) / "state.sqlite"
 
-    def seed(self, records):
+    def seed(self, records, *, interested=False):
         collect_jobs.collect(self.jobs, lambda _: (records, 1))
         dashboard_store.init_state_db(self.jobs, self.state)
         with closing(sqlite3.connect(self.state)) as db, db:
             db.execute("CREATE TABLE IF NOT EXISTS test_events(id INTEGER PRIMARY KEY,status TEXT)")
+            if interested:
+                db.executemany("INSERT INTO job_state(post_id,status,updated_at) VALUES(?,'interested','')",
+                               [(record["id"],) for record in records])
 
     def task(self, post_id, **extra):
         return {
@@ -145,9 +148,22 @@ class RefreshSourceTests(unittest.TestCase):
         self.assertEqual(sorted(map(len, calls)), [1, 100])
         self.assertEqual(self.events()[101], "failed")
 
+    def test_archived_post_skips_a_preexisting_logo_task_before_any_network_call(self):
+        from functools import partial
+
+        self.seed([branded_post(1)], interested=True)
+        run = refresh_queue.enqueue(self.state, [(1, self.task(1)["version"])], "detail:1")
+        dashboard_store.set_status(self.jobs, self.state, 1, "archived")
+        (task,) = refresh_queue.claim(self.state, "logo", 1)
+        self.logo(task, lambda *_, **kw: self.fail("archived job made a network request"),
+                  partial(refresh_queue.finish, self.state))
+        result = refresh_queue.snapshot(self.state, run, post_id=1)["post_tasks"]
+        self.assertEqual(result["logo"], {"status": "skipped", "message": refresh_queue.LOGO_OUT_OF_SCOPE})
+        self.assertEqual([result[k]["status"] for k in ("deadline", "fit")], ["queued", "queued"])
+
     def test_newer_jd_and_logo_are_from_the_same_inthiswork_response(self):
         old = posting(1)
-        self.seed([old])
+        self.seed([old], interested=True)
         task = self.task(1)
         logo_task = dict(task, id=2, source_work_id=1, source_status="running")
         asset = "https://assets.example.com/verified.png"
@@ -178,7 +194,7 @@ class RefreshSourceTests(unittest.TestCase):
 
     def test_verified_cache_finishes_while_deadline_is_running_and_workers_share_image_claim(self):
         url = "https://assets.example.com/acme.png"
-        self.seed([branded_post(i, content=f'<img alt="Acme 로고" src="{url}">') for i in (1, 2, 3)])
+        self.seed([branded_post(i, content=f'<img alt="Acme 로고" src="{url}">') for i in (1, 2, 3)], interested=True)
         started, release = threading.Event(), threading.Event()
         calls = []
 
@@ -190,15 +206,13 @@ class RefreshSourceTests(unittest.TestCase):
             return url, logo_png(), "image/png"
 
         with ThreadPoolExecutor() as pool:
-            legacy = pool.submit(company_logos.refresh_logos, self.jobs, limit=1, fetch=fetch)
+            legacy = pool.submit(company_logos.refresh_logos, self.jobs, state_path=self.state, limit=1, fetch=fetch)
             self.assertTrue(started.wait(2))
             manual = pool.submit(self.logo, self.task(2), fetch)
             try:
                 end = time.monotonic() + 2
                 with closing(sqlite3.connect(self.jobs)) as db:
-                    while not db.execute("SELECT lease_until FROM job_company_logos WHERE post_id=2").fetchone()[
-                        0
-                    ]:
+                    while not db.execute("SELECT 1 FROM job_company_logos WHERE post_id=2 AND lease_until>0").fetchone():
                         self.assertLess(time.monotonic(), end, "manual worker did not claim the other posting")
                         time.sleep(0.01)
             finally:
@@ -211,7 +225,7 @@ class RefreshSourceTests(unittest.TestCase):
             self.assertIsNotNone(company_logos.read_logo(self.jobs, post_id))
 
     def test_verified_external_page_shares_original_job_and_preserves_body_on_deadline_only(self):
-        self.seed([posting(1)])
+        self.seed([posting(1)], interested=True)
         url = "https://www.wanted.co.kr/wd/123"
         image = "https://assets.example.com/wanted-company.png"
         self.update_document(1, source="wanted", source_job_id="123", url=url, lines=[])
@@ -246,7 +260,7 @@ class RefreshSourceTests(unittest.TestCase):
         url = "https://www.wanted.co.kr/wd/321"
         image = "https://assets.example.com/company-321.png"
         record = posting(1, f'<p>마감일</p><p>2026-12-31</p><a href="{url}">지원하러가기</a>')
-        self.seed([record])
+        self.seed([record], interested=True)
         calls = []
 
         def fetch(requested, **_):
@@ -433,7 +447,7 @@ class RefreshSourceTests(unittest.TestCase):
         expired = home + "ko/o/239254"
         image = "https://profiles.greetinghr.com/group/logo"
         listing = branded_post(1, "Silicon2", f'<a href="{expired}">지원하러가기</a>')
-        self.seed([listing])
+        self.seed([listing], interested=True)
         board = next_page({"host": host, "careerBaseInfo": {
             "workspace": {"id": 5, "name": "(주) 실리콘투", "imageUrl": image}},
             "careerBootInfo": {"design": {"footer": {"companyName": "Silicon2"}}}})
@@ -467,7 +481,7 @@ class RefreshSourceTests(unittest.TestCase):
         url = f"https://{host}/ko/o/1"
         group = "https://profiles.greetinghr.com/group/acme"
         header = "https://opening-attachments.greetinghr.com/header/acme.png"
-        self.seed([branded_post(1)])
+        self.seed([branded_post(1)], interested=True)
         self.update_document(1, source="greeting", source_job_id=1, url=url)
         page = next_page({"host": host, "openingId": 1,
             "careerBootInfo": {"design": {"header": {"logoUrl": header}}},
@@ -495,7 +509,7 @@ class RefreshSourceTests(unittest.TestCase):
         host = "acme.career.greetinghr.com"
         url = f"https://{host}/ko/o/1"
         asset = "https://profiles.greetinghr.com/group/acme"
-        self.seed([branded_post(1)])
+        self.seed([branded_post(1)], interested=True)
         self.update_document(1, source="greeting", source_job_id=1, url=url)
         board = next_page({"host": host, "careerBaseInfo": {
             "workspace": {"id": 8, "name": "Acme", "imageUrl": asset}}})
@@ -513,7 +527,7 @@ class RefreshSourceTests(unittest.TestCase):
         self.assertIsNotNone(company_logos.read_logo(self.jobs, 1))
 
     def test_invalid_deadline_does_not_discard_an_independently_verified_logo(self):
-        self.seed([posting(1)])
+        self.seed([posting(1)], interested=True)
         image = "https://assets.example.com/logo.png"
         url = "https://www.wanted.co.kr/wd/321"
         self.update_document(1, source="wanted", source_job_id=321, url=url)
@@ -644,8 +658,10 @@ class RefreshSourceTests(unittest.TestCase):
         from unittest.mock import patch
 
         url = "https://assets.example.com/acme.png"
-        self.seed([branded_post(1, content=f'<img alt="Acme 로고" src="{url}">')])
+        self.seed([branded_post(1, content=f'<img alt="Acme 로고" src="{url}">')], interested=True)
         with closing(sqlite3.connect(self.jobs)) as db, db:
+            doc, version = db.execute("SELECT document,fingerprint FROM posts WHERE id=1").fetchone()
+            company_logos.enqueue_logo(db, 1, json.loads(doc), version)
             key = db.execute("SELECT identity FROM job_company_logos WHERE post_id=1").fetchone()[0]
             db.execute(
                 "INSERT INTO logo_image_claims VALUES(?,?,?,?)", (key, url, "interrupted", time.time() + 15)
@@ -688,7 +704,7 @@ class RefreshSourceTests(unittest.TestCase):
         self.assertEqual(collect_jobs.get_posts(self.jobs, [1])[0]["images"], stored["images"])
 
     def test_greenhouse_response_body_logo_does_not_require_another_job_page(self):
-        self.seed([posting(1)])
+        self.seed([posting(1)], interested=True)
         url = "https://job-boards.greenhouse.io/example/jobs/123"
         asset = "https://org.example/logo.png"
         self.update_document(1, source="greenhouse", source_job_id=123, url=url)
@@ -715,7 +731,7 @@ class RefreshSourceTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
     def test_same_verified_company_without_a_second_asset_reuses_its_png(self):
-        self.seed([posting(1), posting(2)])
+        self.seed([posting(1), posting(2)], interested=True)
         asset = "https://org.example/logo.png"
         for i in (1, 2):
             self.update_document(i, source="wanted", source_job_id=i, url=f"https://www.wanted.co.kr/wd/{i}")
@@ -813,9 +829,9 @@ class RefreshSourceTests(unittest.TestCase):
         from tests.test_job_fit import assessment, criterion
 
         image = "https://assets.example.com/original.png"
-        self.seed([posting(1, f'<p>필수 경력 5년</p><img alt="회사 로고" src="{image}">')])
+        self.seed([posting(1, f'<p>필수 경력 5년</p><img alt="회사 로고" src="{image}">')], interested=True)
         fit_work.migrate(self.jobs, self.state, profile={})
-        company_logos.refresh_logos(self.jobs, fetch=lambda u, **_: (u, logo_png(), "image/png"))
+        company_logos.refresh_logos(self.jobs, state_path=self.state, fetch=lambda u, **_: (u, logo_png(), "image/png"))
         before = self.task(1)
         entry = {"id": 1, "fingerprint": before["version"], "decision": "exclude", "reason": "필수 경력 미충족",
                  "evidence_lines": [1], "availability": "open", "assessment": assessment(criterion("경력", "required", "unmet"))}
@@ -850,7 +866,7 @@ class RefreshSourceTests(unittest.TestCase):
         from functools import partial
 
         asset = "https://assets.example.com/brand.png"
-        self.seed([posting(1), posting(2)])
+        self.seed([posting(1), posting(2)], interested=True)
         for i in (1, 2):
             self.update_document(i, source="wanted", source_job_id=i, url=f"https://www.wanted.co.kr/wd/{i}")
         finish = partial(refresh_queue.finish, self.state)
@@ -992,7 +1008,7 @@ class RefreshSourceTests(unittest.TestCase):
         url = "https://www.wanted.co.kr/wd/17"
         image = "https://assets.example.com/17.png"
         old = posting(1, "<p>마감 2099-12-01</p>")
-        self.seed([old])
+        self.seed([old], interested=True)
         fresh = posting(
             1, f'<p>마감 2099-12-31</p><img alt="회사 로고" src="{image}"><a href="{url}">지원하러가기</a>'
         )
@@ -1085,7 +1101,7 @@ class RefreshSourceTests(unittest.TestCase):
 
         url = "https://www.wanted.co.kr/wd/17"
         listing = posting(2, f'<a href="{url}">지원하러가기</a>')
-        self.seed([posting(1), listing])
+        self.seed([posting(1), listing], interested=True)
         self.update_document(1, source="wanted", source_job_id=17, url=url)
         company = {"company_id": 1, "company_name": "회사"}
         role = {"id": 17, "position": "엔지니어", "company": company, "status": "active",
@@ -1104,7 +1120,7 @@ class RefreshSourceTests(unittest.TestCase):
         role.update(status="closed", requirements="동명 기업의 필수 요건")
         scheduled = verify_openings(stored, fetch_page=lambda _: ([listing], 1), fetch=fetch)
         self.deadlines([self.task(1, id=3), self.task(2, id=4)], fetch)
-        company_logos.refresh_logos(self.jobs, fetch=fetch)
+        company_logos.refresh_logos(self.jobs, state_path=self.state, fetch=fetch)
         for post_id in (1, 2):
             card = dashboard_store.get_job(self.jobs, self.state, post_id)
             self.assertEqual(card["lines"], ["기존 기업의 필수 요건"])
@@ -1121,7 +1137,7 @@ class RefreshSourceTests(unittest.TestCase):
         listing = posting(
             1, f'<p>마감 2099-12-01</p><img alt="회사 로고" src="{broken}"><a href="{url}">지원하러가기</a>'
         )
-        self.seed([listing])
+        self.seed([listing], interested=True)
         refresh_queue.enqueue(self.state, [(1, self.task(1)["version"])], "detail:1")
         finish = partial(refresh_queue.finish, self.state)
         calls, entered, release = [], threading.Event(), threading.Event()

@@ -5,6 +5,7 @@ from uuid import UUID
 from flask import jsonify, render_template, request
 
 from . import dashboard_store as store, refresh_queue as queue
+from .logo_scope import eligible_post_ids
 
 
 def _scope(view, q, post_id):
@@ -37,7 +38,8 @@ def register(app, source, state, context):
         view, q, _, _ = context()
         targets = store.refresh_targets(source, state, view=view, q=q, post_id=post_id)
         request_id = request.headers.get("X-Refresh-Request")
-        run = queue.enqueue(state, targets, _scope(view, q, post_id), str(UUID(request_id)) if request_id else None)
+        run = queue.enqueue(state, targets, _scope(view, q, post_id), str(UUID(request_id)) if request_id else None,
+                            logo_post_ids=eligible_post_ids(source, state, post_id))
         return jsonify(queue.snapshot(state, run, post_id=post_id)), 202
 
     @app.post("/refreshes")
