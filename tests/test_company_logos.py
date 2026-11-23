@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -40,11 +41,21 @@ class LogoTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.jobs = Path(self.temp.name) / "jobs.sqlite"
-        self.state = Path(self.temp.name) / "state.sqlite"
+        self.state = self.jobs.parent / "dashboard/dashboard.sqlite"
+        self.enterContext(patch.dict(os.environ, DASHBOARD_STATE_DB=""))
         self.calls = []
 
     def collect(self, records):
-        return collect_jobs.collect(self.jobs, lambda _: (records, 1), self.now)
+        result = collect_jobs.collect(self.jobs, lambda _: (records, 1), self.now)
+        dashboard_store.init_state_db(self.jobs, self.state)
+        with closing(sqlite3.connect(self.jobs)) as db, db:
+            db.executemany("UPDATE posts SET decision='recommend' WHERE id=?", [(post["id"],) for post in records])
+        return result
+
+    def seed_existing_queue(self):
+        with closing(sqlite3.connect(self.jobs)) as db, db:
+            for post_id, document, fingerprint in db.execute("SELECT id,document,fingerprint FROM posts"):
+                company_logos.enqueue_logo(db, post_id, json.loads(document), fingerprint)
 
     def body_logo(self, post_id, url=None):
         return branded_post(post_id, content='<img alt="Acme 공식 로고" src="' + (url or self.acme_image) + '">'
@@ -417,6 +428,7 @@ class LogoTests(unittest.TestCase):
         posts = [branded_post(1, content=f'<img alt="Acme 로고" src="{timeout_url}">')]
         posts.extend(self.body_logo(i) for i in range(2, 54))
         self.collect(posts)
+        self.seed_existing_queue()
         with closing(sqlite3.connect(self.jobs)) as db, db:
             db.execute("DELETE FROM job_company_logos WHERE post_id > 10")
 
@@ -457,6 +469,7 @@ class LogoTests(unittest.TestCase):
     def test_drain_waits_for_interrupted_claim_from_same_round(self):
         self.collect([self.body_logo(1)])
         cutoff = time.time()
+        self.seed_existing_queue()
         claimed = cutoff + 1
         lease = cutoff + 15
         with closing(sqlite3.connect(self.jobs)) as db, db:
@@ -494,6 +507,7 @@ class LogoTests(unittest.TestCase):
 
     def test_drain_reconciles_inconsistent_existing_queue_rows(self):
         self.collect([self.body_logo(1), self.body_logo(2)])
+        self.seed_existing_queue()
         with closing(sqlite3.connect(self.jobs)) as db, db:
             db.execute("DELETE FROM posts WHERE id=1")
             db.execute("UPDATE job_company_logos SET document_version='stale' WHERE post_id=2")
@@ -501,6 +515,32 @@ class LogoTests(unittest.TestCase):
             company_logos.drain_logos(self.jobs, limit=1, retry_before=time.time(), fetch=self.fetch)
         self.assertEqual(self.calls, [self.acme_image])
         self.assert_logo(2)
+
+    def test_existing_backlog_is_scoped_and_follows_personal_status_changes(self):
+        records = [self.body_logo(i, f"https://assets.example.com/{i}.png") for i in range(1, 6)]
+        self.collect(records)
+        self.seed_existing_queue()
+        with closing(sqlite3.connect(self.jobs)) as db, db:
+            db.execute("UPDATE posts SET decision='needs_review' WHERE id<>1")
+        with closing(sqlite3.connect(self.state)) as db, db:
+            db.executemany("INSERT INTO job_state(post_id,status,updated_at) VALUES(?,?,'now')",
+                           [(1, "archived"), (3, "interested"), (4, "preparing"), (5, "applied")])
+
+        def fetch(url, **_):
+            self.calls.append(url)
+            if url.endswith("/3.png"):
+                dashboard_store.set_status(self.jobs, self.state, 4, "archived")
+            return url, logo_png(), "image/png"
+
+        result = company_logos.drain_logos(self.jobs, retry_before=time.time(), fetch=fetch)
+        self.assertEqual(result["checked"], 2)
+        self.assertEqual(self.calls, ["https://assets.example.com/3.png", "https://assets.example.com/5.png"])
+        dashboard_store.set_status(self.jobs, self.state, 2, "interested")
+        self.assertEqual(company_logos.refresh_logos(self.jobs, fetch=fetch)["checked"], 1)
+        self.assertEqual(self.calls[-1], "https://assets.example.com/2.png")
+        with closing(sqlite3.connect(self.jobs)) as db:
+            self.assertEqual(db.execute("SELECT post_id FROM job_company_logos WHERE attempted_at IS NULL ORDER BY post_id")
+                             .fetchall(), [(1,), (4,)])
 
     def test_drain_fails_when_required_table_is_missing(self):
         self.collect([])
@@ -571,6 +611,7 @@ company_logos.main()
         requests.mkdir()
         signal_time = time.time() - 100
         self.collect([self.body_logo(1)])
+        self.seed_existing_queue()
         for signal in requests.iterdir():
             signal.unlink()
         (requests / f"{int(signal_time * 1_000_000_000)}-{'0' * 32}").touch()

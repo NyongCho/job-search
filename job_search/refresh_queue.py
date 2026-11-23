@@ -8,6 +8,7 @@ from pathlib import Path
 
 KINDS = ("deadline", "logo", "fit")
 STATUSES = ("queued", "running", "done", "failed", "skipped")
+LOGO_OUT_OF_SCOPE = "로고는 추천·관심·지원 준비·지원한 공고에서 수집해요."
 FIT_FAILURE_REASONS = {
     "Hermes 평가 실행 준비 실패": "Hermes가 적합도 평가를 시작하지 못했어요.",
     "평가 응답에서 공고 누락 또는 중복": "평가 응답에서 이 공고가 누락되거나 중복됐어요.",
@@ -76,7 +77,22 @@ def _recheck_fits(db, run):
         (SELECT group_id FROM refresh_members WHERE run_id=?)""", (run, run))
 
 
-def enqueue(path, targets, scope, request_id=None):
+def _scope_logos(db, run, logo_post_ids):
+    if logo_post_ids is None:
+        return
+    # A second click can subscribe to an active group after the job was moved to another tab.
+    changed = db.execute("""WITH eligible AS (SELECT value FROM json_each(?))
+        UPDATE refresh_work SET
+            status=CASE WHEN status='queued' THEN 'skipped' ELSE 'queued' END,
+            message=CASE WHEN status='queued' THEN ? ELSE '' END, ready_at=0
+        WHERE kind='logo' AND post_id>0 AND group_id IN (SELECT group_id FROM refresh_members WHERE run_id=?)
+          AND ((status='queued' AND post_id NOT IN eligible)
+            OR (status='skipped' AND message=? AND post_id IN eligible))
+        RETURNING id""", (json.dumps(sorted(logo_post_ids)), LOGO_OUT_OF_SCOPE, run, LOGO_OUT_OF_SCOPE)).fetchall()
+    db.executemany("INSERT OR REPLACE INTO refresh_changes(work_id) VALUES(?)", changed)
+
+
+def enqueue(path, targets, scope, request_id=None, *, logo_post_ids=None):
     encoded = json.dumps(sorted(set(map(tuple, targets))))
     signature = hashlib.sha256(encoded.encode()).hexdigest()
     with closing(connect(path)) as db, db:
@@ -93,6 +109,7 @@ def enqueue(path, targets, scope, request_id=None):
             WHERE m.run_id=r.id AND w.status IN ('queued','running')) ORDER BY r.id DESC LIMIT 1""",
                               (scope, signature)).fetchone()
         if existing:
+            _scope_logos(db, existing[0], logo_post_ids)
             _recheck_fits(db, existing[0])
             if request_id:
                 db.execute("INSERT INTO refresh_receipts VALUES(?,?)", (request_id, existing[0]))
@@ -122,6 +139,7 @@ def enqueue(path, targets, scope, request_id=None):
                 SELECT ?,json_extract(value,'$[0]') FROM json_each(?)""", (run, new_groups))
         db.execute("""INSERT INTO refresh_members(run_id,group_id)
             SELECT DISTINCT ?,active_group FROM targets WHERE active_group IS NOT NULL""", (run,))
+        _scope_logos(db, run, logo_post_ids)
         _recheck_fits(db, run)
         return run
 

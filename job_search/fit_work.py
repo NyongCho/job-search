@@ -17,9 +17,11 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from . import fit_hermes
+from .company_logos import signal_logo_worker
 from .fit_digest import checked_link, dashboard_origin, review_decision, review_digest
 from .job_availability import _stamp, availability, deadline_view
 from .job_fit import evaluate_fit, jd_input, profile_jd, read_fit, recommendation_group, stable_hash
+from .logo_scope import eligible_post_ids
 
 DEFAULT_BATCH_SIZE = 3
 RUBRIC = stable_hash([2, fit_hermes.PROMPT])
@@ -609,6 +611,10 @@ def refresh_fit_tasks(
     groups = [(path, [task for task in tasks if (task["post_id"] > 0) == positive])
               for positive, path in ((True, jobs_path), (False, state_path))]
 
+    # A dashboard refresh may have already skipped the logo before the fit makes the job a recommendation.
+    manual_ids = {task["post_id"] for task in tasks if task.get("run_id") and task["post_id"] > 0}
+    previously_outside = [i for i in manual_ids if not eligible_post_ids(jobs_path, state_path, i)]
+
     def run_batch(work):
         path, group = work
         while group:
@@ -622,6 +628,8 @@ def refresh_fit_tasks(
         batches = [(path, group[i:i + size]) for path, group in groups for i in range(0, len(group), size)]
         with ThreadPoolExecutor(slots) as pool:
             list(pool.map(run_batch, batches))
+    if any(eligible_post_ids(jobs_path, state_path, i) for i in previously_outside):
+        signal_logo_worker(jobs_path)
 
 
 def verify_openings(documents, *, fetch_page=None, fetch=None):
@@ -779,7 +787,9 @@ def scheduled_review(
                 (execution_id, digest, json.dumps([execution_id])),
             )
         db.execute("INSERT INTO metadata VALUES(?,?)", ("fit_delivery:" + execution_id, "1"))
-        return digest
+    if any(decision == "recommend" for _, _, decision, _ in reviews):
+        signal_logo_worker(jobs_path)
+    return digest
 
 
 def main():

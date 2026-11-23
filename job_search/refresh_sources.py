@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from . import collect_jobs, company_logos, refresh_queue
 from .job_availability import _automatic, _stamp, document_version, has_jd_content, inspect_document
+from .logo_scope import eligible_post_ids
 from .job_sources import SourceLocator, matches_jd_source, parse_posting, role_key, source_locator
 from .public_fetch import fetch_public
 from .refresh_job_availability import (
@@ -442,6 +443,9 @@ def refresh_logo_task(jobs_path, state_path, task, finish, *, fetch=fetch_public
     """Return False when a source result or a concurrent logo download is still pending."""
     if task["post_id"] < 0:
         finish(task, "skipped", NO_SOURCE)
+        return True
+    if not eligible_post_ids(jobs_path, state_path, task["post_id"]):
+        finish(task, "skipped", refresh_queue.LOGO_OUT_OF_SCOPE)
         return True
     from PIL import Image
 

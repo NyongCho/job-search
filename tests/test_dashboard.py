@@ -316,6 +316,22 @@ class WebTests(unittest.TestCase):
             self.assertEqual(row_ids(html), ["1", "2"])
             self.assertIn('<option value="deadline" selected>', html)
 
+    def test_logo_refresh_tracks_dashboard_membership_across_overlapping_clicks(self):
+        token = self.csrf()
+        dashboard.store.set_status(self.source, self.state, 1, "archived")
+        bulk = self.post("/refreshes?view=archived", {}, token)
+        self.assertEqual(bulk.status_code, 202)
+        self.assertEqual(bulk.json["by_kind"]["logo"]["skipped"], 1)
+        self.assertEqual(bulk.json["counts"]["queued"], 2)
+        self.assertEqual(refresh_queue.claim(self.state, "logo", 1), [])
+        detail = self.post("/refreshes?view=recommended", {"post_id": 1}, token)
+        self.assertEqual(detail.json["post_tasks"]["logo"], {
+            "status": "skipped", "message": refresh_queue.LOGO_OUT_OF_SCOPE})
+        dashboard.store.set_status(self.source, self.state, 1, "interested")
+        resumed = self.post("/refreshes", {"post_id": 1}, token)
+        self.assertEqual(resumed.json["id"], detail.json["id"])
+        self.assertEqual(resumed.json["post_tasks"]["logo"]["status"], "queued")
+
     def test_imported_application_offers_common_refresh_with_no_deadline_source(self):
         dashboard.store.import_profile_jobs(self.source, self.state, [{
             "source_key": "applications/legacy", "company": "회사", "role": "직무", "summary": "기존 지원",
