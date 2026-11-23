@@ -54,11 +54,13 @@ def review_digest(reviews, dashboard_url):
                     f'필수 조건 {entry["required_summary"].strip()}\n마감 {entry["deadline"].strip()}\n'
                     f'지원 {fit["apply_url"]}\n원문 {source}')
         if dashboard_url:
-            text += f'\n대시보드 {dashboard_url}/jobs/{entry["id"]}'
+            text += f'\n채용함에서 보기 {dashboard_url}/jobs/{entry["id"]}'
         score = 0 if group == "question" else fit["score"]
         groups[group].append((score, fit["reviewed_at"], entry["id"], text))
     sections = []
     for group, items in groups.items():
         if items:
             sections.append(titles[group] + "\n\n" + "\n\n".join(item[3] for item in sorted(items, reverse=True)))
+    if sections and dashboard_url:
+        sections.append(f"채용함 전체 목록 {dashboard_url}")
     return "\n\n".join(sections) or "[SILENT]"
