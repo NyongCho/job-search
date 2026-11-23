@@ -559,13 +559,26 @@ def read_logo(path, post_id):
     return None
 
 
+def requeue_missing(path):
+    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True)) as db, db:
+        count = db.execute("""UPDATE job_company_logos SET outcome='pending',attempted_at=NULL
+            WHERE outcome='missing' AND company_key IS NULL AND lease_until<=?""", (time.time(),)).rowcount
+    if count:
+        signal_logo_worker(path)
+    return count
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, type=Path)
     parser.add_argument("--limit", type=int, default=DEFAULT_LOGO_LIMIT)
-    parser.add_argument("--drain", action="store_true", help="Process all available logo requests in batches")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--drain", action="store_true", help="Process all available logo requests in batches")
+    mode.add_argument("--retry-missing", action="store_true", help="Queue previously missing logos and notify the worker")
     args = parser.parse_args()
-    if args.drain:
+    if args.retry_missing:
+        summary = {"requeued": requeue_missing(args.db)}
+    elif args.drain:
         summary = _drain_with_signals(args.db, limit=args.limit, fetch=fetch_public)
     else:
         summary = refresh_logos(args.db, limit=args.limit, fetch=fetch_public)

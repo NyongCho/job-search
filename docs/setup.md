@@ -52,6 +52,12 @@ systemd를 사용하지 않는 환경에서는 같은 DB를 지정해 수동으�
 .venv-dashboard/bin/python -m job_search.company_logos --db data/jobs.sqlite --drain
 ```
 
+로고 탐색 방식이 개선된 뒤에는 이전에 로고를 찾지 못한 공고를 한 번 다시 대기열에 넣을 수 있습니다. 설치된 경로 감시 워커가 이어서 처리합니다. 수동 운영 환경에서는 이 명령 뒤에 위의 `--drain`을 실행합니다.
+
+```sh
+.venv-dashboard/bin/python -m job_search.company_logos --db data/jobs.sqlite --retry-missing
+```
+
 ## Hermes와 Slack
 
 루트 `deployment.json`에 실제 작업 ID·Slack 채널·웹 주소를 기록합니다. [설정 예시](../deploy/deployment.example.json)를 참고하며 기존 설정은 보존합니다. JSON만 작성하면 예약되는 것은 아닙니다. Hermes에서 작업을 만들고 그 ID와 실행 설정을 일치시켜야 합니다.
