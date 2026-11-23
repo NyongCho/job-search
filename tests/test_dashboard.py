@@ -126,6 +126,45 @@ class WebTests(unittest.TestCase):
             page = self.get("/?view=" + view).get_data(as_text=True)
             self.assertIn(f'<option value="{value}" selected>{label}</option>', page)
 
+    def test_inbox_views_offer_fit_sort_and_keep_their_defaults(self):
+        for view in ("interested", "preparing", "applied", "archived", "needs_review", "expired"):
+            with self.subTest(view=view):
+                path = "/?view=" + view
+                default = "activity" if view == "applied" else "reviewed"
+                menu = self.get(path).get_data(as_text=True)
+                self.assertIn(f'<option value="{default}" selected>', menu)
+                self.assertIn('<option value="fit">적합도순</option>', menu)
+                selected = self.get(path + "&sort=fit")
+                self.assertEqual(selected.status_code, 200)
+                self.assertIn('<option value="fit" selected>적합도순</option>', selected.get_data(as_text=True))
+
+    def test_interested_fit_sort_keeps_search_and_page_on_detail_return(self):
+        collect_fit_examples(self.source)
+        for post_id in (1, 2, 3, 4):
+            dashboard.store.set_status(self.source, self.state, post_id, "interested")
+
+        def follow(html, link):
+            return self.get(unescape(re.search(link, html)[1])).get_data(as_text=True)
+
+        def check_page(html, ids):
+            self.assertIn('name="q" value="Agent"', html)
+            self.assertIn('<option value="fit" selected>', html)
+            self.assertNotIn('class="list-group-title"', html)
+            self.assertEqual(re.findall(r'class="job-row[^"]*" href="/jobs/(\d+)\?', html), ids)
+
+        with patch.object(dashboard.store, "PAGE_SIZE", 2):
+            first = self.get("/?view=interested&q=Agent&sort=fit").get_data(as_text=True)
+            check_page(first, ["3", "4"])
+            self.assertIn("90.0점 · 선호 밖 추천", first)
+            second = follow(first, r'href="([^"]+)" aria-label="다음 페이지"')
+            check_page(second, ["2", "1"])
+            self.assertIn("적합도 미산정", second)
+            detail = follow(second, r'href="(/jobs/2\?[^"]+)"')
+            returned = follow(detail, r'class="back-link" href="([^"]+)"')
+            check_page(returned, ["2", "1"])
+            previous = follow(returned, r'href="([^"]+)" aria-label="이전 페이지"')
+            check_page(previous, ["3", "4"])
+
     def test_fit_list_and_detail_keep_evidence_questions_and_return_location(self):
         collect_fit_examples(self.source)
         page = self.get("/").get_data(as_text=True)

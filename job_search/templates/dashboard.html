@@ -60,16 +60,17 @@
         </div>
         <div class="inbox-grid">
           <section id="job-list" class="job-list" aria-label="공고 목록" data-scroll-key="{{ view }}:{{ listing.sort }}:{{ q }}:{{ listing.page }}">
+            {% set grouped_by_fit = view == 'recommended' and listing.sort == 'fit' %}
             {% for item in listing['items'] %}
-            {% if view == 'recommended' and (listing.sort == 'fit' or item.fit_group == 'question') and loop.changed(item.fit_group) %}
+            {% if (grouped_by_fit or (view == 'recommended' and item.fit_group == 'question')) and loop.changed(item.fit_group) %}
             <h2 class="list-group-title">{{ fit_groups[item.fit_group] }}</h2>
             {% endif %}
             <a class="job-row {% if detail and detail.id == item.id %}selected{% endif %}" href="{{ url_for('detail',post_id=item.id,view=view,q=q,sort=listing.sort,page=listing.page) }}" {% if detail and detail.id == item.id %}aria-current="true"{% endif %}>
               <div class="company-line">{% if item.has_company_logo %}<img class="company-logo" src="{{ url_for('company_logo', post_id=item.id) }}" alt="" width="24" height="24" loading="lazy">{% else %}<span class="company-avatar" aria-hidden="true">{{ item.company[0] }}</span>{% endif %}<span class="company-name">{{ item.company }}</span><span class="deadline-badge {{ item.deadline_kind }}">{{ deadline_content(item) }}</span></div>
               <div class="job-row-title">{{ item.role }}</div>
               {% if item.fit %}
-              <p class="fit-preview">{% if item.fit.score is not none %}적합도 {{ '%.1f'|format(item.fit.score) }}점{% else %}적합도 보류{% endif %}{% if item.fit_group in ('preferred', 'outside') and listing.sort != 'fit' %} · {{ fit_groups[item.fit_group] }}{% endif %}</p>
-              {% elif item.fit_group == 'legacy' and listing.sort != 'fit' %}<p class="fit-preview">적합도 미산정</p>
+              <p class="fit-preview">{% if item.fit.score is not none %}적합도 {{ '%.1f'|format(item.fit.score) }}점{% else %}적합도 보류{% endif %}{% if item.fit_group in ('preferred', 'outside') and not grouped_by_fit %} · {{ fit_groups[item.fit_group] }}{% endif %}</p>
+              {% elif item.fit_group == 'legacy' and not grouped_by_fit %}<p class="fit-preview">적합도 미산정</p>
               {% endif %}
               {% if item.company_review %}{% set review = item.company_review %}
               <div class="company-rating-preview">
