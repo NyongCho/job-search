@@ -245,22 +245,57 @@ test('a confirmed deadline repaints while the worker still reads the linked JD',
   assert.equal(snapshots, 1);
 });
 
-test('each refresh control reports the same requests as its usage links', () => {
-  const status = ids => ({
-    textContent: '',
-    parentElement: {querySelectorAll() { return ids.map(id => ({dataset: {runId: String(id)}})); }},
-  });
-  const list = status([10]), detail = status([10, 12]);
-  const context = {document: {
-    querySelector() { return null; }, querySelectorAll() { return [list, detail]; },
+test('the same run paints list totals and each selected job task with its own reason', () => {
+  function fields() {
+    const elements = new Map();
+    return {querySelector(key) {
+      if (!elements.has(key)) elements.set(key, {});
+      return elements.get(key);
+    }};
+  }
+  function panel(individual) {
+    const rows = ['deadline', 'logo', 'fit'].map(kind => ({...fields(), dataset: {kind, task: kind}}));
+    const dataset = {runId: '10', ...(individual ? {postResults: ''} : {})};
+    return {...fields(), dataset, rows, querySelectorAll: key =>
+      key === (individual ? '[data-task]' : '[data-kind]') ? rows : []};
+  }
+  const counts = (changes = {}) => ({queued: 0, running: 0, done: 0, failed: 0, skipped: 0, ...changes});
+  const run = {id: 10, counts: counts({failed: 3, done: 1, running: 1, queued: 1}), by_kind: {
+    deadline: counts({failed: 1, done: 1}), logo: counts({failed: 1, running: 1}), fit: counts({failed: 1, queued: 1}),
+  }, post_tasks: {
+    deadline: {status: 'failed', message: '원본 공고 미확인'}, logo: {status: 'failed', message: '이미지 수집 실패'},
+    fit: {status: 'failed', message: 'Hermes가 적합도 평가를 시작하지 못했어요.'},
   }};
-  vm.runInNewContext(script + `
-    runs.set(10, {id: 10, complete: false, counts: {queued: 6, done: 2, failed: 1, skipped: 0, running: 0}});
-    runs.set(12, {id: 12, complete: true, counts: {queued: 0, done: 2, failed: 1, skipped: 0, running: 0}});
-    showProgress();
-  `, context);
-  assert.match(list.textContent, /새로고침 중 · 3\/9개 항목/);
-  assert.match(detail.textContent, /#12 완료 · 3\/3개 항목 · 실패 1/);
+  const list = panel(false), detail = panel(true);
+  const paint = vm.runInNewContext(script + '\n runs.set(10, run); showProgress;', {
+    run, document: {querySelector() { return null; }, querySelectorAll() { return [list, detail]; }},
+  });
+  paint();
+  assert.equal(list.querySelector('[data-run-state]').textContent, '처리 중');
+  assert.equal(list.querySelector('[data-run-total]').textContent, '작업 4/6개 처리 · 실행 중 1 · 대기 1');
+  assert.deepEqual(list.querySelector('[data-run-bar]'), {max: 6, value: 4});
+  assert.equal(list.rows[0].querySelector('progress').value, 2);
+  assert.equal(list.rows[1].querySelector('[data-kind-status]').textContent, '처리 중 1 · 실패 1');
+  assert.equal(detail.querySelector('[data-run-state]').textContent, '전체 실패');
+  assert.equal(detail.querySelector('[data-run-total]').textContent, '작업 3/3개 처리');
+  assert.deepEqual(detail.rows.map(row => row.querySelector('[data-task-status]').textContent), ['실패','실패','실패']);
+  assert.deepEqual(detail.rows.map(row => row.querySelector('[data-task-message]').textContent),
+    ['원본 공고 미확인','이미지 수집 실패','Hermes가 적합도 평가를 시작하지 못했어요.']);
+  const savedTasks = run.post_tasks;
+  delete run.post_tasks;
+  paint();
+  assert.equal(detail.querySelector('[data-run-state]').textContent, '전체 실패');
+  run.post_tasks = savedTasks;
+  run.post_tasks.logo = {status: 'queued', message: ''};
+  run.post_tasks.fit = {status: 'running', message: ''};
+  paint();
+  assert.deepEqual(detail.rows.map(row => row.querySelector('[data-task-status]').textContent), ['실패','대기 중','처리 중']);
+  assert.equal(detail.rows[2].querySelector('[data-task-message]').textContent, '');
+  run.post_tasks.logo = {status: 'skipped', message: '확인된 기업 로고가 없어요.'};
+  run.post_tasks.fit = {status: 'done', message: '기존 평가'};
+  paint();
+  assert.equal(detail.querySelector('[data-run-state]').textContent, '일부 실패');
+  assert.deepEqual(detail.rows.map(row => row.querySelector('[data-task-status]').textContent), ['실패','건너뜀','성공']);
 });
 
 test('an empty destination tab polls until active work can no longer change its cards or totals', async () => {

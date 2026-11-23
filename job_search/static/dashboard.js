@@ -36,6 +36,7 @@ function wireScroll() {
 async function post(url, data, requestId) {
   const response = await fetch(url, {
     method: "POST", credentials: "same-origin", keepalive: Boolean(requestId),
+    ...(requestId ? {signal: refreshSignal()} : {}),
     headers: { "Content-Type": "application/json", "X-CSRF-Token": token,
                ...(requestId ? {"X-Refresh-Request": requestId} : {}) },
     body: JSON.stringify(data),
@@ -214,11 +215,17 @@ const runs = new Map();
 let activity = null;
 let needsSnapshot = false;
 let pollTimer;
+let pollDelay = 1500;
+const lastProgress = new Map();
+
+function refreshSignal() {
+  return globalThis.AbortSignal?.timeout?.(15000);
+}
 
 async function readCurrentScreen(accept) {
   const version = ++screenVersion;
   try {
-    const response = await fetch(location.href, {headers: {"X-Dashboard-Snapshot": "1"}});
+    const response = await fetch(location.href, {headers: {"X-Dashboard-Snapshot": "1"}, signal: refreshSignal()});
     if (!response.ok) throw new Error("화면을 불러오지 못했어요.");
     const html = await response.text();
     if (pageActive && version === screenVersion) accept(html);
@@ -292,7 +299,7 @@ function syncList(next) {
 function applySnapshot(html) {
   const next = new DOMParser().parseFromString(html, "text/html");
   syncList(next.querySelector("#job-list"));
-  const selectors = [".list-title > span", ".collection-time", ".nav-count", ".summary-strip strong", "[data-refresh-usage]"];
+  const selectors = [".list-title > span", ".collection-time", ".nav-count", ".summary-strip strong", "[data-refresh-panels]"];
   if (detail) {
     selectors.push(".detail-company", "#job-detail > h2", ".detail-meta", ".detail-actions", "#detail-fit",
                    "#detail-evidence", "#deadline-auto-value", "#deadline-manual-value");
@@ -321,6 +328,8 @@ function applySnapshot(html) {
   for (const run of JSON.parse(baseline.runs)) runs.set(run.id, run);
   activity = JSON.parse(baseline.activity);
   needsSnapshot = false;
+  pollDelay = 1500;
+  refreshMessage("");
   showProgress();
 }
 
@@ -336,27 +345,86 @@ async function refreshScreen() {
     await readCurrentScreen(applySnapshot);
   } catch {
     if (pageActive) {
-      refreshMessage("화면을 불러오지 못했어요. 다시 시도하고 있어요.");
-      schedulePoll(1500);
+      retryRefresh("화면을 불러오지 못했어요. 연결을 다시 확인할게요.");
+      schedulePoll(pollDelay);
     }
   }
 }
 
+function retryRefresh(message) {
+  pollDelay = Math.min(30000, pollDelay * 2);
+  refreshMessage(message);
+}
+
+function progressSummary(counts) {
+  const finished = counts.done + counts.failed + counts.skipped;
+  const total = finished + counts.running + counts.queued;
+  let state = "완료";
+  if (!total) state = "대상 없음";
+  else if (counts.running) state = "처리 중";
+  else if (counts.queued) state = "대기 중";
+  else if (counts.failed) state = counts.failed === total ? "전체 실패" : "일부 실패";
+
+  const parts = [];
+  for (const [key, label] of [["running","처리 중"], ["queued","대기"], ["done","성공"], ["skipped","해당 없음"], ["failed","실패"]]) {
+    if (counts[key]) parts.push(`${label} ${counts[key]}`);
+  }
+  return {state, total, finished, details: parts.join(" · ") || state};
+}
+
+function setText(element, value) {
+  if (element.textContent !== value) element.textContent = value;
+}
+
+function setProgress(bar, summary) {
+  bar.max = summary.total || 1;
+  bar.value = summary.finished;
+}
+
+const taskStates = {queued: "대기 중", running: "처리 중", done: "성공", failed: "실패", skipped: "건너뜀"};
+
+function showPostTasks(panel, tasks) {
+  const counts = {queued: 0, running: 0, done: 0, failed: 0, skipped: 0};
+  for (const row of panel.querySelectorAll("[data-task]")) {
+    const task = tasks[row.dataset.task];
+    if (!task) continue;
+    counts[task.status]++;
+    row.dataset.state = task.status;
+    setText(row.querySelector("[data-task-status]"), taskStates[task.status]);
+    setText(row.querySelector("[data-task-message]"), task.message ||
+      (task.status === "failed" ? "세부 실패 사유가 기록되지 않았어요." : ""));
+  }
+  return counts;
+}
+
 function showProgress() {
-  for (const status of document.querySelectorAll("[data-refresh-status]")) {
-    const links = status.parentElement.querySelectorAll("[data-run-id]");
-    const visible = [...links].map(link => runs.get(Number(link.dataset.runId))).filter(Boolean);
-    const message = visible.map(({id, counts, complete}) => {
-      const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
-      const finished = counts.done + counts.failed + counts.skipped;
-      const label = visible.length > 1 ? `새로고침 #${id}` : "새로고침";
-      const parts = [`${label} ${complete ? "완료" : "중"} · ${finished}/${total}개 항목`];
-      if (counts.running) parts.push(`확인 중 ${counts.running}`);
-      if (counts.failed) parts.push(`실패 ${counts.failed}`);
-      if (counts.skipped) parts.push(`해당 없음 ${counts.skipped}`);
-      return parts.join(" · ");
-    }).join(" / ");
-    if (status.textContent !== message) status.textContent = message;
+  const now = Date.now();
+  for (const panel of document.querySelectorAll("[data-refresh-panels] [data-run-id]")) {
+    const run = runs.get(Number(panel.dataset.runId));
+    if (!run) continue;
+    const individual = panel.dataset.postResults !== undefined;
+    if (individual && !run.post_tasks) continue;
+    const counts = individual ? showPostTasks(panel, run.post_tasks) : run.counts;
+    const summary = progressSummary(counts);
+    const complete = summary.finished === summary.total;
+    const progressKey = `${run.id}/${individual ? "post" : "list"}`;
+    const signature = individual ? JSON.stringify(run.post_tasks) : [run.cursor, counts.running, counts.queued].join("/");
+    if (lastProgress.get(progressKey)?.signature !== signature) lastProgress.set(progressKey, {signature, at: now});
+    const minutes = Math.floor((now - lastProgress.get(progressKey).at) / 60000);
+    const elapsed = !complete && minutes ? ` · ${minutes}분간 변동 없음` : "";
+    setText(panel.querySelector("[data-run-state]"), summary.state);
+    const pending = complete ? "" : ` · 실행 중 ${counts.running} · 대기 ${counts.queued}`;
+    setText(panel.querySelector("[data-run-total]"), `작업 ${summary.finished}/${summary.total}개 처리${pending}${elapsed}`);
+    setProgress(panel.querySelector("[data-run-bar]"), summary);
+    panel.dataset.outcome = complete && counts.failed ? "failed" : complete ? "complete" : "active";
+    for (const part of panel.querySelectorAll("[data-kind]")) {
+      const counts = run.by_kind[part.dataset.kind];
+      const value = progressSummary(counts);
+      part.dataset.failed = String(counts.failed > 0);
+      setText(part.querySelector("[data-kind-count]"), `${value.finished}/${value.total}`);
+      setText(part.querySelector("[data-kind-status]"), value.details);
+      setProgress(part.querySelector("progress"), value);
+    }
   }
 }
 
@@ -380,7 +448,7 @@ function forgetSubmission(id) {
 }
 
 async function recoverRefresh(request) {
-  const response = await fetch(`/refreshes?request=${encodeURIComponent(request.id)}`);
+  const response = await fetch(`/refreshes?request=${encodeURIComponent(request.id)}`, {signal: refreshSignal()});
   if (!response.ok) throw new Error();
   const found = await response.json();
   return found.runs[0] || submitRefresh(request.scope, request.postId, request.id);
@@ -402,18 +470,21 @@ async function poll() {
       const active = [...runs.values()].filter(run => !run.complete);
       if (activity?.active || active.length) {
         const read = async url => {
-          const response = await fetch(url);
+          const response = await fetch(url, {signal: refreshSignal()});
           if (!response.ok) throw new Error();
           return response.json();
         };
         const [latest, ...updates] = await Promise.all([
           activity?.active ? read("/refreshes/activity") : null,
-          ...active.map(run => read(`/refreshes/${run.id}?after=${run.cursor}&view=progress`)),
+          ...active.map(run => read(`/refreshes/${run.id}?after=${run.cursor}&view=progress` +
+            (detail ? `&post_id=${encodeURIComponent(detail.dataset.jobId)}` : ""))),
         ]);
         if (!pageActive || version !== screenVersion) return;
         const changed = (latest && latest.cursor !== activity.cursor) || updates.some(run => run.changes.length > 0);
         if (latest) activity = latest;
         for (const run of updates) runs.set(run.id, run);
+        pollDelay = 1500;
+        refreshMessage("");
         showProgress();
         if (changed) await refreshScreen();
       }
@@ -430,10 +501,10 @@ async function poll() {
       await refreshScreen();
     }
   } catch {
-    if (pageActive) refreshMessage("새로고침 진행 상황을 다시 확인하고 있어요.");
+    if (pageActive) retryRefresh("진행 상태를 받아오지 못했어요. 마지막으로 확인한 결과를 표시하고 있어요.");
   } finally {
     if (needsSnapshot || activity?.active || [...runs.values()].some(run => !run.complete) || storage.get("refresh-submitting")) {
-      schedulePoll(1500);
+      schedulePoll(pollDelay);
     }
   }
 }
@@ -458,12 +529,16 @@ if (dashboard) {
         await refreshScreen();
       } catch (error) {
         if (!pageActive) return;
-        if ([400, 403, 404].includes(error.status)) forgetSubmission(request.id);
-        refreshMessage(error.message || "새로고침 요청을 다시 확인하고 있어요.");
+        if ([400, 403, 404].includes(error.status)) {
+          forgetSubmission(request.id);
+          refreshMessage(error.message);
+        } else {
+          retryRefresh("서버 응답이 없어 요청 접수 여부를 다시 확인하고 있어요.");
+        }
       } finally {
         submitting.delete(request.id);
         button.disabled = false;
-        if (pageActive) schedulePoll(800);
+        if (pageActive) schedulePoll(pollDelay);
       }
     });
   }

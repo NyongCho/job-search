@@ -38,11 +38,60 @@ class RefreshQueueTests(unittest.TestCase):
         detail = self.start({"post_id": task["post_id"]})
         self.assertEqual(detail["counts"]["done"], 1)
         self.assertEqual(detail["counts"]["queued"], 2)
+        self.assertEqual(detail["by_kind"]["deadline"]["done"], 1)
+        self.assertEqual(detail["by_kind"]["logo"]["queued"], 1)
+        self.assertEqual(detail["by_kind"]["fit"]["queued"], 1)
         fresh = self.web.get(f"/refreshes/{run['id']}?after={run['cursor']}").json
+        self.assertEqual(fresh["by_kind"]["deadline"]["queued"], 32)
         self.assertEqual([(c["kind"], c["post_id"]) for c in fresh["changes"]], [("deadline", task["post_id"])])
         self.assertIn(run["id"], [r["id"] for r in self.web.get("/refreshes?q=대상&page=2").json["runs"]])
         with sqlite3.connect(self.state) as db:
             self.assertFalse(db.execute("SELECT 1 FROM refresh_work WHERE post_id=34").fetchone())
+
+    def test_selected_post_results_survive_completion_and_reopening_a_bulk_run(self):
+        older = self.start({"post_id": 1})
+        for kind in queue.KINDS:
+            task, = queue.claim(self.state, kind, 1)
+            queue.finish(self.state, task, "done")
+        run = queue.enqueue(self.state, [(1, "a"), (2, "b")], "list:recommended:")
+        reason = "같은 직무의 공개 공고를 확인하지 못했어요. 마지막 확인값을 유지했어요."
+        for kind, message in (("deadline", reason), ("logo", "로고를 가져오지 못했어요."),
+                              ("fit", "Hermes 평가 실행 준비 실패")):
+            for task in queue.claim(self.state, kind, 2):
+                failed = task["post_id"] == 1
+                queue.finish(self.state, task, "failed" if failed else "done", message if failed else "")
+        reopened, = self.web.get("/refreshes?post_id=1").json["runs"]
+        self.assertEqual(reopened["id"], run)
+        self.assertNotEqual(reopened["id"], older["id"])
+        selected = reopened["post_tasks"]
+        self.assertEqual(selected["deadline"], {"status": "failed", "message": reason})
+        self.assertEqual(selected["logo"]["status"], "failed")
+        self.assertIn("Hermes", selected["fit"]["message"])
+        self.assertEqual(reopened["counts"]["done"], 3)
+        snapshot = self.web.get(f"/refreshes/{run}?view=progress&after={reopened['cursor']}&post_id=1").json
+        self.assertEqual(snapshot["changes"], [])
+        self.assertEqual(snapshot["post_tasks"], selected)
+        self.assertEqual(self.web.get(f"/refreshes/{run}?view=progress&post_id=3").json["post_tasks"], {})
+
+    def test_selected_fit_task_does_not_display_raw_errors_or_stale_messages(self):
+        run = self.start({"post_id": 1})["id"]
+        url = f"/refreshes/{run}?view=progress&post_id=1"
+        for reason, hint in (
+            ("private model output", "점수를 갱신하지 못했어요"),
+            ("Conflicting fit evidence for private criterion", "서로 다른 판정"),
+            ("A question is required for unknown required experience", "질문"),
+            ("Invalid fit criterion category or status", "분류 또는 판정"),
+            ("Fit tenure must be a required criterion", "필수 경력 기간"),
+        ):
+            with self.subTest(reason=reason):
+                with sqlite3.connect(self.state) as db:
+                    db.execute("UPDATE refresh_work SET status='failed',message=? WHERE kind='fit'", (reason,))
+                message = self.web.get(url).json["post_tasks"]["fit"]["message"]
+                self.assertIn(hint, message)
+                self.assertNotIn("private", message)
+        with sqlite3.connect(self.state) as db:
+            db.execute("UPDATE refresh_work SET status='running' WHERE kind='fit'")
+        self.assertEqual(self.web.get(url).json["post_tasks"]["fit"], {"status": "running", "message": ""})
 
     def test_list_enqueue_uses_a_bounded_number_of_sql_statements(self):
         from unittest.mock import patch

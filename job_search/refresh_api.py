@@ -13,7 +13,7 @@ def _scope(view, q, post_id):
 
 def find_runs(source, state, view, q, post_id=None):
     if post_id is not None:
-        return queue.find(state, _scope(view, q, post_id), [post_id])
+        return queue.find(state, _scope(view, q, post_id), [post_id], post_id=post_id)
     with closing(queue.connect(state)) as db:
         if not db.execute("SELECT 1 FROM sqlite_master WHERE name='refresh_runs'").fetchone():
             return []
@@ -24,6 +24,13 @@ def find_runs(source, state, view, q, post_id=None):
 
 
 def register(app, source, state, context):
+    def selected_post():
+        raw = request.args.get("post_id")
+        post_id = int(raw) if raw is not None else None
+        if post_id is not None and not -(2**63) <= post_id < 2**63:
+            raise ValueError("공고 번호를 확인해 주세요.")
+        return post_id
+
     def enqueue(post_id):
         if post_id is not None and not -(2**63) <= post_id < 2**63:
             raise ValueError("공고 번호를 확인해 주세요.")
@@ -31,7 +38,7 @@ def register(app, source, state, context):
         targets = store.refresh_targets(source, state, view=view, q=q, post_id=post_id)
         request_id = request.headers.get("X-Refresh-Request")
         run = queue.enqueue(state, targets, _scope(view, q, post_id), str(UUID(request_id)) if request_id else None)
-        return jsonify(queue.snapshot(state, run)), 202
+        return jsonify(queue.snapshot(state, run, post_id=post_id)), 202
 
     @app.post("/refreshes")
     def start_refresh():
@@ -52,11 +59,7 @@ def register(app, source, state, context):
         if "request" in request.args:
             return jsonify(runs=queue.receipt(state, str(UUID(request.args["request"]))))
         view, q, _, _ = context()
-        raw = request.args.get("post_id")
-        post_id = int(raw) if raw is not None else None
-        if post_id is not None and not -(2**63) <= post_id < 2**63:
-            raise ValueError("공고 번호를 확인해 주세요.")
-        return jsonify(runs=find_runs(source, state, view, q, post_id))
+        return jsonify(runs=find_runs(source, state, view, q, selected_post()))
 
     @app.get("/refreshes/<int:run>")
     def refresh_status(run):
@@ -65,7 +68,7 @@ def register(app, source, state, context):
             raise ValueError("진행 상태 번호를 확인해 주세요.")
         view = request.args.get("view")
         report = view == "usage"
-        status = queue.snapshot(state, run, None if report else after)
+        status = queue.snapshot(state, run, None if report else after, post_id=selected_post())
         if view == "progress":
             return jsonify(status)
         from .fit_work import COUNTERS, usage

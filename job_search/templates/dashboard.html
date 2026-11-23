@@ -2,10 +2,33 @@
 {% macro company_mark(job) -%}
 {% if job.has_company_logo %}<img class="company-logo" src="{{ url_for('company_logo', post_id=job.id, v=job.logo_version) }}" alt="" width="24" height="24">{% else %}<span class="company-avatar" aria-hidden="true">{{ job.company[0] }}</span>{% endif %}
 {%- endmacro %}
-{% macro refresh_status(runs) -%}
-<p class="refresh-status"><span data-refresh-status role="status"></span><span data-refresh-usage>
-  {%- for run in runs|sort(attribute='id') %}<a data-run-id="{{ run.id }}" href="{{ url_for('refresh_status', run=run.id, view='usage') }}" target="_blank" rel="noopener" aria-label="새로고침 {{ run.id }} 모델 사용량 (새 탭)">모델 사용량{% if runs|length > 1 %} #{{ run.id }}{% endif %}</a>{% endfor -%}
-</span></p>
+{% macro refresh_status(runs, individual=false) -%}
+<div class="refresh-status">
+  <p data-refresh-status role="status"></p>
+  <div data-refresh-panels>{% for run in runs|sort(attribute='id') %}
+    <section class="refresh-run" data-run-id="{{ run.id }}"{% if individual %} data-post-results{% endif %} aria-label="새로고침 작업 {{ run.id }}">
+      <div class="refresh-summary"><strong>{{ '이 공고 새로고침' if individual else '목록 새로고침' if run.list_scope else '개별 공고 새로고침' }}{% if runs|length > 1 %} #{{ run.id }}{% endif %}</strong>
+        <span class="refresh-badge" data-run-state role="status"></span>
+        <span class="refresh-total" data-run-total></span>
+        <a href="{{ url_for('refresh_status', run=run.id, view='usage') }}" target="_blank" rel="noopener" aria-label="새로고침 {{ run.id }} 모델 사용량 (새 탭)">{{ '목록 모델 사용량' if individual and run.list_scope else '모델 사용량' }}</a>
+      </div>
+      <progress data-run-bar value="0" max="1" aria-label="전체 작업 처리 진행률"></progress>
+      {% set kinds = [('deadline','마감'),('logo','기업 로고'),('fit','적합도')] %}
+      {% if individual %}
+      <dl class="refresh-task-list">{% for key,label in kinds %}
+        <div data-task="{{ key }}"><dt>{{ label }}</dt><dd><strong data-task-status></strong><span data-task-message></span></dd></div>
+      {% endfor %}</dl>
+      {% else %}
+      <div class="refresh-kinds">{% for key,label in kinds %}
+        <div class="refresh-kind" data-kind="{{ key }}">
+          <div><strong>{{ label }}</strong><span data-kind-count></span></div>
+          <progress value="0" max="1" aria-label="{{ label }} 처리 진행률"></progress>
+          <small data-kind-status></small>
+        </div>{% endfor %}
+      </div>
+      {% endif %}
+    </section>{% endfor %}</div>
+</div>
 {%- endmacro %}
 <!doctype html>
 <html lang="ko">
@@ -126,7 +149,7 @@
               </div>
             </div>
             <h2>{{ detail.role }}</h2><div class="detail-meta">{% if detail.source_kind == 'profile' %}기록 가져옴 {{ detail.recorded_at|kst }} · 실제 지원일과 다릅니다{% else %}추천 검토 {{ detail.reviewed_at|kst }} <span>·</span> 게시 {{ detail.published_at|kst }}{% endif %} <span class="decision-tag {{ 'expired' if detail.is_expired else detail.display_decision or 'pending' }}">{{ '만료' if detail.is_expired else '기존 지원 기록' if detail.source_kind == 'profile' else decisions.get(detail.display_decision,'검토 대기') }}</span></div>
-            {{ refresh_status(detail_runs) }}
+            {{ refresh_status(detail_runs, individual=true) }}
             <p id="deadline-status" class="deadline-status" role="status"></p>
             <div class="detail-actions">{% if detail.apply_url %}<a class="{{ 'source-button' if detail.is_expired else 'primary-button' }}" href="{{ detail.apply_url }}" target="_blank" rel="noopener noreferrer">{{ '마감·재공고 확인' if detail.is_expired else '지원 페이지 열기' }} <span aria-hidden="true">↗</span></a>{% elif detail.source_kind != 'profile' and not detail.is_expired %}<button class="primary-button" disabled>지원 링크 미확인</button>{% endif %}{% if detail.source_url %}<a class="source-button" href="{{ detail.source_url }}" target="_blank" rel="noopener noreferrer">{{ '원본 지원 자료 보기' if detail.source_kind == 'profile' else '원문 보기' }} ↗</a>{% endif %}</div>
             {{ editor(detail) }}

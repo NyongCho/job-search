@@ -57,6 +57,12 @@ class WebTests(unittest.TestCase):
         response = self.client.get("/", base_url="https://evil.example", headers=self.identity)
         self.assertEqual(response.status_code, 400)
 
+    def test_loopback_health_check_requires_the_configured_host(self):
+        url = "http://127.0.0.1:8765"
+        self.assertEqual(self.client.get("/healthz", base_url=url).status_code, 400)
+        health = self.client.get("/healthz", base_url=url, headers={"Host": "dashboard.example"})
+        self.assertEqual((health.status_code, health.json), (200, {"status": "ok"}))
+
     def test_navigation_returns_card_placeholders_before_the_list_query(self):
         path = "/?view=interested&q=없는회사&sort=fit"
         navigation = {**self.identity, "Sec-Fetch-Mode": "navigate"}
