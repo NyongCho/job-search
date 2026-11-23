@@ -8,6 +8,8 @@ import threading
 import time
 from urllib.parse import urljoin, urlsplit
 
+from .jobda_logos import JOBDA_CONFIG_URL, JOBDA_DESIGN_URL, JOBDA_IMAGE_URL, JOBDA_TENANT
+
 _WORKERS = threading.BoundedSemaphore(4)
 _REDIRECTS = {301, 302, 303, 307, 308}
 _TRANSLATED = tuple(map(ipaddress.ip_network, ("64:ff9b::/96", "64:ff9b:1::/48", "2002::/16", "2001::/32")))
@@ -53,7 +55,7 @@ def _addresses(parsed):
     return records
 
 
-def _request(parsed, records, deadline, limit):
+def _request(parsed, records, deadline, limit, jobda_tenant):
     client = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
     host = parsed.hostname.encode("idna").decode("ascii")
     with_client = client(host, port=parsed.port, timeout=_remaining(deadline))
@@ -77,13 +79,19 @@ def _request(parsed, records, deadline, limit):
         path = parsed.path or "/"
         if parsed.query:
             path += "?" + parsed.query
-        with_client.request("GET", path, headers={"User-Agent": "Mozilla/5.0 (compatible; PersonalJobReader/0.1)",
-                                                  "Accept-Encoding": "identity"})
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; PersonalJobReader/0.1)", "Accept-Encoding": "identity"}
+        if jobda_tenant is not None:
+            headers["prefix"] = jobda_tenant
+        with_client.request("GET", path, headers=headers)
         with with_client.getresponse() as response:
             headers = {name.lower(): value for name, value in response.getheaders()}
             if response.status != 200:
                 return response.status, headers, b""
-            if headers.get("content-encoding", "identity").lower() != "identity":
+            encoding = headers.get("content-encoding", "identity").lower()
+            # JOBDA labels raw JSON and raster bytes as Content-Encoding: UTF-8 on its design CDN.
+            url = parsed.geturl()
+            if encoding != "identity" and not (encoding == "utf-8" and
+                    (JOBDA_CONFIG_URL.fullmatch(url) or JOBDA_IMAGE_URL.fullmatch(url))):
                 raise OSError("Unsupported public response encoding")
             expected = response.length
             if expected is not None and expected > limit:
@@ -104,21 +112,25 @@ def _request(parsed, records, deadline, limit):
         with_client.close()
 
 
-def _fetch(url, deadline, limit):
+def _fetch(url, deadline, limit, jobda_tenant):
     for _ in range(4):
         _remaining(deadline)
         target = _endpoint(url)
-        status, headers, body = _request(target, _addresses(target), deadline, limit)
+        status, headers, body = _request(target, _addresses(target), deadline, limit, jobda_tenant)
         if status == 200:
             return url, body, headers.get("content-type", "").partition(";")[0].lower()
         if status not in _REDIRECTS or not headers.get("location"):
             raise PublicHTTPError(status)
         url = urljoin(url, headers["location"])
+        jobda_tenant = None
     raise OSError("Too many redirects from public source")
 
 
-def fetch_public(url, *, deadline, limit):
+def fetch_public(url, *, deadline, limit, jobda_tenant=None):
     """Enforce the caller's total budget even when the OS resolver stalls."""
+    if jobda_tenant is not None and (url != JOBDA_DESIGN_URL or not isinstance(jobda_tenant, str)
+                                     or not JOBDA_TENANT.fullmatch(jobda_tenant)):
+        raise ValueError("Invalid JOBDA tenant design request")
     _remaining(deadline)
     if not _WORKERS.acquire(blocking=False):
         raise TimeoutError("Public requests are busy")
@@ -126,7 +138,7 @@ def fetch_public(url, *, deadline, limit):
 
     def read():
         try:
-            result.put((True, _fetch(url, deadline, limit)))
+            result.put((True, _fetch(url, deadline, limit, jobda_tenant)))
         except http.client.HTTPException as error:
             result.put((False, OSError(str(error))))
         except Exception as error:

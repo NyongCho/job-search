@@ -96,8 +96,8 @@ def _open(path):
     return sqlite3.connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True, timeout=10)
 
 
-def _official_result(doc, locator, final_url, body, *, listing=None):
-    posting = parse_posting(locator, final_url, body, previous=doc)
+def _official_result(doc, locator, final_url, raw, *, listing=None):
+    posting = parse_posting(locator, final_url, raw, previous=doc)
     try:
         official_facts = _external_facts(doc, posting)
     except ValueError:
@@ -135,7 +135,12 @@ def _official_result(doc, locator, final_url, body, *, listing=None):
             fresh["modified_gmt"] = modified
         if posting.modified:
             fresh["jd_modified_gmt"] = posting.modified
-    candidate = company_logos.posting_logo(posting, locator) or plan.body
+    board = None
+    if locator.source == "greeting":
+        # Save the branding from this response so the logo worker need not download the posting again.
+        board = company_logos._board_brand(raw.decode("utf-8-sig"), final_url, locator.company)
+        plan = replace(plan, page=None)
+    candidate = board or company_logos.posting_logo(posting, locator) or plan.body
     return SourceResult(
         facts,
         modified,
@@ -291,7 +296,9 @@ def _read_results(future, group):
                     facts = listing.facts
                     if not facts["closed"] and facts["deadline_kind"] == "unknown":
                         facts = None
-                    result = replace(listing, facts=facts, plan=replace(listing.plan, page=None))
+                    # A closed or unverifiable job can still have independently verifiable employer branding.
+                    home = company_logos.greeting_home(selection.locator.url)
+                    result = replace(listing, facts=facts, plan=replace(listing.plan, page=home))
                 else:
                     result = None
         yield selection, result
@@ -348,6 +355,9 @@ def _snapshot_plan(serialized):
     data = json.loads(serialized)
     if data["locator"]:
         data["locator"] = SourceLocator(**data["locator"])
+        if not data.get("page") and not data.get("awaiting_official") and not data.get("verified_source"):
+            # Previously saved final snapshots omitted the board URL when the linked posting failed.
+            data["page"] = company_logos.greeting_home(data["locator"].url)
     if data["body"]:
         data["body"] = company_logos.Candidate(**data["body"])
     return company_logos.LogoPlan(**data)
@@ -390,7 +400,7 @@ def _prepare_logo(db, task):
             return "waiting", expected, None
         # A failed or superseded direct posting was just checked by the deadline worker.
         if source_locator(doc) == plan.locator and plan.locator:
-            plan = replace(plan, page=None)
+            plan = replace(plan, page=company_logos.greeting_home(plan.page) if plan.page else None)
     return None, expected, plan
 
 

@@ -423,6 +423,95 @@ class RefreshSourceTests(unittest.TestCase):
                 server.shutdown()
                 thread.join(3)
 
+
+
+    def test_expired_linked_greeting_job_keeps_employer_logo_fallback_in_snapshot(self):
+        from job_search.public_fetch import PublicHTTPError
+
+        host = "siliconii.career.greetinghr.com"
+        home = f"https://{host}/"
+        expired = home + "ko/o/239254"
+        image = "https://profiles.greetinghr.com/group/logo"
+        listing = branded_post(1, "Silicon2", f'<a href="{expired}">지원하러가기</a>')
+        self.seed([listing])
+        board = next_page({"host": host, "careerBaseInfo": {
+            "workspace": {"id": 5, "name": "(주) 실리콘투", "imageUrl": image}},
+            "careerBootInfo": {"design": {"footer": {"companyName": "Silicon2"}}}})
+        urls = []
+        def fetch(url, **_):
+            urls.append(url)
+            if url.startswith(collect_jobs.API):
+                return url, json.dumps([listing]).encode(), "application/json"
+            if url == expired:
+                raise PublicHTTPError(404)
+            if url == home:
+                return home + "ko/home", board.encode(), "text/html"
+            self.assertEqual(url, image)
+            return url, logo_png(), "image/png"
+
+        task = self.task(1)
+        self.deadlines([task], fetch)
+        self.assertEqual(self.events(), {1: "failed"})
+        with closing(sqlite3.connect(self.jobs)) as db, db:
+            row = db.execute("SELECT logo_plan FROM refresh_source_snapshots WHERE work_id=1").fetchone()
+            self.assertEqual(json.loads(row[0])["page"], home)
+            # Existing terminal snapshots contain the same verified locator with a null page.
+            db.execute("UPDATE refresh_source_snapshots SET logo_plan=json_set(logo_plan,'$.page',NULL) WHERE work_id=1")
+        self.logo(dict(task, id=2, source_work_id=1, source_status="failed"), fetch)
+        self.assertEqual(self.events(), {1: "failed", 2: "done"})
+        self.assertEqual(urls[1:], [expired, home, image])
+        self.assertIsNotNone(company_logos.read_logo(self.jobs, 1))
+
+    def test_verified_greeting_snapshot_tries_header_after_invalid_group_image(self):
+        host = "acme.career.greetinghr.com"
+        url = f"https://{host}/ko/o/1"
+        group = "https://profiles.greetinghr.com/group/acme"
+        header = "https://opening-attachments.greetinghr.com/header/acme.png"
+        self.seed([branded_post(1)])
+        self.update_document(1, source="greeting", source_job_id=1, url=url)
+        page = next_page({"host": host, "openingId": 1,
+            "careerBootInfo": {"design": {"header": {"logoUrl": header}}},
+            "dehydratedState": {"queries": [{"queryKey": ["career", "getOpeningById"], "state": {
+                "data": {"success": True, "data": {"groupInfo": {"name": "Acme", "imageUrl": group},
+                "openingsInfo": {"openingId": 1, "title": "엔지니어", "status": "OPEN", "dueDate": "2026-12-26"}}}}}]}})
+        calls = []
+        def fetch(requested, **_):
+            calls.append(requested)
+            if requested == url:
+                return url, page.encode(), "text/html"
+            if requested == group:
+                return group, b"Broken image", "image/png"
+            self.assertEqual(requested, header)
+            return header, logo_png(), "image/png"
+
+        task = self.task(1)
+        self.deadlines([task], fetch)
+        self.logo(dict(task, id=2, source_work_id=1), fetch)
+        self.assertEqual(self.events(), {1: "done", 2: "done"})
+        self.assertEqual(calls, [url, group, header])
+        self.assertIsNotNone(company_logos.read_logo(self.jobs, 1))
+
+    def test_failed_greeting_deadline_still_refreshes_the_employers_board_logo(self):
+        host = "acme.career.greetinghr.com"
+        url = f"https://{host}/ko/o/1"
+        asset = "https://profiles.greetinghr.com/group/acme"
+        self.seed([branded_post(1)])
+        self.update_document(1, source="greeting", source_job_id=1, url=url)
+        board = next_page({"host": host, "careerBaseInfo": {
+            "workspace": {"id": 8, "name": "Acme", "imageUrl": asset}}})
+        calls = []
+        def fetch(requested, **_):
+            calls.append(requested)
+            if requested == f"https://{host}/":
+                return f"https://{host}/ko/intro", board.encode(), "text/html"
+            self.assertEqual(requested, asset)
+            return asset, logo_png(), "image/png"
+
+        self.logo(self.task(1, id=2, source_work_id=1, source_status="failed"), fetch)
+        self.assertEqual(self.events(), {2: "done"})
+        self.assertEqual(calls, [f"https://{host}/", asset])
+        self.assertIsNotNone(company_logos.read_logo(self.jobs, 1))
+
     def test_invalid_deadline_does_not_discard_an_independently_verified_logo(self):
         self.seed([posting(1)])
         image = "https://assets.example.com/logo.png"

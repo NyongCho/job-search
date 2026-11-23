@@ -65,6 +65,207 @@ class LogoTests(unittest.TestCase):
             self.assertEqual(image.format, "PNG")
             self.assertEqual(image.size, (48, 36))
 
+    def check_board(self, url, title, page, expected):
+        post = branded_post(1, title.split("｜")[0], f'<a href="{url}">지원하러가기</a>')
+        post["title"]["rendered"] = title
+        self.collect([post])
+
+        def fetch(requested, **_):
+            self.calls.append(requested)
+            if requested == url:
+                return url, page.encode(), "text/html"
+            self.assertEqual(requested, expected)
+            return requested, logo_png(), "image/png"
+
+        company_logos.refresh_logos(self.jobs, limit=1, fetch=fetch)
+        if expected:
+            self.assert_logo(1)
+            self.assertEqual(self.calls, [url, expected])
+        else:
+            self.assertIsNone(company_logos.read_logo(self.jobs, 1))
+
+    def ashby(self, name="BJAK", post_id="job-123", square=None):
+        asset = "https://app.ashbyhq.com/api/images/org-theme-wordmark/org-1/theme/brand.png"
+        data = {"organization": {"name": name, "organizationId": "org-1", "hostedJobsPageSlug": "bjakcareer",
+                                 "theme": {"logoWordmarkImageUrl": asset, "logoSquareImageUrl": square}},
+                "posting": {"id": post_id, "title": "Applied AI Engineer"}}
+        page = ('<link rel="icon" href="https://cdn.ashbyprd.com/favicon.png">'
+                '<script nonce="nonce">window.__appData = ' + json.dumps(data) + '; loadBundle();</script>')
+        return "https://jobs.ashbyhq.com/bjakcareer/job-123", page, asset
+
+    def test_ashby_wordmark_belongs_to_posted_organization(self):
+        url, page, asset = self.ashby()
+        self.check_board(url, "BJAK｜Applied AI Engineer", page, asset)
+
+    def test_ashby_tries_verified_wordmark_when_square_is_gone(self):
+        from job_search.public_fetch import PublicHTTPError
+        square = "https://app.ashbyhq.com/api/images/org-theme-square/org-1/theme/square.png"
+        url, page, wordmark = self.ashby(square=square)
+        self.collect([branded_post(1, "BJAK", f'<a href="{url}">지원하러가기</a>')])
+        deadlines = []
+        def fetch(requested, **options):
+            self.calls.append(requested)
+            deadlines.append(options["deadline"])
+            if requested == url:
+                return url, page.encode(), "text/html"
+            if requested == square:
+                raise PublicHTTPError(404)
+            self.assertEqual(requested, wordmark)
+            return requested, logo_png(), "image/png"
+        company_logos.refresh_logos(self.jobs, fetch=fetch)
+        self.assertEqual(self.calls, [url, square, wordmark])
+        self.assertEqual(len(set(deadlines)), 1)
+        self.assert_logo(1)
+        with closing(sqlite3.connect(self.jobs)) as db:
+            self.assertEqual(db.execute("SELECT image_url FROM company_logos").fetchone(), (wordmark,))
+            self.assertEqual(db.execute("SELECT count(*) FROM logo_image_claims").fetchone(), (0,))
+
+    def test_greeting_duplicate_or_transient_failed_assets_preserve_queue_outcome(self):
+        from job_search.public_fetch import PublicHTTPError
+        base = "https://acme.career.greetinghr.com/ko/o/"
+        group = "https://profiles.greetinghr.com/group/acme"
+        header = "https://opening-attachments.greetinghr.com/header/acme.png"
+        self.collect([branded_post(n, "Acme", f'<a href="{base}{n}">지원하러가기</a>') for n in (1, 2)])
+        def fetch(url, **_):
+            self.calls.append(url)
+            if url.startswith(base):
+                n = url[-1]
+                page = next_page({"host": "acme.career.greetinghr.com", "openingId": n,
+                    "careerBaseInfo": {"workspace": {"id": 8, "name": "Acme", "imageUrl": group}},
+                    "careerBootInfo": {"design": {"header": {"logoUrl": group if n == "1" else header}}}})
+                return url, page.encode(), "text/html"
+            if url == group:
+                return url, b"Invalid image", "image/png"
+            self.assertEqual(url, header)
+            raise PublicHTTPError(503)
+        company_logos.refresh_logos(self.jobs, limit=2, fetch=fetch)
+        self.assertEqual(self.calls, [base + "1", group, base + "2", group, header])
+        with closing(sqlite3.connect(self.jobs)) as db:
+            self.assertEqual(db.execute("SELECT outcome FROM job_company_logos ORDER BY post_id").fetchall(),
+                             [("missing",), ("pending",)])
+            self.assertEqual(db.execute("SELECT count(*) FROM logo_image_claims").fetchone(), (0,))
+
+    def test_verified_board_links_are_discovered_from_labeled_anchors_without_apply_url(self):
+        job_id = "d3f3a6b6-8ffc-4d5c-a4e2-a80d785931de"
+        for url in (
+            "https://jobs.ashbyhq.com/bjakcareer/" + job_id,
+            "https://jobs.lever.co/palantir/" + job_id,
+            "https://corp.ninehire.site/job_posting/wwVUsjps",
+            "https://team.example.com/job_posting/wwVUsjps",
+            "https://acme.recruiter.co.kr/career/jobs/135315",
+            "https://acme.career.greetinghr.com/o/12345",
+        ):
+            with self.subTest(url=url):
+                doc = {"title": "Acme｜엔지니어", "links": [{"url": url, "text": "공고 원문"}]}
+                self.assertEqual(company_logos._plan(doc).page, url)
+                doc["links"][0]["text"] = "개인 블로그"
+                self.assertIsNone(company_logos._plan(doc).page)
+        doc = {"title": "Acme｜엔지니어", "links": [{"url": "https://example.com/team", "text": "공고 원문"}]}
+        self.assertIsNone(company_logos._plan(doc).page)
+
+    def test_worker_reads_named_job_anchor_from_collected_listing(self):
+        job_id = "d3f3a6b6-8ffc-4d5c-a4e2-a80d785931de"
+        _, page, image = self.ashby(post_id=job_id)
+        url = "https://jobs.ashbyhq.com/bjakcareer/" + job_id
+        self.collect([branded_post(1, "BJAK", f'<a href="{url}">지원하기</a>')])
+        self.assertFalse(collect_jobs.get_posts(self.jobs, [1])[0].get("apply_url"))
+        def fetch(requested, **_):
+            self.calls.append(requested)
+            return (url, page.encode(), "text/html") if requested == url else (requested, logo_png(), "image/png")
+        company_logos.refresh_logos(self.jobs, fetch=fetch)
+        self.assertEqual(self.calls, [url, image])
+        self.assert_logo(1)
+
+    def test_ashby_ignores_wrong_post_and_platform_favicon(self):
+        url, page, _ = self.ashby(post_id="wrong-id")
+        self.check_board(url, "BJAK｜Applied AI Engineer", page, None)
+
+    def test_lever_verified_tenant_accepts_extended_employer_name(self):
+        url = "https://jobs.lever.co/palantir/position-1"
+        asset = "https://lever-client-logos.s3.us-west-2.amazonaws.com/company.png"
+        data = {"@type": "JobPosting", "title": "Software engineer", "hiringOrganization": {
+            "name": "Palantir Technologies", "logo": asset}}
+        self.check_board(url, "Palantir｜Software engineer", '<script type="application/ld+json">' +
+                      json.dumps(data) + '</script><img alt="Lever logo" src="/img/lever.svg">', asset)
+
+    def test_lever_other_tenant_cannot_use_employer_name_shortening(self):
+        url = "https://jobs.lever.co/other/position-1"
+        page = '<script type="application/ld+json">' + json.dumps({
+            "@type": "JobPosting", "title": "Software engineer",
+            "hiringOrganization": {"name": "Palantir Technologies", "logo": self.acme_image}
+        }) + '</script>'
+        self.check_board(url, "Palantir｜Software engineer", page, None)
+
+    def test_greeting_workspace_brand_can_have_a_separate_language_name(self):
+        url = "https://siliconii.career.greetinghr.com/ko/o/239254"
+        logo = "https://profiles.greetinghr.com/group/brand-id"
+        page = next_page({"host": "siliconii.career.greetinghr.com", "openingId": "239254",
+                          "careerBaseInfo": {"workspace": {"id": 18668, "name": "(주) 실리콘투", "imageUrl": logo}},
+                          "careerBootInfo": {"design": {"footer": {"companyName": "Silicon2"}}}})
+        self.check_board(url, "Silicon2｜재무전략 담당자 (경력 무관)", page, logo)
+
+    def test_ninehire_custom_domain_uses_employer_brand_never_cover_image(self):
+        url = "https://team.bgzt.co.kr/job_posting/OPXL7y3A"
+        logo = "https://image.ninehire.com/brand/company-1/brand.png"
+        page = next_page({"homepage": {"domain": {"hostname": "team.bgzt.co.kr", "url": url},
+                          "info": {"companyId": "company-1", "companyName": "번개장터",
+                                   "brand": {"image": {"fileUrl": logo}}}},
+                          "jobPosting": {"companyId": "company-1", "coverImage": {"fileUrl": "https://example.com/banner.png"}},
+                          "recruitment": {"companyId": "company-1", "companyName": "번개장터"}})
+        self.check_board(url, "번개장터｜Product Designer", page, logo)
+
+    def test_ninehire_rejects_unrelated_job_owner_and_job_cover(self):
+        url = "https://team.acme.example/job_posting/opening"
+        page = next_page({"homepage": {"domain": {"hostname": "team.acme.example", "url": url},
+                          "info": {"companyId": "acme", "companyName": "Acme",
+                                   "brand": {"image": {"fileUrl": "https://image.ninehire.com/brand/acme/logo.png"}}}},
+                          "jobPosting": {"companyId": "other", "coverImage": {"fileUrl": self.acme_image}},
+                          "recruitment": {"companyId": "other"}})
+        self.check_board(url, "Acme｜엔지니어", page, None)
+
+    def test_unrelated_board_owner_cannot_supply_its_generic_icon(self):
+        url = "https://other.career.greetinghr.com/ko/o/1"
+        page = next_page({"host": "other.career.greetinghr.com", "openingId": "1", "careerBaseInfo": {
+            "workspace": {"id": 1, "name": "Other", "imageUrl": "https://profiles.greetinghr.com/group/other"}}})
+        self.check_board(url, "Acme｜엔지니어", page, None)
+
+    def test_greeting_closed_job_recovers_logo_from_matched_board_only(self):
+        from job_search.public_fetch import PublicHTTPError
+        home = "https://husteel.career.greetinghr.com/"
+        expired = home + "ko/o/5"
+        asset = "https://profiles.greetinghr.com/group/office"
+        self.collect([branded_post(1, "휴스틸", f'<a href="{expired}">지원하러가기</a>')])
+        board = next_page({"host": "husteel.career.greetinghr.com", "careerBaseInfo": {
+            "workspace": {"id": 1, "name": "휴스틸", "imageUrl": asset}}})
+        def fetch(url, **_):
+            self.calls.append(url)
+            if url == expired:
+                raise PublicHTTPError(404)
+            if url == home:
+                return home + "ko/intro", board.encode(), "text/html"
+            self.assertEqual(url, asset)
+            return url, logo_png(), "image/png"
+        company_logos.refresh_logos(self.jobs, fetch=fetch)
+        self.assert_logo(1)
+        self.assertEqual(self.calls, [expired, home, asset])
+
+    def test_greeting_accepts_locale_redirect_for_same_board_and_opening(self):
+        host = "acme.career.greetinghr.com"
+        unlocalized = f"https://{host}/o/6"
+        asset = "https://profiles.greetinghr.com/group/office"
+        self.collect([branded_post(1, "Acme", f'<a href="{unlocalized}">지원하러가기</a>')])
+        board = next_page({"host":host, "openingId":6, "careerBaseInfo":{
+            "workspace":{"id":1, "name":"Acme", "imageUrl":asset}}})
+        def fetch(url, **_):
+            self.calls.append(url)
+            if url == unlocalized:
+                return f"https://{host}/en/o/6", board.encode(), "text/html"
+            self.assertEqual(url, asset)
+            return url, logo_png(), "image/png"
+        company_logos.refresh_logos(self.jobs, fetch=fetch)
+        self.assert_logo(1)
+        self.assertEqual(self.calls, [unlocalized,asset])
+
     def test_body_logo_avoids_page_fetch_and_same_company_reuses_verified_copy(self):
         def after_commit(url, **options):
             with closing(sqlite3.connect(self.jobs)) as db:

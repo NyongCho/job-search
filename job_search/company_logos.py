@@ -17,8 +17,10 @@ from uuid import uuid4
 from .card_metadata import has_table
 from .evidence import Document
 from .job_availability import document_version
+from .jobda_logos import jobda_logo
 from .job_sources import (
-    company_key, company_names, fetch_posting, linked_job_locator, matches_jd_source, role_key, source_locator,
+    _next_data, company_key, company_names, fetch_posting, linked_job_locator, matches_jd_source, parse_posting,
+    role_key, source_locator,
 )
 from .public_fetch import PublicHTTPError, fetch_public
 
@@ -47,6 +49,12 @@ class Candidate:
     key: str
     source_page: str
     image_url: str
+    alternate_image_url: str | None = None
+
+
+def _brand_candidate(key, page, urls):
+    distinct = list(dict.fromkeys(url for url in urls if url))
+    return Candidate(key, page, *distinct) if distinct else None
 
 
 @dataclass(frozen=True)
@@ -118,6 +126,20 @@ def _official_domain(url, company):
     return ".".join(labels[-size:])
 
 
+def _branding_job_link(url):
+    """Allow known public posting routes as logo sources for a labeled application link."""
+    location = urlsplit(url)
+    host, path = location.hostname, location.path.rstrip("/")
+    if host in {"jobs.ashbyhq.com", "jobs.lever.co", "jobs.eu.lever.co"}:
+        return re.fullmatch(r"/[\w-]+/[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}(?:/apply|/application)?", path, re.I | re.ASCII)
+    if host.endswith(".recruiter.co.kr"):
+        return re.fullmatch(r"/career/jobs/[1-9][0-9]*", path)
+    if host.endswith(".career.greetinghr.com"):
+        return re.fullmatch(r"/(?:[a-z]{2}/)?o/[1-9][0-9]*", path)
+    # Ninehire and Greeting also publish these routes on employers' custom domains.
+    return re.fullmatch(r"/job_posting/[A-Za-z0-9]{8}|/[a-z]{2}/o/[1-9][0-9]*", path)
+
+
 def _plan(doc):
     title = doc.get("title")
     company, _, role = title.partition("｜") if isinstance(title, str) else ("", "", "")
@@ -147,6 +169,8 @@ def _plan(doc):
             if locator or domain:
                 page = url
                 break
+            if page is None and _branding_job_link(url):
+                page = url
     if locator:
         page = locator.url
         scope = f"{locator.source}:{locator.scope}"
@@ -154,8 +178,8 @@ def _plan(doc):
             scope += ":" + locator.original_id
     elif domain:
         scope = "domain:" + domain
-    elif apply_url and urlsplit(apply_url).hostname not in {"forms.gle", "docs.google.com", "tally.so", "form.naver.com"}:
-        page = apply_url
+    elif page or (apply_url and urlsplit(apply_url).hostname not in {"forms.gle", "docs.google.com", "tally.so", "form.naver.com"}):
+        page = page or apply_url
         scope = "linked:" + urlsplit(page).hostname
     elif body_url:
         scope = "body:" + body_url
@@ -167,6 +191,104 @@ def _plan(doc):
         organization = None
     body = Candidate(organization or identity, source, body_url) if body_url else None
     return LogoPlan(company, role, identity, body, page, domain, locator, organization=organization)
+
+
+def _brand_names(value):
+    # Some board owners use their careers-site title as the workspace name.
+    return company_names(re.sub(r"\s+(?:채용|careers)\s*$", "", value, flags=re.I)) if isinstance(value, str) else set()
+
+
+def greeting_home(url):
+    host = urlsplit(url).hostname
+    if host and re.fullmatch(r"[a-z0-9-]+\.career\.greetinghr\.com", host):
+        return "https://" + host + "/"
+    return None
+
+
+def _ashby_brand(page, url, path, employer):
+    match = re.fullmatch(r"/([^/]+)/([^/]+)(?:/application)?", path)
+    script = re.search(r"<script\b[^>]*>\s*window\.__appData\s*=\s*", page, re.I)
+    if not match or not script:
+        return None
+    data, _ = json.JSONDecoder().raw_decode(page, script.end())
+    org = data["organization"]
+    if (org["hostedJobsPageSlug"] != match[1] or data["posting"]["id"] != match[2]
+            or not employer & company_names(org["name"])):
+        return None
+    assets = []
+    for field in ("logoSquareImageUrl", "logoWordmarkImageUrl"):
+        asset = _asset(org["theme"].get(field), url)
+        if (asset and urlsplit(asset).hostname == "app.ashbyhq.com"
+                and re.fullmatch(r"/api/images/org-theme-(?:square|wordmark)/"
+                                 + re.escape(org["organizationId"]) + r"/.+", urlsplit(asset).path)):
+            assets.append(asset)
+    return _brand_candidate("ashby:" + org["organizationId"], url, assets)
+
+
+def _ninehire_brand(props, url, employer):
+    home = props["homepage"]
+    info, domain = home["info"], home["domain"]
+    company_id = info["companyId"]
+    location = urlsplit(url)
+    if (domain["hostname"] != location.hostname or urlsplit(domain["url"]).path.rstrip("/") != location.path.rstrip("/")
+            or props["jobPosting"]["companyId"] != company_id or props["recruitment"]["companyId"] != company_id
+            or not employer & _brand_names(info["companyName"])):
+        return None
+    asset = _asset((info["brand"].get("image") or {}).get("fileUrl"), url)
+    if (asset and urlsplit(asset).hostname == "image.ninehire.com"
+            and urlsplit(asset).path.startswith("/brand/" + company_id + "/")):
+        return Candidate("ninehire:" + company_id, url, asset)
+    return None
+
+
+def _greeting_brand(props, url, employer):
+    workspace = props["careerBaseInfo"]["workspace"]
+    design = props.get("careerBootInfo", {}).get("design", {})
+    location = urlsplit(url)
+    owner_names = _brand_names(workspace["name"]) | _brand_names(design.get("footer", {}).get("companyName"))
+    if props["host"] != location.hostname or not employer & owner_names:
+        return None
+    opening = re.fullmatch(r"/(?:[a-z]{2}/)?o/([0-9]+)/?", location.path)
+    if opening and str(props.get("openingId")) != opening[1]:
+        return None
+    assets = []
+    for value in (workspace.get("imageUrl"), design.get("header", {}).get("logoUrl")):
+        asset = _asset(value, url)
+        if not asset:
+            continue
+        loc = urlsplit(asset)
+        if ((loc.hostname == "profiles.greetinghr.com" and loc.path.startswith("/group/"))
+                or loc.hostname == "opening-attachments.greetinghr.com"):
+            assets.append(asset)
+    tenant = location.hostname.split(".")[0] if greeting_home(url) else f"{location.hostname}:{workspace['id']}"
+    return _brand_candidate("greeting:" + tenant, url, assets)
+
+
+def _board_brand(page, url, company):
+    """Read employer branding fields bound to the board serving the application link."""
+    location = urlsplit(url)
+    path = location.path.rstrip("/")
+    employer = company_names(company)
+    try:
+        if location.hostname == "jobs.ashbyhq.com":
+            return _ashby_brand(page, url, path, employer)
+        if re.fullmatch(r"/job_posting/[^/]+", path):
+            return _ninehire_brand(_next_data(page), url, employer)
+        if greeting_home(url) or re.fullmatch(r"/[a-z]{2}/o/[0-9]+", path):
+            return _greeting_brand(_next_data(page), url, employer)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        pass  # Missing or inconsistent public branding metadata is not an employer match.
+    return None
+
+
+def _lever_name_matches(url, name, company):
+    location = urlsplit(url)
+    if location.hostname not in {"jobs.lever.co", "jobs.eu.lever.co"} or not isinstance(name, str):
+        return False
+    tenant = re.fullmatch(r"/([^/]+)/[^/]+(?:/apply)?/?", location.path)
+    # The employer can appear as its tenant slug in listings and legal name in JobPosting.
+    short = re.sub(r"\s+(?:technologies|inc\.?|corporation|corp\.?|ltd\.?)$", "", name, flags=re.I)
+    return bool(tenant and role_key(tenant[1]) in company_names(company) & company_names(short))
 
 
 def _json_logo(page, plan, url):
@@ -185,7 +307,11 @@ def _json_logo(page, plan, url):
                 organization = entry.get("hiringOrganization")
             else:
                 organization = entry if entry.get("@type") == "Organization" else None
-            if not isinstance(organization, dict) or not company_names(organization.get("name")) & company_names(plan.company):
+            if not isinstance(organization, dict):
+                continue
+            name = organization.get("name")
+            if not (company_names(name) & company_names(plan.company) or (entry.get("@type") == "JobPosting"
+                    and _lever_name_matches(url, name, plan.company))):
                 continue
             logo = organization.get("logo")
             if isinstance(logo, dict):
@@ -196,21 +322,36 @@ def _json_logo(page, plan, url):
 
 
 def posting_logo(posting, locator):
-    url = _asset(posting.logo, locator.url) or _logo_in_images(posting.body.images, locator.company, locator.url)
-    return Candidate(posting.organization, locator.url, url) if url else None
+    assets = [_asset(value, locator.url) for value in (posting.logo, posting.alternate_logo)]
+    if not any(assets):
+        assets = [_logo_in_images(posting.body.images, locator.company, locator.url)]
+    return _brand_candidate(posting.organization, locator.url, assets)
 
 
 def _official(plan, fetch, deadline, doc):
     if not plan.page:
         return None
-    if plan.verified_source and plan.locator and plan.locator.source != "greenhouse":
+    if plan.verified_source and plan.locator and plan.locator.source not in {"greenhouse", "greeting"}:
         return None
-    if plan.locator and not plan.verified_source:
+    if plan.locator and plan.locator.source != "greeting" and not plan.verified_source:
         posting = fetch_posting(plan.locator, fetch, deadline, previous=doc)
         candidate = posting_logo(posting, plan.locator)
         if candidate or plan.locator.source != "greenhouse":
             return candidate
-    final, raw, _ = fetch(plan.page, deadline=deadline, limit=MAX_PAGE)
+    home = greeting_home(plan.page)
+    requested = plan.page
+    try:
+        final, raw, _ = fetch(requested, deadline=deadline, limit=MAX_PAGE)
+    except PublicHTTPError as error:
+        if error.status not in {404, 410} or not home or requested == home:
+            raise
+        # Closed listings may disappear while the same employer still publishes its board.
+        requested = home
+        final, raw, _ = fetch(home, deadline=deadline, limit=MAX_PAGE)
+    if home and requested == home:
+        if greeting_home(final) != home:
+            return None
+        return _board_brand(raw.decode("utf-8-sig"), final, plan.company)
     if plan.locator:
         match = linked_job_locator({"title": plan.company + "｜" + plan.role}, final)
         if not match or (match.scope, match.original_id) != (plan.locator.scope, plan.locator.original_id):
@@ -225,12 +366,26 @@ def _official(plan, fetch, deadline, doc):
             return None
     try:
         page = raw.decode("utf-8-sig")
-        doc = Document(page, final)
+        document = Document(page, final)
     except (ValueError, UnicodeError):
         return None
-    logo = _logo_in_images(doc.images, plan.company, final) if plan.domain or plan.locator else None
+    original_path = urlsplit(plan.page).path.rstrip("/")
+    final_path = urlsplit(final).path.rstrip("/")
+    same_greeting_opening = (home and greeting_home(final) == home
+                             and re.sub(r"^/[a-z]{2}(?=/o/)", "", final_path) == original_path)
+    if final_path == original_path or same_greeting_opening:
+        candidate = _board_brand(page, final, plan.company)
+        if candidate:
+            return candidate
+        image = jobda_logo(page, final, plan.company, fetch, deadline)
+        if image:
+            return Candidate("jobda:" + urlsplit(final).hostname, final, image)
+    if plan.locator and plan.locator.source == "greeting" and not plan.verified_source:
+        posting = parse_posting(plan.locator, final, raw, previous=doc)
+        return posting_logo(posting, plan.locator)
+    logo = _logo_in_images(document.images, plan.company, final) if plan.domain or plan.locator else None
     logo = logo or _json_logo(page, plan, final)
-    key = f"greenhouse:{plan.locator.scope}" if plan.locator else plan.identity
+    key = f"{plan.locator.source}:{plan.locator.scope}" if plan.locator else plan.identity
     return Candidate(key, final, logo) if logo else None
 
 
@@ -309,18 +464,32 @@ def _release_image(db, token):
         db.execute("DELETE FROM logo_image_claims WHERE token=?", (token,))
 
 
+def _image_candidates(plan, fetch, deadline, doc):
+    seen = set()
+    for source in ("body", "official"):
+        brand = plan.body if source == "body" else _official(plan, fetch, deadline, doc)
+        if brand:
+            for url in (brand.image_url, brand.alternate_image_url):
+                if url and (brand.key, url) not in seen:
+                    seen.add((brand.key, url))
+                    yield Candidate(brand.key, brand.source_page, url)
+
+
 def _attempt(db, plan, fetch, deadline, image_module, doc):
+    candidates = _image_candidates(plan, fetch, deadline, doc)
     retry = False
-    for current in ("body", "official"):
+    while True:
         token = None
         try:
-            candidate = plan.body if current == "body" else _official(plan, fetch, deadline, doc)
+            candidate = next(candidates, None)
             if not candidate:
-                continue
+                break
             token = _claim_image(db, candidate, deadline)
             if token is None:
                 return "ready", candidate, None, None
-            _, data, _ = fetch(candidate.image_url, deadline=deadline, limit=MAX_IMAGE)
+            final, data, _ = fetch(candidate.image_url, deadline=deadline, limit=MAX_IMAGE)
+            if candidate.key.startswith("jobda:") and final != candidate.image_url:
+                raise ValueError("JOBDA image redirected away from its verified asset")
             png = _verified_png(data, image_module)
             if png is not None:
                 return "ready", candidate, png, token
@@ -559,13 +728,26 @@ def read_logo(path, post_id):
     return None
 
 
+def requeue_missing(path):
+    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True)) as db, db:
+        count = db.execute("""UPDATE job_company_logos SET outcome='pending',attempted_at=NULL
+            WHERE outcome='missing' AND company_key IS NULL AND lease_until<=?""", (time.time(),)).rowcount
+    if count:
+        signal_logo_worker(path)
+    return count
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, type=Path)
     parser.add_argument("--limit", type=int, default=DEFAULT_LOGO_LIMIT)
-    parser.add_argument("--drain", action="store_true", help="Process all available logo requests in batches")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--drain", action="store_true", help="Process all available logo requests in batches")
+    mode.add_argument("--retry-missing", action="store_true", help="Queue previously missing logos and notify the worker")
     args = parser.parse_args()
-    if args.drain:
+    if args.retry_missing:
+        summary = {"requeued": requeue_missing(args.db)}
+    elif args.drain:
         summary = _drain_with_signals(args.db, limit=args.limit, fetch=fetch_public)
     else:
         summary = refresh_logos(args.db, limit=args.limit, fetch=fetch_public)
