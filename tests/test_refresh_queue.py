@@ -38,7 +38,11 @@ class RefreshQueueTests(unittest.TestCase):
         detail = self.start({"post_id": task["post_id"]})
         self.assertEqual(detail["counts"]["done"], 1)
         self.assertEqual(detail["counts"]["queued"], 2)
+        self.assertEqual(detail["by_kind"]["deadline"]["done"], 1)
+        self.assertEqual(detail["by_kind"]["logo"]["queued"], 1)
+        self.assertEqual(detail["by_kind"]["fit"]["queued"], 1)
         fresh = self.web.get(f"/refreshes/{run['id']}?after={run['cursor']}").json
+        self.assertEqual(fresh["by_kind"]["deadline"]["queued"], 32)
         self.assertEqual([(c["kind"], c["post_id"]) for c in fresh["changes"]], [("deadline", task["post_id"])])
         self.assertIn(run["id"], [r["id"] for r in self.web.get("/refreshes?q=대상&page=2").json["runs"]])
         with sqlite3.connect(self.state) as db:

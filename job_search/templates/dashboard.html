@@ -3,9 +3,25 @@
 {% if job.has_company_logo %}<img class="company-logo" src="{{ url_for('company_logo', post_id=job.id, v=job.logo_version) }}" alt="" width="24" height="24">{% else %}<span class="company-avatar" aria-hidden="true">{{ job.company[0] }}</span>{% endif %}
 {%- endmacro %}
 {% macro refresh_status(runs) -%}
-<p class="refresh-status"><span data-refresh-status role="status"></span><span data-refresh-usage>
-  {%- for run in runs|sort(attribute='id') %}<a data-run-id="{{ run.id }}" href="{{ url_for('refresh_status', run=run.id, view='usage') }}" target="_blank" rel="noopener" aria-label="새로고침 {{ run.id }} 모델 사용량 (새 탭)">모델 사용량{% if runs|length > 1 %} #{{ run.id }}{% endif %}</a>{% endfor -%}
-</span></p>
+<div class="refresh-status">
+  <p data-refresh-status role="status"></p>
+  <div data-refresh-panels>{% for run in runs|sort(attribute='id') %}
+    <section class="refresh-run" data-run-id="{{ run.id }}" aria-label="새로고침 작업 {{ run.id }}">
+      <div class="refresh-summary"><strong>새로고침{% if runs|length > 1 %} #{{ run.id }}{% endif %}</strong>
+        <span class="refresh-badge" data-run-state role="status"></span>
+        <span class="refresh-total" data-run-total></span>
+        <a href="{{ url_for('refresh_status', run=run.id, view='usage') }}" target="_blank" rel="noopener" aria-label="새로고침 {{ run.id }} 모델 사용량 (새 탭)">모델 사용량</a>
+      </div>
+      <progress data-run-bar value="0" max="1" aria-label="전체 작업 처리 진행률"></progress>
+      <div class="refresh-kinds">{% for key,label in [('deadline','마감'),('logo','기업 로고'),('fit','적합도')] %}
+        <div class="refresh-kind" data-kind="{{ key }}">
+          <div><strong>{{ label }}</strong><span data-kind-count></span></div>
+          <progress value="0" max="1" aria-label="{{ label }} 처리 진행률"></progress>
+          <small data-kind-status></small>
+        </div>{% endfor %}
+      </div>
+    </section>{% endfor %}</div>
+</div>
 {%- endmacro %}
 <!doctype html>
 <html lang="ko">

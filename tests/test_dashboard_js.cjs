@@ -245,22 +245,37 @@ test('a confirmed deadline repaints while the worker still reads the linked JD',
   assert.equal(snapshots, 1);
 });
 
-test('each refresh control reports the same requests as its usage links', () => {
-  const status = ids => ({
-    textContent: '',
-    parentElement: {querySelectorAll() { return ids.map(id => ({dataset: {runId: String(id)}})); }},
-  });
-  const list = status([10]), detail = status([10, 12]);
-  const context = {document: {
-    querySelector() { return null; }, querySelectorAll() { return [list, detail]; },
+test('list and detail paint their own real counts, including partial failure', () => {
+  function fields() {
+    const elements = new Map();
+    return {querySelector(key) {
+      if (!elements.has(key)) elements.set(key, {});
+      return elements.get(key);
+    }};
+  }
+  function panel(id) {
+    const kinds = ['deadline', 'logo', 'fit'].map(kind => ({...fields(), dataset: {kind}}));
+    return {...fields(), dataset: {runId: String(id)}, querySelectorAll: () => kinds, kinds};
+  }
+  const counts = (changes = {}) => ({queued: 0, running: 0, done: 0, failed: 0, skipped: 0, ...changes});
+  const first = {id: 10, counts: counts({done: 1, running: 1, queued: 1}), by_kind: {
+    deadline: counts({done: 1}), logo: counts({running: 1}), fit: counts({queued: 1}),
   }};
-  vm.runInNewContext(script + `
-    runs.set(10, {id: 10, complete: false, counts: {queued: 6, done: 2, failed: 1, skipped: 0, running: 0}});
-    runs.set(12, {id: 12, complete: true, counts: {queued: 0, done: 2, failed: 1, skipped: 0, running: 0}});
-    showProgress();
-  `, context);
-  assert.match(list.textContent, /새로고침 중 · 3\/9개 항목/);
-  assert.match(detail.textContent, /#12 완료 · 3\/3개 항목 · 실패 1/);
+  const second = {id: 12, complete: true, counts: counts({done: 1, skipped: 1, failed: 1}), by_kind: {
+    deadline: counts({done: 1}), logo: counts({skipped: 1}), fit: counts({failed: 1}),
+  }};
+  const list = panel(10), detail = panel(12);
+  vm.runInNewContext(script + '\n runs.set(10, first); runs.set(12, second); showProgress();', {
+    first, second, document: {querySelector() { return null; }, querySelectorAll() { return [list, detail]; }},
+  });
+  assert.equal(list.querySelector('[data-run-state]').textContent, '처리 중');
+  assert.equal(list.querySelector('[data-run-total]').textContent, '1/3개 처리 · 실행 중 1 · 대기 1');
+  assert.deepEqual(list.querySelector('[data-run-bar]'), {max: 3, value: 1});
+  assert.equal(list.kinds[0].querySelector('progress').value, 1);
+  assert.equal(list.kinds[1].querySelector('[data-kind-status]').textContent, '처리 중 1');
+  assert.equal(list.kinds[2].querySelector('[data-kind-status]').textContent, '대기 1');
+  assert.equal(detail.querySelector('[data-run-state]').textContent, '일부 실패');
+  assert.equal(detail.kinds[2].querySelector('[data-kind-status]').textContent, '실패 1');
 });
 
 test('an empty destination tab polls until active work can no longer change its cards or totals', async () => {

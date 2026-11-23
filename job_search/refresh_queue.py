@@ -158,14 +158,17 @@ def _snapshot(db, run, after):
     if not db.execute("SELECT 1 FROM refresh_runs WHERE id=?", (run,)).fetchone():
         raise LookupError("Unknown refresh")
     counts = dict.fromkeys(STATUSES, 0)
-    counts.update(db.execute("""SELECT status,count(*) FROM refresh_members m JOIN refresh_work w USING(group_id)
-        WHERE run_id=? GROUP BY status""", (run,)))
+    by_kind = {kind: dict.fromkeys(STATUSES, 0) for kind in KINDS}
+    for kind, status, count in db.execute("""SELECT kind,status,count(*) FROM refresh_members m
+            JOIN refresh_work w USING(group_id) WHERE run_id=? GROUP BY kind,status""", (run,)):
+        by_kind[kind][status] = count
+        counts[status] += count
     query = """ FROM refresh_changes c JOIN refresh_work w ON w.id=c.work_id
         JOIN refresh_members m ON m.group_id=w.group_id WHERE m.run_id=?"""
     cursor = db.execute("SELECT coalesce(max(seq),0)" + query, (run,)).fetchone()[0]
     changes = [] if after is None else [dict(r) for r in db.execute(
         "SELECT seq,w.post_id,w.kind,w.status,w.message" + query + " AND seq>? ORDER BY seq", (run, after))]
-    return {"id": run, "counts": counts, "cursor": cursor, "changes": changes,
+    return {"id": run, "counts": counts, "by_kind": by_kind, "cursor": cursor, "changes": changes,
             "complete": not (counts["queued"] or counts["running"])}
 
 
