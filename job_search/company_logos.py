@@ -17,7 +17,9 @@ from uuid import uuid4
 from .card_metadata import has_table
 from .evidence import Document
 from .job_availability import document_version
-from .job_sources import company_key, company_names, fetch_posting, linked_job_locator, role_key, source_locator
+from .job_sources import (
+    company_key, company_names, fetch_posting, linked_job_locator, matches_jd_source, role_key, source_locator,
+)
 from .public_fetch import PublicHTTPError, fetch_public
 
 MAX_PAGE = 2_000_000
@@ -56,6 +58,9 @@ class LogoPlan:
     page: str | None = None
     domain: str | None = None
     locator: object = None
+    verified_source: bool = False
+    organization: str | None = None
+    awaiting_official: bool = False
 
 
 def _http_url(value):
@@ -119,7 +124,9 @@ def _plan(doc):
     if not company_key(company) or not role_key(role):
         return LogoPlan("", "", "")
     source = _http_url(doc.get("url"))
-    body_url = _logo_in_images(doc.get("images"), company, source) if source else None
+    body_url = None
+    if source:
+        body_url = _logo_in_images(doc.get("listing_images"), company, source) or _logo_in_images(doc.get("images"), company, source)
     linked = doc.get("links")
     linked = linked if isinstance(linked, list) else []
     apply_url = _http_url(doc.get("apply_url"))
@@ -155,8 +162,11 @@ def _plan(doc):
     else:
         scope = ""
     identity = f"{scope}:{company_key(company)}" if scope else ""
-    body = Candidate(identity, source, body_url) if body_url else None
-    return LogoPlan(company, role, identity, body, page, domain, locator)
+    organization = doc.get("jd_organization")
+    if not isinstance(organization, str) or not matches_jd_source(doc, locator):
+        organization = None
+    body = Candidate(organization or identity, source, body_url) if body_url else None
+    return LogoPlan(company, role, identity, body, page, domain, locator, organization=organization)
 
 
 def _json_logo(page, plan, url):
@@ -185,14 +195,21 @@ def _json_logo(page, plan, url):
     return next(iter(matches)) if len(matches) == 1 else None
 
 
-def _official(plan, fetch, deadline):
+def posting_logo(posting, locator):
+    url = _asset(posting.logo, locator.url) or _logo_in_images(posting.body.images, locator.company, locator.url)
+    return Candidate(posting.organization, locator.url, url) if url else None
+
+
+def _official(plan, fetch, deadline, doc):
     if not plan.page:
         return None
-    if plan.locator:
-        posting = fetch_posting(plan.locator, fetch, deadline)
-        if plan.locator.source != "greenhouse":
-            logo = _asset(posting.logo, plan.page)
-            return Candidate(posting.organization, plan.page, logo) if logo else None
+    if plan.verified_source and plan.locator and plan.locator.source != "greenhouse":
+        return None
+    if plan.locator and not plan.verified_source:
+        posting = fetch_posting(plan.locator, fetch, deadline, previous=doc)
+        candidate = posting_logo(posting, plan.locator)
+        if candidate or plan.locator.source != "greenhouse":
+            return candidate
     final, raw, _ = fetch(plan.page, deadline=deadline, limit=MAX_PAGE)
     if plan.locator:
         match = linked_job_locator({"title": plan.company + "｜" + plan.role}, final)
@@ -213,7 +230,8 @@ def _official(plan, fetch, deadline):
         return None
     logo = _logo_in_images(doc.images, plan.company, final) if plan.domain or plan.locator else None
     logo = logo or _json_logo(page, plan, final)
-    return Candidate(plan.identity, final, logo) if logo else None
+    key = f"greenhouse:{plan.locator.scope}" if plan.locator else plan.identity
+    return Candidate(key, final, logo) if logo else None
 
 
 def _verified_png(raw, image_module):
@@ -262,26 +280,88 @@ def _seed(db, limit):
     return len(rows)
 
 
-def _attempt(db, plan, fetch, deadline, image_module):
+class ImageClaimInProgress(Exception):
+    pass
+
+
+def _claim_image(db, candidate, deadline):
+    token = uuid4().hex
+    while True:
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            cached = db.execute("SELECT image_url FROM company_logos WHERE company_key=?", (candidate.key,)).fetchone()
+            if cached and cached[0] == candidate.image_url:
+                return None
+            now = time.time()
+            claim = db.execute("""INSERT INTO logo_image_claims VALUES(?,?,?,?)
+                ON CONFLICT(company_key,image_url) DO UPDATE SET token=excluded.token,lease_until=excluded.lease_until
+                WHERE logo_image_claims.lease_until<=? RETURNING token""",
+                (candidate.key, candidate.image_url, token, now + 15, now)).fetchone()
+            if claim:
+                return token
+        if time.monotonic() >= deadline:
+            raise ImageClaimInProgress
+        time.sleep(.05)
+
+
+def _release_image(db, token):
+    if token:
+        db.execute("DELETE FROM logo_image_claims WHERE token=?", (token,))
+
+
+def _attempt(db, plan, fetch, deadline, image_module, doc):
     retry = False
     for current in ("body", "official"):
+        token = None
         try:
-            candidate = plan.body if current == "body" else _official(plan, fetch, deadline)
+            candidate = plan.body if current == "body" else _official(plan, fetch, deadline, doc)
             if not candidate:
                 continue
-            existing = db.execute("SELECT image_url FROM company_logos WHERE company_key=?", (candidate.key,)).fetchone()
-            if existing and existing[0] == candidate.image_url:
-                return "ready", candidate, None
+            token = _claim_image(db, candidate, deadline)
+            if token is None:
+                return "ready", candidate, None, None
             _, data, _ = fetch(candidate.image_url, deadline=deadline, limit=MAX_IMAGE)
-            if (png := _verified_png(data, image_module)) is not None:
-                return "ready", candidate, png
+            png = _verified_png(data, image_module)
+            if png is not None:
+                return "ready", candidate, png, token
+        except ImageClaimInProgress:
+            return "busy", None, None, None
         except PublicHTTPError as error:
             retry |= error.status not in {404, 410}
         except OSError:
             retry = True
         except ValueError:
-            continue
-    return ("pending" if retry else "missing"), None, None
+            pass
+        with db:
+            _release_image(db, token)
+    return ("pending" if retry else "missing"), None, None, None
+
+
+def record_logo_receipt(db, work, status):
+    db.execute("""INSERT OR IGNORE INTO refresh_logo_receipts(work_id,post_id,version,status)
+        VALUES(?,?,?,?)""", (work["id"], work["post_id"], work["version"], status))
+
+
+def cached_company(db, post_id, doc, plan):
+    own = db.execute("""SELECT j.company_key FROM job_company_logos j JOIN company_logos c USING(company_key)
+        WHERE j.post_id=? AND j.document_version=?""", (post_id, document_version(doc))).fetchone()
+    if own:
+        return own[0]
+    if plan.organization:
+        row = db.execute("SELECT company_key FROM company_logos WHERE company_key=?", (plan.organization,)).fetchone()
+        if row:
+            return row[0]
+    if plan.body:
+        row = db.execute("SELECT company_key FROM company_logos WHERE company_key=? AND image_url=?",
+                         (plan.body.key, plan.body.image_url)).fetchone()
+        if row:
+            return row[0]
+    if plan.domain or (plan.locator and plan.locator.source in {"greenhouse", "greeting"}):
+        row = db.execute("""SELECT DISTINCT j.company_key FROM job_company_logos j JOIN company_logos c USING(company_key)
+            WHERE j.identity=? LIMIT 2""", (plan.identity,)).fetchall()
+        if len(row) == 1:
+            return row[0][0]
+    return None
 
 
 # A nonzero lease marks an interrupted or in-flight attempt, regardless of the cutoff.
@@ -297,6 +377,69 @@ def _batch_deadline(limit):
     return time.monotonic() + min(120, 6 * limit)
 
 
+def _refresh_post(db, post_id, *, deadline, fetch, image_module, retry_before=None,
+                  work=None, plan=None, expected_version=None):
+    started = time.time()
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        post = db.execute("SELECT document,fingerprint FROM posts WHERE id=?", (post_id,)).fetchone()
+        if not post or (work and post[1] != expected_version):
+            return None
+        serialized, fingerprint = post
+        try:
+            doc = json.loads(serialized)
+        except ValueError:
+            doc = {}
+        doc = doc if isinstance(doc, dict) else {}
+        version = document_version(doc)
+        row = db.execute("SELECT document_version FROM job_company_logos WHERE post_id=?", (post_id,)).fetchone()
+        if not row or version != row[0]:
+            enqueue_logo(db, post_id, doc, fingerprint)
+            if not work:
+                return None
+        due = "" if work else f"AND j.outcome='pending' AND {_RETRY_ELIGIBLE}"
+        args = () if work else (retry_before, retry_before)
+        claim = db.execute(f"""UPDATE job_company_logos AS j SET attempted_at=?,lease_until=?
+            WHERE post_id=? AND lease_until<=? {due} RETURNING post_id""",
+            (started, started + 15, post_id, started, *args)).fetchone()
+        if not claim:
+            return None
+    outcome, candidate, png, token = _attempt(db, plan or _plan(doc), fetch, deadline, image_module, doc)
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        current = db.execute("""SELECT p.document, j.attempted_at FROM posts p JOIN job_company_logos j ON j.post_id=p.id
+            WHERE p.id=? AND j.document_version=?""", (post_id, version)).fetchone()
+        _release_image(db, token)
+        if not current or tuple(current) != (serialized, started):
+            return None
+        if outcome == "busy":
+            if work:
+                db.execute("UPDATE job_company_logos SET lease_until=0 WHERE post_id=?", (post_id,))
+                return None
+            outcome = "pending"
+        if work and plan.awaiting_official and outcome != "ready":
+            # The linked response may yet supply a different, verified candidate.
+            db.execute("""DELETE FROM refresh_source_snapshots WHERE work_id=? AND
+                json_extract(logo_plan,'$.awaiting_official')=1""", (work["source_work_id"],))
+            db.execute("UPDATE job_company_logos SET lease_until=0 WHERE post_id=?", (post_id,))
+            return None
+        if png is not None:
+            db.execute("""INSERT INTO company_logos VALUES(?,?,?,?,?)
+                ON CONFLICT(company_key) DO UPDATE SET source_page=excluded.source_page,image_url=excluded.image_url,
+                  image=excluded.image,checked_at=excluded.checked_at WHERE excluded.checked_at>=company_logos.checked_at""",
+                (candidate.key, candidate.source_page, candidate.image_url, png, started))
+        # Preserve the round boundary if the wall clock moved backward.
+        attempted = max(started, retry_before) if retry_before is not None else started
+        db.execute("""UPDATE job_company_logos SET company_key=COALESCE(?,company_key), outcome=?,
+            attempted_at=?,lease_until=0 WHERE post_id=?""",
+            (candidate.key if candidate else None, outcome, attempted, post_id))
+        if work:
+            if plan.awaiting_official and outcome == "ready":
+                db.execute("UPDATE job_company_logos SET identity=? WHERE post_id=?", (plan.identity, post_id))
+            record_logo_receipt(db, work, {"ready": "done", "pending": "failed", "missing": "skipped"}[outcome])
+    return outcome
+
+
 def _refresh_batch(db, *, limit, deadline, fetch, image_module, retry_before=None):
     summary = {"checked": 0, "ready": 0, "missing": 0, "retry": 0}
     ids = db.execute(f"""SELECT j.post_id FROM job_company_logos j JOIN posts p ON p.id=j.post_id
@@ -305,44 +448,11 @@ def _refresh_batch(db, *, limit, deadline, fetch, image_module, retry_before=Non
     for (post_id,) in ids:
         if time.monotonic() >= deadline:
             break
-        started = time.time()
-        with db:
-            attempt = db.execute(f"""UPDATE job_company_logos AS j SET attempted_at=?,lease_until=?
-                WHERE post_id=? AND outcome='pending' AND lease_until<=? AND {_RETRY_ELIGIBLE}
-                RETURNING document_version""",
-                (started, started + 15, post_id, started, retry_before, retry_before)).fetchone()
-            if not attempt:
-                continue
-            post = db.execute("SELECT document,fingerprint FROM posts WHERE id=?", (post_id,)).fetchone()
-            if post is None:
-                continue
-            serialized, fingerprint = post
-            try:
-                doc = json.loads(serialized)
-            except ValueError:
-                doc = None
-            if not isinstance(doc, dict) or document_version(doc) != attempt[0]:
-                enqueue_logo(db, post_id, doc if isinstance(doc, dict) else {}, fingerprint)
-                continue
-        outcome, candidate, png = _attempt(db, _plan(doc), fetch, min(deadline, time.monotonic() + 5), image_module)
-        with db:
-            db.execute("BEGIN IMMEDIATE")
-            current = db.execute("""SELECT p.document, j.attempted_at FROM posts p JOIN job_company_logos j ON j.post_id=p.id
-                WHERE p.id=? AND j.document_version=?""", (post_id, attempt[0])).fetchone()
-            if not current or current != (serialized, started):
-                continue
-            if png is not None:
-                db.execute("""INSERT INTO company_logos VALUES(?,?,?,?,?)
-                    ON CONFLICT(company_key) DO UPDATE SET source_page=excluded.source_page,image_url=excluded.image_url,
-                      image=excluded.image,checked_at=excluded.checked_at WHERE excluded.checked_at>=company_logos.checked_at""",
-                    (candidate.key, candidate.source_page, candidate.image_url, png, started))
-            # Preserve the round boundary if the wall clock moved backward.
-            attempted = max(started, retry_before) if retry_before is not None else started
-            db.execute("""UPDATE job_company_logos SET company_key=COALESCE(?,company_key), outcome=?,
-                attempted_at=?,lease_until=0 WHERE post_id=?""",
-                (candidate.key if candidate else None, outcome, attempted, post_id))
-        summary["checked"] += 1
-        summary["retry" if outcome == "pending" else outcome] += 1
+        outcome = _refresh_post(db, post_id, deadline=min(deadline, time.monotonic() + 5),
+                                fetch=fetch, image_module=image_module, retry_before=retry_before)
+        if outcome:
+            summary["checked"] += 1
+            summary["retry" if outcome == "pending" else outcome] += 1
     return summary
 
 

@@ -1,6 +1,8 @@
 """Score evidence-backed job reviews and route current recommendations."""
 
+import hashlib
 import json
+import re
 import sys
 from fractions import Fraction
 
@@ -140,6 +142,12 @@ def recommendation_group(decision: str, fit: dict | None) -> str | None:
     return "outside" if score >= 80 else None
 
 
+def group_before_closure(fit):
+    if fit and fit.get("availability") == "closed":
+        return recommendation_group(fit.get("assessment_decision"), {**fit, "availability": "open"})
+    return None
+
+
 def read_fit(row) -> dict | None:
     """Accept only a stored v1 result for the same source and the same review."""
     try:
@@ -150,9 +158,41 @@ def read_fit(row) -> dict | None:
             if not isinstance(fit.get(stamp), str) or not fit[stamp] or fit[stamp] != row[stamp]:
                 return None
         # The writer checked JD line bounds against the fingerprinted source.
-        expected = evaluate_fit(fit, line_count=sys.maxsize)
+        line_count = len(json.loads(row["document"])["lines"]) if "document" in row.keys() else sys.maxsize
+        expected = evaluate_fit(fit, line_count=line_count)
         if any(key not in fit or fit[key] != value for key, value in expected.items()):
             return None
     except (KeyError, IndexError, TypeError, ValueError, RecursionError):
         return None
     return fit
+
+
+def stable_hash(value):
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+# Keep the original line numbering. Only wholly administrative deadline lines are masked.
+_CALENDAR_LINE = re.compile(
+    r"(?:(?:지원|접수|채용|모집|서류(?:\s*접수)?)\s*)?(?:마감(?:일시|일)?|기간|기한)"
+    r"\s*[:：]?\s*(?:[0-9./~\s:()년월일시오전후까지-]+|상시\s*채용|채용\s*시\s*마감)[.!]?", re.I)
+
+
+def profile_jd(record, post_id):
+    """Return only an explicitly sourced job description from a historical application."""
+    jd = record.get("jd") or (record if record.get("jd_source") else {})
+    if not isinstance(jd, dict) or not jd.get("jd_source") or not jd.get("lines"):
+        jd = {"title":record.get("title",""), "url":"", "lines":[]}
+    return {**jd,"id":post_id}
+
+
+def jd_input(doc):
+    """Only reproducible recruiting evidence belongs in the model input."""
+    company = str(doc.get("title", "")).partition("｜")[0].strip()
+    logo_alt = re.compile(re.escape(company) + r"\s*(?:공식\s*)?(?:로고|logo)", re.I)
+    images = [im for im in doc.get("images", []) if isinstance(im, dict)
+              and not (company and logo_alt.fullmatch(str(im.get("alt", "")).strip()))]
+    lines = ["" if isinstance(line,str) and _CALENDAR_LINE.fullmatch(line.strip()) else line
+             for line in doc.get("lines", [])]
+    return {"title": doc.get("title", ""), "lines": lines, "images": images,
+            "source": doc.get("jd_source") or doc.get("url", "")}

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
 from .evidence import Document
+from .job_availability import _stamp
 
 INTHISWORK_API = "https://inthiswork.com/wp-json/wp/v2/posts"
 _GREENHOUSE = {"boards.greenhouse.io", "job-boards.greenhouse.io"}
@@ -45,6 +46,8 @@ def _id(value):
 
 
 def _parts(url):
+    if not isinstance(url, str):
+        return "", ""
     try:
         parsed = urlsplit(url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username is not None:
@@ -127,7 +130,7 @@ def linked_job_locator(doc, url):
 
 @dataclass(frozen=True)
 class SourcePosting:
-    lines: list
+    body: Document
     due: str | None
     closed: bool
     logo: str | None
@@ -149,14 +152,26 @@ def _validate_scope(locator, url):
         raise ValueError("Posting URL does not match")
 
 
+def matches_jd_source(doc, locator):
+    origin = doc.get("jd_source")
+    if (not locator or not isinstance(origin, dict)
+            or origin.get("source") != locator.source or origin.get("original_id") != locator.original_id):
+        return False
+    try:
+        _validate_scope(locator, origin.get("url"))
+    except ValueError:
+        return False
+    return True
+
+
 def _matching_job(locator, posting, company):
     if (_id(posting["id"]) != locator.original_id or role_key(posting["title"]) != role_key(locator.role)
             or not company_names(company) & company_names(locator.company)):
         raise ValueError("Posting identity does not match")
 
 
-def _lines(content, url):
-    return Document(content, url).lines if isinstance(content, str) and content.strip() else []
+def _body(content, url):
+    return Document(content if isinstance(content, str) else "", url)
 
 
 def _greenhouse(locator, final_url, body):
@@ -169,7 +184,7 @@ def _greenhouse(locator, final_url, body):
     content = posting.get("content")
     if isinstance(content, str) and content.lstrip().startswith("&lt;"):
         content = html.unescape(content)
-    return SourcePosting(_lines(content, locator.url), posting.get("application_deadline"), False, None,
+    return SourcePosting(_body(content, locator.url), posting.get("application_deadline"), False, None,
                          f"greenhouse:{locator.scope}", posting.get("updated_at"))
 
 
@@ -195,7 +210,7 @@ def _greeting(locator, url, page):
         raise ValueError("Greeting posting is unavailable")
     header = props.get("careerBootInfo", {}).get("design", {}).get("header", {})
     logo = group.get("imageUrl") or header.get("logoUrl")
-    return SourcePosting(_lines(posting.get("detail"), url), posting.get("dueDate"), closed, logo,
+    return SourcePosting(_body(posting.get("detail"), url), posting.get("dueDate"), closed, logo,
                          f"greeting:{locator.scope}")
 
 
@@ -208,17 +223,16 @@ def _wanted(locator, url, page):
     status = posting["status"]
     if not company_id or posting.get("hidden") or posting.get("is_private") or status not in {"active", "closed"}:
         raise ValueError("Wanted posting is unavailable")
-    lines = []
-    for field in ("intro", "main_tasks", "requirements", "hire_rounds"):
-        lines.extend(_lines(posting.get(field), url))
+    fields = ("intro", "main_tasks", "requirements", "preferred_points", "benefits", "hire_rounds")
+    body = _body("\n".join(posting[f] for f in fields if isinstance(posting.get(f), str)), url)
     due = posting.get("due_time")
     if not due:
         articles = re.findall(r"<article\b[^>]*\bJobDueTime_JobDueTime__\w+[^>]*>(.*?)</article\s*>", page, re.S)
         if len(articles) == 1:
-            field = _lines(articles[0], url)
+            field = _body(articles[0], url).lines
             if len(field) == 2 and field[0] == "마감일":
-                lines.insert(0, "접수 마감: " + field[1])
-    return SourcePosting(lines, due, status == "closed", company.get("logo_image"),
+                body.lines.insert(0, "접수 마감: " + field[1])
+    return SourcePosting(body, due, status == "closed", company.get("logo_image"),
                          f"wanted:{company_id}")
 
 
@@ -248,15 +262,32 @@ def _ascent(locator, url, page):
     conditions = posting.get("conditions")
     if not isinstance(conditions, list) or not all(isinstance(value, str) for value in conditions):
         raise ValueError("Ascent posting conditions are unavailable")
-    return SourcePosting(conditions + _lines(posting.get("description"), url), None, False, company.get("logoUrl"),
-                         f"ascent:{company_id}")
+    body = _body(posting.get("description"), url)
+    body.lines[:0] = conditions
+    return SourcePosting(body, None, False, company.get("logoUrl"), f"ascent:{company_id}")
 
 
-def fetch_posting(locator, fetch, deadline):
+def fetch_posting(locator, fetch, deadline, *, previous=None):
     """Read role-specific data without treating a generic or login page as a job."""
     url, body, _ = fetch(locator.endpoint, deadline=deadline, limit=2_000_000)
+    return parse_posting(locator, url, body, previous=previous)
+
+
+def parse_posting(locator, url, body, *, previous=None):
+    """Validate and select one role even on boards that share a URL across jobs."""
     parser = {"greenhouse": _greenhouse, "greeting": _greeting, "wanted": _wanted, "ascent": _ascent}[locator.source]
     try:
-        return parser(locator, url, body.decode("utf-8-sig"))
+        posting = parser(locator, url, body.decode("utf-8-sig"))
+        modified = _stamp(posting.modified)
+        if posting.modified is not None and modified is None:
+            raise ValueError("Invalid source revision")
+        if previous and matches_jd_source(previous, locator):
+            organization = previous.get("jd_organization")
+            if organization and organization != posting.organization:
+                raise ValueError("Posting employer ID changed")
+            saved = _stamp(previous.get("jd_modified_gmt"))
+            if saved and (not modified or modified < saved):
+                raise ValueError("Posting revision is older than the verified job")
+        return posting
     except (KeyError, TypeError, ValueError, AttributeError, IndexError) as error:
         raise ValueError("같은 직무의 공개 공고를 확인하지 못했어요.") from error

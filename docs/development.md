@@ -27,6 +27,8 @@ make test-live
 
 `make test`는 외부 접속 없이 Python 테스트와 Node.js 테스트를 실행합니다. `make test-live`는 별도 `tests/integration/`의 실제 RSS 검사를 실행합니다. 테스트는 임시 DB를 사용하며 운영 데이터로 저장 동작을 시험하지 않습니다.
 
+목록 새로고침은 인증된 Flask 요청으로 측정했다. 17행짜리 합성 공고 3,000개 중 2,400개가 검색에 맞았고, 2페이지에서 누른 첫 접수는 5회 중앙값 200ms와 SQL 26회였다. 실행 중 같은 조건으로 다시 누르면 189ms와 SQL 20회였다. 33건 중 미평가 3건만 제출하고 재클릭과 다음 정기 전달을 검증하는 회귀 테스트는 `tests/test_refresh_integration.py`에 있다. [실제 Hermes 평가 품질과 사용량](fit-batch-comparison.md)
+
 수집 스킬 번들은 앱 패키지와 독립적인 배포 단위입니다. 번들 코드를 바꿀 때는 `assets/runtime-manifest.json`도 갱신하고 `tests.test_job_search_skill`로 복사·설정·실행을 검증합니다.
 
 ## Git과 배포

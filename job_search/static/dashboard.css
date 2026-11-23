@@ -215,3 +215,26 @@ blockquote { margin: 14px 0; border-left: 2px solid #c6d9ce; padding: 3px 0 3px 
   #deadline-dialog { padding: 18px; }
   .deadline-editor-actions button, .deadline-fields input, .deadline-fields select { min-height: 44px; }
 }
+
+.detail-company { display: flex; align-items: center; gap: 8px; }
+.detail-company .company-avatar { width: 24px; height: 24px; }
+.skeleton-card { padding: 23px 22px 20px; border-bottom: 1px solid var(--line); }
+.skeleton-card i { display: block; background: #edf1f2; border-radius: 4px; }
+.sk-logo { width: 24px; height: 24px; }
+.sk-company { width: 24%; height: 11px; }
+.sk-deadline { width: 68px; height: 23px; margin-left: auto; }
+.sk-title { width: 72%; height: 17px; margin: 14px 0; }
+.sk-reason { width: 89%; height: 11px; margin-bottom: 16px; }
+.sk-tag { width: 42px; height: 18px; }
+.refresh-status { color: #366d5c; font-size: 12px; line-height: 1.6; margin: 0 0 12px; }
+.refresh-status a { margin-left: 8px; text-decoration: underline; white-space: nowrap; }
+.refresh-status:has([data-refresh-status]:empty):not(:has(a)) { display: none; }
+.usage-report { margin: 32px auto; width: min(480px, 90%); }
+.usage-report dl { padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: white; }
+.usage-report dl div { display: flex; justify-content: space-between; padding: 7px 0; }
+.usage-report dd { font-weight: 650; font-variant-numeric: tabular-nums; }
+@media (max-width: 640px) {
+  .skeleton-card { padding: 20px 18px; }
+  .has-detail .main-shell > .refresh-status { display: none; }
+  .job-detail > .refresh-status:has([data-refresh-status]:not(:empty)), .job-detail > .refresh-status:has(a) { display: block; margin: 10px 0; }
+}

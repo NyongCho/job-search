@@ -1,5 +1,6 @@
 """Hermes pre-run script; install under ~/.hermes/scripts/."""
 import json
+import os
 import subprocess
 import sqlite3
 import sys
@@ -26,8 +27,12 @@ def main():
     retry = reconcile_outbox(root / "data/jobs.sqlite", outcomes, current[0])
     payload = {"execution_id": current[0], "retry_digests": retry}
     if not retry:
-        result = subprocess.run([config["python"], str(root / "collect_jobs.py"), "collect"],
-                                cwd=root, capture_output=True, text=True, timeout=240, check=True)
+        command = [config["python"], str(root / "collect_jobs.py"), "scheduled", "--execution-id", current[0]]
+        if config.get("dashboard_url"):
+            command.extend(["--dashboard-url",config["dashboard_url"]])
+        result = subprocess.run(command, env={**os.environ,"HERMES_HOME":config["hermes_home"],
+                                             "HERMES_REPO":config["hermes_repo"]},
+                                cwd=root, capture_output=True, text=True, timeout=3500, check=True)
         payload.update(json.loads(result.stdout))
     print(json.dumps(payload, ensure_ascii=False))
 

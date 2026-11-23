@@ -3,15 +3,19 @@ import argparse
 import json
 import sqlite3
 import time
+from collections import Counter
 from contextlib import closing
+from dataclasses import asdict
 from datetime import date, datetime, time as clock, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
+from .card_metadata import has_table
 from .collect_jobs import API, FIELDS, extract, request_json
+from .company_logos import _plan
 from .dashboard_store import init_state_db, read_job_document
 from .job_availability import KST, _stamp, availability, document_version, inspect_document
-from .job_fit import read_fit, recommendation_group
+from .job_fit import group_before_closure, read_fit, recommendation_group
 from .job_sources import fetch_posting, same_inthiswork_post, source_locator
 from .public_fetch import fetch_public
 
@@ -36,8 +40,31 @@ def _inthiswork(post, expected):
     return doc
 
 
+def include_url(ids):
+    return API + "?" + urlencode({"include": ",".join(map(str, ids)), "per_page": 100, "_fields": FIELDS})
+
+
+def checked_inthiswork_posts(posts, locators, *, strict):
+    if not isinstance(posts, list):
+        raise ValueError("Expected Inthiswork posts")
+    ids = [p.get("id") if isinstance(p, dict) and type(p.get("id")) is int else None for p in posts]
+    counts = Counter(ids)
+    valid = {}
+    for post, post_id in zip(posts, ids):
+        try:
+            if counts[post_id] != 1:
+                raise ValueError("Ambiguous Inthiswork posting")
+            doc = _inthiswork(post, locators)
+            if same_inthiswork_post(locators[post_id], doc):
+                valid[post_id] = doc
+        except (ValueError, TypeError, KeyError, AttributeError):
+            if strict:
+                raise
+    return valid
+
+
 def _external_facts(document, posting):
-    facts = inspect_document({"lines": posting.lines, "published_gmt": document.get("published_gmt")})
+    facts = inspect_document({"lines": posting.body.lines, "published_gmt": document.get("published_gmt")})
     if posting.due is not None:
         value = posting.due
         if not isinstance(value, str):
@@ -53,7 +80,7 @@ def _external_facts(document, posting):
         facts.update(deadline_at=at.isoformat(), deadline_kind=kind, deadline_word="", evidence=value)
     if posting.closed:
         facts.update(closed=True, evidence="출처에서 접수 종료를 확인함")
-    elif not posting.lines and posting.due is None:
+    elif not posting.body.lines and not posting.body.images and posting.due is None:
         raise ValueError("Source returned no posting content")
     return facts
 
@@ -82,7 +109,7 @@ def refresh_one(jobs_db, state_db, post_id, *, fetch=fetch_public, now=None):
                 raise ValueError("Inthiswork returned an older version")
             facts = inspect_document(fresh)
         else:
-            posting = fetch_posting(locator, fetch, deadline)
+            posting = fetch_posting(locator, fetch, deadline, previous=document)
             facts = _external_facts(document, posting)
             modified = posting.modified
     except OSError as error:
@@ -93,12 +120,13 @@ def refresh_one(jobs_db, state_db, post_id, *, fetch=fetch_public, now=None):
         db.execute("BEGIN IMMEDIATE")
         if read_job_document(jobs_db, post_id) != document:
             raise SourceCheckFailed("조회 중 저장된 공고가 바뀌었어요. 다시 확인해 주세요.")
-        return write_facts(db, post_id, document, facts, started, modified, locator.endpoint)
+        linked = _plan(fresh).locator if locator.source == "inthiswork" and has_table(db, "job_linked_deadlines") else None
+        return write_facts(db, post_id, document, facts, started, modified, locator.endpoint, linked=linked)
 
 
-def write_facts(db, post_id, document, facts, started, source_modified, source_url):
+def accepts_facts(db, post_id, document, started, source_modified):
     version = document_version(document)
-    old = db.execute("""SELECT a.checked_at,a.source_modified_at,f.document_version FROM job_availability a
+    old = db.execute("""SELECT a.checked_at,a.source_modified_at,f.document_version,a.source_url FROM job_availability a
         LEFT JOIN job_deadline_facts f ON a.post_id=f.post_id AND a.checked_at=f.checked_at WHERE a.post_id=?""",
         (post_id,)).fetchone()
     previous = _stamp(old[0]) if old else None
@@ -107,9 +135,43 @@ def write_facts(db, post_id, document, facts, started, source_modified, source_u
     incoming = _stamp(source_modified)
     stored = _stamp(document.get("modified_gmt"))
     previous_source = _stamp(old[1]) if old and old[2] == version else None
+    if old and old[2] == version and document.get("source", "inthiswork") == "inthiswork" and not old[3].startswith(API):
+        # A linked official deadline uses that site's modification time in the displayed fact.
+        # Earlier writers did not record linked facts or create the companion table.
+        if db.execute("PRAGMA table_info(job_linked_deadlines)").fetchone():
+            linked = db.execute("""SELECT listing_modified_at FROM job_linked_deadlines
+                WHERE post_id=? AND json_extract(locator,'$.url')=?""", (post_id, old[3])).fetchone()
+            if linked:
+                previous_source = _stamp(linked[0])
+    if previous_source and not incoming:
+        return False
     if incoming and any(value and incoming < value for value in (stored, previous_source)):
         return False
+    return True
+
+
+def write_facts(db, post_id, document, facts, started, source_modified, source_url, *,
+                linked=None, official_facts=None, official_modified=None):
+    if not accepts_facts(db, post_id, document, started, source_modified):
+        return False
+    version = document_version(document)
     checked_at = started.isoformat(timespec="microseconds")
+    if linked:
+        locator = json.dumps(asdict(linked), sort_keys=True)
+        saved = db.execute("""SELECT facts,checked_at,modified_at FROM job_linked_deadlines
+            WHERE post_id=? AND locator=?""", (post_id, locator)).fetchone()
+        previous = _stamp(saved[2]) if saved else None
+        incoming = _stamp(official_modified)
+        if official_facts is not None and (not previous or (incoming and incoming > previous)
+                or (incoming == previous and official_facts == json.loads(saved[0]))):
+            saved = (json.dumps(official_facts, ensure_ascii=False), checked_at, official_modified)
+        if saved:
+            # Each site has its own revision clock. A listing-only check cannot renew the official success time.
+            db.execute("INSERT OR REPLACE INTO job_linked_deadlines VALUES(?,?,?,?,?,?)",
+                       (post_id, locator, *saved, source_modified))
+            official = json.loads(saved[0])
+            if not facts["closed"] and (official["closed"] or official["deadline_kind"] != "unknown"):
+                facts, checked_at, source_modified, source_url = official, saved[1], saved[2], linked.url
     db.execute("""INSERT INTO job_availability VALUES(?,?,?,?,?,?,?)
         ON CONFLICT(post_id) DO UPDATE SET closed=excluded.closed,deadline_at=excluded.deadline_at,
         evidence=excluded.evidence,checked_at=excluded.checked_at,source_modified_at=excluded.source_modified_at,
@@ -132,33 +194,35 @@ def refresh(jobs_db, state_db, fetch_page=request_json, now=None):
         stored = {}
         for row in db.execute("SELECT * FROM posts"):
             status = statuses.get(row["id"])
-            if (row["decision"] == "recommend" or status in ("interested", "preparing", "applied")
-                    or (status != "archived" and row["decision"] == "needs_review"
-                        and recommendation_group(row["decision"], read_fit(row)) == "question")):
+            fit = read_fit(row)
+            prior_group = group_before_closure(fit)
+            if (row["decision"] == "recommend" or prior_group in {"preferred", "outside"}
+                    or status in ("interested", "preparing", "applied")
+                    or (status != "archived" and
+                        (prior_group == "question" or recommendation_group(row["decision"], fit) == "question"))):
                 stored[row["id"]] = json.loads(row["document"])
     locators = {i: locator for i, doc in stored.items() if (locator := source_locator(doc))
                 and locator.source == "inthiswork" and locator.original_id == str(i)}
     ids = sorted(locators)
     unsupported = sorted(stored.keys() - locators.keys())
     checked = {}
-    seen = set()
     for start in range(0, len(ids), 100):
         batch = ids[start:start + 100]
-        url = API + "?" + urlencode({"include": ",".join(map(str, batch)), "per_page": 100, "_fields": FIELDS})
-        posts, _ = fetch_page(url)
-        if not isinstance(posts, list):
-            raise ValueError("Expected Inthiswork posts")
-        for post in posts:
-            doc = _inthiswork(post, set(batch) - seen)
-            post_id = post["id"]
-            seen.add(post_id)
-            if same_inthiswork_post(locators[post_id], doc):
-                checked[post_id] = (doc, inspect_document(doc))
+        posts, _ = fetch_page(include_url(batch))
+        valid = checked_inthiswork_posts(posts, {i: locators[i] for i in batch}, strict=True)
+        for post_id, doc in valid.items():
+            checked[post_id] = doc, inspect_document(doc)
     # Fetch every batch before starting the write transaction. A failed request preserves previous facts.
     with closing(sqlite3.connect(Path(state_db).resolve().as_uri() + "?mode=rw", uri=True, timeout=30)) as db, db:
+        db.execute("ATTACH DATABASE ? AS source", (Path(jobs_db).resolve().as_uri() + "?mode=ro",))
         db.execute("BEGIN IMMEDIATE")
+        supports_linked = has_table(db, "job_linked_deadlines")
         for post_id, (doc, facts) in checked.items():
-            write_facts(db, post_id, stored[post_id], facts, now, doc.get("modified_gmt"), API + "/" + str(post_id))
+            row = db.execute("SELECT document FROM source.posts WHERE id=?", (post_id,)).fetchone()
+            if not row or json.loads(row[0]) != stored[post_id]:
+                continue
+            write_facts(db, post_id, stored[post_id], facts, now, doc.get("modified_gmt"),
+                        API + "/" + str(post_id), linked=_plan(doc).locator if supports_linked else None)
     return {"requested": len(ids), "checked": len(checked), "unsupported_ids": unsupported,
             "missing_ids": sorted(set(ids) - checked.keys()),
             "expired_in_checked": [i for i, (doc, _) in checked.items() if availability(doc, now=now)["is_expired"]]}

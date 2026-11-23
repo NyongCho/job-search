@@ -11,10 +11,9 @@ from urllib.parse import urlsplit
 from flask import Flask, Response, abort, g, jsonify, render_template, request, session, url_for
 from werkzeug.exceptions import HTTPException, SecurityError
 
-from . import dashboard_store as store
+from . import dashboard_store as store, refresh_api, refresh_queue
 from .company_logos import read_logo
 from .company_research import load_research, lookup_research
-from .refresh_job_availability import SourceCheckFailed, refresh_one
 
 ROOT = Path(__file__).resolve().parents[1]
 VIEW_LABELS = {"recommended": "추천", "interested": "관심", "preparing": "지원 준비",
@@ -116,16 +115,33 @@ def create_app(config=None):
 
     def screen(post_id=None):
         view, q, page, sort = context()
-        listing = store.list_jobs(source, state, view=view, q=q, page=page, sort=sort)
+        snapshot = request.headers.get("X-Dashboard-Snapshot") == "1"
+        shell = (request.method == "GET" and request.headers.get("Sec-Fetch-Mode") == "navigate"
+                 and request.args.get("render") != "full" and not snapshot)
+        list_runs = detail_runs = []
+        activity = None
+        if snapshot:
+            # Capture event cursors before reading the values those events published.
+            activity = refresh_queue.activity(state)
+            list_runs = refresh_api.find_runs(source, state, view, q)
+            if post_id is not None:
+                detail_runs = refresh_api.find_runs(source, state, view, q, post_id)
+        if shell:
+            listing = {"sort": sort, "page": page, "counts": dict.fromkeys(VIEW_LABELS, "–")}
+        else:
+            listing = store.list_jobs(source, state, view=view, q=q, page=page, sort=sort)
+            for item in listing["items"]:
+                item["company_review"] = lookup_research(research, item["company"])
         detail = store.get_job(source, state, post_id) if post_id is not None else None
         if post_id is not None and detail is None:
             abort(404)
-        for item in listing["items"]:
-            item["company_review"] = lookup_research(research, item["company"])
         if detail is not None:
             detail["company_review"] = lookup_research(research, detail["company"])
         session.setdefault("csrf_token", secrets.token_urlsafe(32))
+        runs = {run["id"]: run for run in (*list_runs, *detail_runs)}
         return render_template("dashboard.html", listing=listing, detail=detail, view=view, q=q,
+                               shell=shell, runs=list(runs.values()), activity=activity,
+                               list_runs=list_runs, detail_runs=detail_runs,
                                sort_options=store.sort_options(view),
                                views=VIEW_LABELS, statuses=STATUS_LABELS, decisions=DECISION_LABELS,
                                fit_groups=FIT_GROUP_LABELS, fit_categories=FIT_CATEGORIES, fit_statuses=FIT_STATUSES,
@@ -178,20 +194,14 @@ def create_app(config=None):
             return jsonify(error=409, message=str(error), html=screen(post_id)), 409
         return jsonify(**result, html=screen(post_id), message="마감 정보를 저장했어요.")
 
-    @app.post("/jobs/<int(signed=True):post_id>/deadline/refresh")
-    def refresh_deadline(post_id):
-        context()
-        try:
-            updated = refresh_one(source, state, post_id)
-        except SourceCheckFailed as error:
-            return error_response(502, str(error))
-        message = "마감 정보를 다시 확인했어요." if updated else "더 최근에 확인한 마감 정보를 표시했어요."
-        return jsonify(html=screen(post_id), message=message)
+    refresh_api.register(app, source, state, context)
 
     @app.get("/healthz")
     def health():
         try:
             store.check_card_metadata(source, state)
+            if app.config.get("REQUIRE_REFRESH_SCHEMA"):
+                store.check_refresh_schema(source, state)
             store.list_jobs(source, state)
         except (OSError, sqlite3.Error, ValueError):
             return jsonify(status="unavailable"), 503
@@ -236,9 +246,11 @@ def create_production_app():
     app = create_app(config)
     try:
         store.check_card_metadata(config["JOBS_DB"], config["STATE_DB"])
+        store.check_refresh_schema(config["JOBS_DB"], config["STATE_DB"])
+        app.config["REQUIRE_REFRESH_SCHEMA"] = True
     except sqlite3.OperationalError as error:
         if str(error).startswith(("no such table:", "no such column:")):
-            raise RuntimeError("Run job_search.migrate_card_metadata before starting this release") from error
+            raise RuntimeError("Run job_search.refresh_worker --migrate before starting this release") from error
         raise
     return app
 

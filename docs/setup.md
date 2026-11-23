@@ -56,7 +56,7 @@ systemd를 사용하지 않는 환경에서는 같은 DB를 지정해 수동으�
 
 루트 `deployment.json`에 실제 작업 ID·Slack 채널·웹 주소를 기록합니다. [설정 예시](../deploy/deployment.example.json)를 참고하며 기존 설정은 보존합니다. JSON만 작성하면 예약되는 것은 아닙니다. Hermes에서 작업을 만들고 그 ID와 실행 설정을 일치시켜야 합니다.
 
-이 저장소용 프리런은 [scripts/hermes_collect.py](../scripts/hermes_collect.py)입니다. 기본 앱 위치 `~/job_search`, 기본 Hermes 홈 `~/.hermes`를 사용하며, Hermes의 `scripts/`에 복사해 실행해도 앱 패키지를 찾습니다. 프리런은 설치된 릴리스의 `.venv-dashboard`에서 수집을 실행합니다. 로고는 수집 신호를 받은 별도 서비스가 처리합니다. 프리런은 실제 활성 실행 ID를 요구하므로 수동 시험 대신 Hermes 작업을 통해 실행합니다.
+정기 프리런의 기본 앱 위치는 `~/job_search`, Hermes 홈은 `~/.hermes`입니다. Hermes의 `scripts/`에 복사해도 설치된 릴리스와 `.venv-dashboard`를 찾아 수집합니다. 새로고침 워커와 같은 환경 파일에서 DB 위치와 경력·평가 설정을 읽어 기존 추천 복구와 정기 평가에 사용합니다. 기본 환경 파일은 `~/.config/job-dashboard/environment`이며 릴리스 설치에서는 `.deploy/config.json`의 `environment_file`을 따릅니다. 프리런은 실제 활성 실행 ID가 있는 Hermes 작업에서 실행합니다. [프리런 코드](../scripts/hermes_collect.py)
 
 새 설치에서 기본 프롬프트를 만들 때는 루트에서 다음 명령을 사용합니다. 이미 `hermes_job_prompt.txt`가 있으면 덮어쓰지 않고 실패합니다.
 
@@ -78,24 +78,33 @@ Hermes 작업에 프롬프트, 프리런, Python, 작업 디렉터리, 시간대
 
 ### 기존 설치에서 적합도 평가 켜기
 
-새 DB에는 평가 결과를 담을 열이 있습니다. 기존 개발 DB는 아래 명령으로 이전합니다. 릴리스 방식의 운영 서버는 [적합도 이전 절차](deployment.md#적합도-평가를-켜는-첫-배포)를 따릅니다.
+로컬 설치에서는 웹과 워커가 함께 사용할 DB를 먼저 준비합니다. 아래 이전 명령은 기존 평가와 개인 상태를 보존하며, 당시 확인 가능한 사용자 경력을 기존 평가의 기준 버전으로 기록합니다. Hermes의 기본 홈은 `~/.hermes`입니다. 경력 자료 경로를 명시하려면 `FIT_PROFILE_FILES`에 콜론으로 구분한 파일 경로를 설정하고 이전과 실제 평가에 같은 환경을 사용합니다.
 
 ```sh
-.venv-dashboard/bin/python -m job_search.collect_jobs --db data/jobs.sqlite migrate-fit
+.venv-dashboard/bin/python -m job_search.collect_jobs status
+.venv-dashboard/bin/python -m job_search.refresh_worker --migrate
+.venv-dashboard/bin/python -m job_search.refresh_worker
 ```
 
-진행 중인 검토가 끝나면 현재 개인 프롬프트를 백업합니다. 템플릿의 항목별 평가, 모집 상태 확인, 결과 저장·전달 지시를 개인 프롬프트와 등록된 Hermes 작업 양쪽에 반영합니다. 패키지 설치에서는 템플릿의 `python3 collect_jobs.py`를 `python3 -m job_search.collect_jobs`로 바꾸고, 릴리스 방식의 작업 디렉터리는 `~/job_search/current`로 지정합니다. 기존의 `--digest` 파일 생성 지시는 새 `review … --execution-id …` 호출로 교체합니다.
+마지막 명령은 상주 워커를 실행합니다. 웹앱을 별도 프로세스에서 실행하고 상세나 목록의 ↻를 누르면 워커가 대기 작업을 처리합니다. 목록 ↻는 해당 보기와 검색 결과 전체를 대상으로 합니다. 마감·로고·평가의 진행 상태 옆 **모델 사용량**을 누르면 이번 요청의 평가 제출 건수, 신규 호출 수와 토큰을 확인할 수 있습니다. 인증된 `GET /refreshes/<실행 ID>`는 공고별 변경과 실제 Hermes 사용량을 반환합니다. `usage`에는 시도별 호출·입력/출력 토큰·처리 시간이 담깁니다. 여러 요청에서 같은 시도를 볼 때 전체 비용은 `attempt_id`로 한 번만 합산합니다.
 
-새 검토부터 핵심 업무 60점, 필수 요건 30점, 우대 요건 10점을 적용합니다. 상세에서 항목별 경력 근거와 JD 줄 번호를 확인할 수 있습니다. 80점은 선호 밖 추천의 노출 기준입니다. 기존 추천에는 '미산정'을 표시합니다.
+패키지의 `scripts/hermes_collect.py`는 정기 수집·평가를 시작합니다. 등록된 Hermes 작업에는 저장된 결과를 전달하는 릴리스의 `hermes_job_prompt.txt.tpl` 내용을 사용합니다. 운영 릴리스에서는 두 프롬프트 백업과 전환을 배포 명령으로 수행합니다. [운영 전환 절차](deployment.md#새로고침-워커와-평가-이력-전환)
 
-별도 경로나 Hermes 프로필에 **수집 전용 인스턴스**를 만들려면 [스킬 설치 안내](../skills/job-search-pipeline/references/setup.md)를 사용합니다. 스킬 번들은 독립 배포를 위해 자체 런타임을 포함하며, 그 생성 결과는 기존 `collect_jobs.py` 방식입니다. 웹앱은 이 저장소를 사용합니다.
+`FIT_BATCH_SIZE`는 한 세션에 넣을 최대 공고 수(1~5, 기본 3), `FIT_CONCURRENCY`는 동시에 허용할 모델 실행 수(1~4, 기본 1)입니다. 준비된 대상이 한 건이면 바로 평가합니다. `FIT_MODEL`과 `FIT_PROVIDER`를 생략하면 설치된 Hermes 설정을 사용합니다. [단건·3건·5건 비교 결과](fit-batch-comparison.md)
+
+```sh
+.venv-dashboard/bin/python -m job_search.fit_benchmark --output comparison/fit-pilot --sizes 1 5 3
+.venv-dashboard/bin/python -m job_search.fit_benchmark --boundary --output comparison/fit-boundary --sizes 1 5 3
+```
+
+비교 명령은 합성 경력과 공고를 사용해 실제 모델을 호출하고, 각 크기별로 JD 근거·필수 요건·토큰·시간을 기록합니다. 결과에 포함된 `criteria`는 원문과 대조할 수 있습니다. 새 비교에는 빈 결과 폴더를 사용합니다.
 
 ## 서버 운영
 
 1. 설치 경로를 `~/job_search`로 두거나 아래 서비스 파일의 경로를 조정합니다.
 2. [환경 예시](../deploy/dashboard.env.example)를 기준으로 `~/.config/job-dashboard/environment`를 만들고 권한을 `0600`으로 설정합니다. 실제 로그인·서버 주소·세션 키를 채우고 개발 모드를 끕니다.
-3. [웹 서비스](../deploy/job-dashboard.service)와 [마감 확인 서비스](../deploy/job-availability.service), [타이머](../deploy/job-availability.timer)를 `~/.config/systemd/user/`에 설치합니다.
-4. `systemctl --user daemon-reload` 후 `systemctl --user enable --now job-dashboard.service job-availability.timer`를 실행합니다.
+3. 웹과 워커의 환경 파일에 지정한 DB와 사용자 경력 설정으로 `job_search.refresh_worker --migrate`를 실행합니다. [웹 서비스](../deploy/job-dashboard.service), [마감 확인 서비스](../deploy/job-availability.service), [타이머](../deploy/job-availability.timer), [새로고침 워커](../deploy/job-refresh-worker.service)를 `~/.config/systemd/user/`에 설치합니다. 새로고침 워커의 기본 경로는 `~/job_search/current`이므로 단일 폴더 설치에서는 해당 유닛의 `WorkingDirectory`와 `ExecStart` 경로를 `~/job_search` 아래로 맞춥니다.
+4. `systemctl --user daemon-reload` 후 `systemctl --user enable --now job-dashboard.service job-availability.timer job-refresh-worker.service`를 실행합니다.
 5. Waitress의 `127.0.0.1:8765`를 Tailscale Serve HTTPS로 연결합니다. 허용한 사용자 계정에서 실제 접근을 확인합니다.
 
 운영 진입점은 `job_search.dashboard:create_production_app`이며 개발 모드를 거부합니다. Tailscale 사용자 신원과 CSRF를 검증합니다. 인증 헤더를 보존하지 않는 일반 공개 프록시에 그대로 노출하는 구성은 지원하지 않습니다.

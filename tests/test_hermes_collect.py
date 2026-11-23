@@ -23,6 +23,8 @@ class HermesDashboardTests(unittest.TestCase):
         self.home = Path(self.temp.name)
         self.root = self.home / "job_search"
         self.root.mkdir()
+        self.enterContext(patch.dict(os.environ, {"HERMES_HOME": str(self.home / ".hermes"),
+                                                 "JOBS_DB": str(self.root / "data/jobs.sqlite")}))
         self.ledger = self.home / ".hermes/cron/executions.db"
         self.ledger.parent.mkdir(parents=True)
         with sqlite3.connect(self.ledger) as db:
@@ -57,6 +59,36 @@ class HermesDashboardTests(unittest.TestCase):
         payload, calls = self.run_wrapper("https://private.example")
         self.assertEqual(calls, 0)
         self.assertEqual(payload["retry_digests"], [original])
+
+    def test_scheduler_and_dashboard_worker_use_same_store_and_fit_settings(self):
+        profile = self.home / "career facts.md"
+        jobs = self.home / "shared" / "jobs.sqlite"
+        hermes_home = self.home / "alternate-hermes"
+        ledger = hermes_home / "cron/executions.db"
+        ledger.parent.mkdir(parents=True)
+        self.ledger.rename(ledger)
+        env_file = self.home / ".config/job-dashboard/environment"
+        env_file.parent.mkdir(parents=True)
+        env_file.write_text(f'HERMES_HOME="{hermes_home}"\nJOBS_DB="{jobs}"\nFIT_PROFILE_FILES="{profile}"\n'
+                            'FIT_BATCH_SIZE=2\nDASHBOARD_SECRET_KEY=web-only-test-value\n')
+        collect_jobs.connect(jobs).close()
+        with sqlite3.connect(jobs) as db:
+            db.execute("INSERT INTO outbox VALUES(?,?,?,0)", ("old", "saved in shared database", '["old"]'))
+        with patch.dict(os.environ, {}, clear=True):
+            payload, calls = self.run_wrapper()
+            self.assertEqual((payload["retry_digests"], calls), (["saved in shared database"], 0))
+            with sqlite3.connect(jobs) as db:
+                db.execute("UPDATE outbox SET delivered=1")
+            with patch.object(Path, "home", return_value=self.home), patch.object(subprocess, "run") as command, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                command.return_value.stdout = '{"scheduled_digest":"[SILENT]"}'
+                hermes_collect.main()
+        argv = command.call_args.args[0]
+        self.assertEqual(argv[argv.index("--db")+1], str(jobs))
+        env = command.call_args.kwargs["env"]
+        self.assertEqual((env["FIT_PROFILE_FILES"], env["FIT_BATCH_SIZE"]), (str(profile), "2"))
+        self.assertEqual(env["DASHBOARD_STATE_DB"], str(self.root / "data/dashboard/dashboard.sqlite"))
+        self.assertNotIn("DASHBOARD_SECRET_KEY", env)
 
     def test_rollback_keeps_saved_digest(self):
         original = "기존 상세 추천 https://private.example/jobs/123"
@@ -116,6 +148,17 @@ class HermesDashboardTests(unittest.TestCase):
             with patch.object(Path, "home", return_value=self.home), contextlib.redirect_stdout(io.StringIO()):
                 hermes_collect.main()
         self.assertEqual(run.call_args.kwargs["cwd"], release)
+
+
+    def test_prerun_uses_current_execution_to_prepare_delivery(self):
+        output = io.StringIO()
+        (self.root / "deployment.json").write_text(json.dumps({"job_id":"fixture-job"}))
+        with patch.object(Path,"home",return_value=self.home), patch.object(subprocess,"run") as command, contextlib.redirect_stdout(output):
+            command.return_value.stdout = '{"scheduled_digest":"stored for current"}'
+            hermes_collect.main()
+        argv = command.call_args.args[0]
+        self.assertEqual(argv[3:],["--db",str(self.root / "data/jobs.sqlite"),"scheduled","--execution-id","current"])
+        self.assertEqual(json.loads(output.getvalue())["scheduled_digest"],"stored for current")
 
 
 if __name__ == "__main__":

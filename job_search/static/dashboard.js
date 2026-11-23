@@ -2,6 +2,7 @@
 
 const list = document.querySelector("#job-list");
 const detail = document.querySelector("#job-detail");
+const dashboard = document.querySelector("[data-dashboard]");
 const token = document.querySelector('meta[name="csrf-token"]')?.content;
 const storage = {
   get(key) { try { return sessionStorage.getItem(key); } catch { return null; } },
@@ -9,7 +10,7 @@ const storage = {
   remove(key) { try { sessionStorage.removeItem(key); } catch { /* Nonessential feedback. */ } },
 };
 
-if (list) {
+function wireScroll() {
   const key = `job-list:${list.dataset.scrollKey}`;
   const navigation = performance.getEntriesByType("navigation")[0]?.type;
   const returning = navigation === "back_forward" || navigation === "reload" || storage.get("return-to-list") === key;
@@ -32,15 +33,17 @@ if (list) {
   });
 }
 
-async function post(url, data) {
+async function post(url, data, requestId) {
   const response = await fetch(url, {
-    method: "POST", credentials: "same-origin",
-    headers: { "Content-Type": "application/json", "X-CSRF-Token": token },
+    method: "POST", credentials: "same-origin", keepalive: Boolean(requestId),
+    headers: { "Content-Type": "application/json", "X-CSRF-Token": token,
+               ...(requestId ? {"X-Refresh-Request": requestId} : {}) },
     body: JSON.stringify(data),
   });
   const result = await response.json();
   if (!response.ok) {
     const error = new Error(result.message || "저장하지 못했어요. 다시 시도해 주세요.");
+    error.status = response.status;
     error.result = result;
     throw error;
   }
@@ -66,7 +69,6 @@ function deadlineWarning(expired, next) {
 
 function wireDeadline(dialog, id) {
   const edit = document.querySelector("#deadline-edit");
-  const refresh = document.querySelector("#deadline-refresh");
   const status = document.querySelector("#deadline-status");
   const form = dialog.querySelector("form");
   const fields = form.querySelector(".deadline-fields");
@@ -91,38 +93,6 @@ function wireDeadline(dialog, id) {
     warning.textContent = deadlineWarning(snapshot.expired, next);
   }
 
-  function applyScreen(html) {
-    const updated = new DOMParser().parseFromString(html, "text/html");
-    const freshDialog = updated.querySelector("#deadline-dialog");
-    snapshot = JSON.parse(freshDialog.dataset.deadline);
-    for (const selector of ["#deadline-auto-value", "#deadline-manual-value"]) {
-      dialog.querySelector(selector).replaceChildren(...freshDialog.querySelector(selector).childNodes);
-    }
-    const freshBadge = updated.querySelector("#deadline-edit");
-    edit.className = freshBadge.className;
-    edit.setAttribute("aria-label", freshBadge.getAttribute("aria-label"));
-    edit.replaceChildren(...freshBadge.childNodes);
-    for (const selector of [".detail-meta", ".detail-actions", ".list-title > span", ".summary-strip"]) {
-      document.querySelector(selector).replaceWith(updated.querySelector(selector));
-    }
-    const counts = updated.querySelectorAll(".nav-count");
-    document.querySelectorAll(".nav-count").forEach((count, i) => { count.textContent = counts[i].textContent; });
-    const freshList = updated.querySelector("#job-list");
-    const scrollTop = list.scrollTop;
-    list.replaceChildren(...freshList.childNodes);
-    list.dataset.scrollKey = freshList.dataset.scrollKey;
-    list.scrollTop = scrollTop;
-    const backUrl = new URL(updated.querySelector(".back-link").href);
-    detail.querySelector(".back-link").href = backUrl.href;
-    const detailUrl = new URL(location.href);
-    const page = backUrl.searchParams.get("page");
-    if (page !== (detailUrl.searchParams.get("page") || "1")) {
-      detailUrl.searchParams.set("page", page);
-      history.replaceState(history.state, "", detailUrl);
-    }
-    drawFields();
-  }
-
   function showStatus(message, failed = false) {
     status.textContent = message;
     status.classList.toggle("error", failed);
@@ -130,6 +100,7 @@ function wireDeadline(dialog, id) {
 
   edit.addEventListener("click", () => {
     if (pending || dialog.open) return;
+    snapshot = JSON.parse(dialog.dataset.deadline);
     const initial = snapshot.manual || snapshot.auto;
     controls.mode.value = snapshot.manual ? "manual" : "auto";
     for (const key of ["kind", "date", "time", "word"]) controls[key].value = initial[key];
@@ -156,32 +127,21 @@ function wireDeadline(dialog, id) {
     error.textContent = "";
     try {
       const result = await post(`/jobs/${id}/deadline${location.search}`, payload);
-      applyScreen(result.html);
       showStatus(result.message);
       dialog.close();
+      await refreshScreen();
     } catch (failure) {
-      if (failure.result?.error === 409) applyScreen(failure.result.html);
+      if (failure.result?.error === 409) {
+        await refreshScreen();
+        snapshot = JSON.parse(dialog.dataset.deadline);
+        drawFields();
+      }
       error.textContent = failure instanceof TypeError ? "연결을 확인한 뒤 다시 시도해 주세요." : failure.message;
     } finally {
       pending = save.disabled = cancel.disabled = false;
     }
   });
-  refresh?.addEventListener("click", async () => {
-    if (pending) return;
-    pending = true;
-    refresh.setAttribute("aria-disabled", "true");
-    showStatus("출처 확인 중…");
-    try {
-      const result = await post(`/jobs/${id}/deadline/refresh${location.search}`, {});
-      applyScreen(result.html);
-      showStatus(result.message + (snapshot.manual ? " 직접 입력값을 유지했어요." : ""));
-    } catch (failure) {
-      showStatus(failure instanceof TypeError ? "연결을 확인한 뒤 다시 시도해 주세요." : failure.message, true);
-    } finally {
-      pending = false;
-      refresh.removeAttribute("aria-disabled");
-    }
-  });
+
 }
 
 if (detail) {
@@ -221,6 +181,7 @@ if (detail) {
             const preview = document.querySelector(".job-row.selected .progress-preview");
             if (preview) preview.textContent = result.progress_label;
             target.textContent = notice;
+            if (dashboard) await refreshScreen();
           } else {
             storage.set(noticeKey, notice);
             location.reload();
@@ -244,4 +205,282 @@ if (detail) {
       save("progress", payload, form.querySelector(".stage-save-status"), "전형 기록을 저장했어요.");
     });
   }
+}
+
+let screenVersion = 0;
+let pageActive = true;
+let scrollWired = false;
+const runs = new Map();
+let activity = null;
+let needsSnapshot = false;
+let pollTimer;
+
+async function readCurrentScreen(accept) {
+  const version = ++screenVersion;
+  try {
+    const response = await fetch(location.href, {headers: {"X-Dashboard-Snapshot": "1"}});
+    if (!response.ok) throw new Error("화면을 불러오지 못했어요.");
+    const html = await response.text();
+    if (pageActive && version === screenVersion) accept(html);
+  } catch (error) {
+    if (pageActive && version === screenVersion) throw error;
+  }
+}
+
+// Reconcile only server-owned markup. Editable fields and their event handlers stay outside this tree.
+function patchReadOnly(current, fresh) {
+  if (current.isEqualNode(fresh)) return;
+  if (current.nodeType !== Node.ELEMENT_NODE) {
+    current.nodeValue = fresh.nodeValue;
+    return;
+  }
+  for (const name of current.getAttributeNames()) {
+    if (!fresh.hasAttribute(name)) current.removeAttribute(name);
+  }
+  for (const {name, value} of fresh.attributes) {
+    if (current.getAttribute(name) !== value) current.setAttribute(name, value);
+  }
+  const children = [...fresh.childNodes];
+  children.forEach((child, i) => {
+    const old = current.childNodes[i];
+    if (!old) current.append(child);
+    else if (old.nodeName !== child.nodeName) old.replaceWith(child);
+    else patchReadOnly(old, child);
+  });
+  while (current.childNodes.length > children.length) current.lastChild.remove();
+}
+
+function syncList(next) {
+  const rows = [...list.querySelectorAll(".job-row")];
+  const key = node => node.dataset.jobId || (node.tagName === "H2" ? node.textContent : node.className);
+  const existing = new Map([...list.children].map(node => [key(node), node]));
+  const nextIds = new Set([...next.querySelectorAll(".job-row")].map(row => row.dataset.jobId));
+  const mobile = matchMedia("(max-width: 640px)").matches;
+  const top = Math.max(0, list.getBoundingClientRect().top);
+  const anchor = rows.find(row => nextIds.has(row.dataset.jobId) && row.getBoundingClientRect().bottom > top);
+  const offset = anchor?.getBoundingClientRect().top;
+  const focused = document.activeElement;
+  const focusedPage = list.contains(focused) && focused.getAttribute("aria-label");
+  let position = list.firstElementChild;
+  for (const incoming of [...next.children]) {
+    const old = existing.get(key(incoming));
+    const node = old || incoming;
+    if (old) patchReadOnly(old, incoming);
+    if (node !== position) list.insertBefore(node, position);
+    position = node.nextElementSibling;
+  }
+  while (position) {
+    const obsolete = position;
+    position = position.nextElementSibling;
+    obsolete.remove();
+  }
+  list.dataset.scrollKey = next.dataset.scrollKey;
+  list.dataset.page = next.dataset.page;
+  list.setAttribute("aria-busy", "false");
+  if (list.contains(focused) && document.activeElement !== focused) focused.focus({preventScroll: true});
+  if (!focused.isConnected && (focusedPage || rows.includes(focused))) {
+    const link = [...list.querySelectorAll(".pagination a")].find(node => node.getAttribute("aria-label") === focusedPage);
+    (link || anchor || list).focus({preventScroll: true});
+  }
+  if (anchor && list.offsetHeight) {
+    const shift = anchor.getBoundingClientRect().top - offset;
+    if (mobile) window.scrollBy(0, shift);
+    else list.scrollTop += shift;
+  }
+}
+
+function applySnapshot(html) {
+  const next = new DOMParser().parseFromString(html, "text/html");
+  syncList(next.querySelector("#job-list"));
+  const selectors = [".list-title > span", ".collection-time", ".nav-count", ".summary-strip strong", "[data-refresh-usage]"];
+  if (detail) {
+    selectors.push(".detail-company", "#job-detail > h2", ".detail-meta", ".detail-actions", "#detail-fit",
+                   "#detail-evidence", "#deadline-auto-value", "#deadline-manual-value");
+    next.querySelector(".jd-section").open = document.querySelector(".jd-section").open;
+    document.querySelector(".back-link").href = next.querySelector(".back-link").href;
+    const edit = document.querySelector("#deadline-edit"), badge = next.querySelector("#deadline-edit");
+    badge.setAttribute("aria-expanded", edit.getAttribute("aria-expanded"));
+    patchReadOnly(edit, badge);
+    document.querySelector("#deadline-dialog").dataset.deadline = next.querySelector("#deadline-dialog").dataset.deadline;
+  }
+  for (const selector of selectors) {
+    const fresh = next.querySelectorAll(selector);
+    document.querySelectorAll(selector).forEach((current, i) => patchReadOnly(current, fresh[i]));
+  }
+  const address = new URL(location.href);
+  if (list.dataset.page !== (address.searchParams.get("page") || "1")) {
+    address.searchParams.set("page", list.dataset.page);
+    history.replaceState(history.state, "", address);
+  }
+  if (!scrollWired) {
+    wireScroll();
+    scrollWired = true;
+  }
+  const baseline = next.querySelector("[data-dashboard]").dataset;
+  runs.clear();
+  for (const run of JSON.parse(baseline.runs)) runs.set(run.id, run);
+  activity = JSON.parse(baseline.activity);
+  needsSnapshot = false;
+  showProgress();
+}
+
+function refreshMessage(message) {
+  for (const status of document.querySelectorAll("[data-refresh-status]")) {
+    if (status.textContent !== message) status.textContent = message;
+  }
+}
+
+async function refreshScreen() {
+  needsSnapshot = true;
+  try {
+    await readCurrentScreen(applySnapshot);
+  } catch {
+    if (pageActive) {
+      refreshMessage("화면을 불러오지 못했어요. 다시 시도하고 있어요.");
+      schedulePoll(1500);
+    }
+  }
+}
+
+function showProgress() {
+  for (const status of document.querySelectorAll("[data-refresh-status]")) {
+    const links = status.parentElement.querySelectorAll("[data-run-id]");
+    const visible = [...links].map(link => runs.get(Number(link.dataset.runId))).filter(Boolean);
+    const message = visible.map(({id, counts, complete}) => {
+      const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
+      const finished = counts.done + counts.failed + counts.skipped;
+      const label = visible.length > 1 ? `새로고침 #${id}` : "새로고침";
+      const parts = [`${label} ${complete ? "완료" : "중"} · ${finished}/${total}개 항목`];
+      if (counts.running) parts.push(`확인 중 ${counts.running}`);
+      if (counts.failed) parts.push(`실패 ${counts.failed}`);
+      if (counts.skipped) parts.push(`해당 없음 ${counts.skipped}`);
+      return parts.join(" · ");
+    }).join(" / ");
+    if (status.textContent !== message) status.textContent = message;
+  }
+}
+
+function submitRefresh(scope, postId, requestId) {
+  const query = new URLSearchParams({view: scope.view, q: scope.query});
+  return post(`/refreshes?${query}`, postId === undefined ? {} : {post_id: Number(postId)}, requestId);
+}
+
+function pendingSubmissions() {
+  try { return JSON.parse(storage.get("refresh-submitting") || "[]"); } catch { return []; }
+}
+
+function rememberSubmission(request) {
+  storage.set("refresh-submitting", JSON.stringify([...pendingSubmissions(), request]));
+}
+
+function forgetSubmission(id) {
+  const remaining = pendingSubmissions().filter(item => item.id !== id);
+  if (remaining.length) storage.set("refresh-submitting", JSON.stringify(remaining));
+  else storage.remove("refresh-submitting");
+}
+
+async function recoverRefresh(request) {
+  const response = await fetch(`/refreshes?request=${encodeURIComponent(request.id)}`);
+  if (!response.ok) throw new Error();
+  const found = await response.json();
+  return found.runs[0] || submitRefresh(request.scope, request.postId, request.id);
+}
+
+const submitting = new Set();
+
+function schedulePoll(delay) {
+  clearTimeout(pollTimer);
+  if (pageActive) pollTimer = setTimeout(poll, delay);
+}
+
+async function poll() {
+  const version = screenVersion;
+  try {
+    if (needsSnapshot) {
+      await refreshScreen();
+    } else {
+      const active = [...runs.values()].filter(run => !run.complete);
+      if (activity?.active || active.length) {
+        const read = async url => {
+          const response = await fetch(url);
+          if (!response.ok) throw new Error();
+          return response.json();
+        };
+        const [latest, ...updates] = await Promise.all([
+          activity?.active ? read("/refreshes/activity") : null,
+          ...active.map(run => read(`/refreshes/${run.id}?after=${run.cursor}&view=progress`)),
+        ]);
+        if (!pageActive || version !== screenVersion) return;
+        const changed = (latest && latest.cursor !== activity.cursor) || updates.some(run => run.changes.length > 0);
+        if (latest) activity = latest;
+        for (const run of updates) runs.set(run.id, run);
+        showProgress();
+        if (changed) await refreshScreen();
+      }
+    }
+    for (const request of pendingSubmissions()) {
+      if (submitting.has(request.id)) continue;
+      try {
+        await recoverRefresh(request);
+      } catch (error) {
+        if (!pageActive || ![400, 403, 404].includes(error.status)) throw error;
+      }
+      if (!pageActive) return;
+      forgetSubmission(request.id);
+      await refreshScreen();
+    }
+  } catch {
+    if (pageActive) refreshMessage("새로고침 진행 상황을 다시 확인하고 있어요.");
+  } finally {
+    if (needsSnapshot || activity?.active || [...runs.values()].some(run => !run.complete) || storage.get("refresh-submitting")) {
+      schedulePoll(1500);
+    }
+  }
+}
+
+if (dashboard) {
+  for (const button of document.querySelectorAll("[data-refresh]")) {
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      const request = {
+        id: crypto.randomUUID(),
+        scope: {view: dashboard.dataset.view, query: dashboard.dataset.query},
+        postId: button.dataset.refresh === "detail" ? Number(detail.dataset.jobId) : undefined,
+      };
+      rememberSubmission(request);
+      submitting.add(request.id);
+      refreshMessage("새로고침을 요청하고 있어요.");
+      try {
+        const run = await submitRefresh(request.scope, request.postId, request.id);
+        if (!pageActive) return;
+        forgetSubmission(request.id);
+        runs.set(run.id, run);
+        await refreshScreen();
+      } catch (error) {
+        if (!pageActive) return;
+        if ([400, 403, 404].includes(error.status)) forgetSubmission(request.id);
+        refreshMessage(error.message || "새로고침 요청을 다시 확인하고 있어요.");
+      } finally {
+        submitting.delete(request.id);
+        button.disabled = false;
+        if (pageActive) schedulePoll(800);
+      }
+    });
+  }
+  window.addEventListener("pagehide", () => {
+    pageActive = false;
+    screenVersion++;
+    clearTimeout(pollTimer);
+  });
+  window.addEventListener("pageshow", event => {
+    if (event.persisted) {
+      pageActive = true;
+      needsSnapshot = true;
+      schedulePoll(0);
+    }
+  });
+  needsSnapshot = true;
+  schedulePoll(0);
+} else if (list) {
+  wireScroll();
 }

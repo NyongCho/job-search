@@ -133,6 +133,23 @@ journalctl --user -u job-logo-worker.service --since today
 
 로고가 갱신되지 않으면 `systemctl --user status job-logo-worker.path job-logo-worker.service`와 워커 로그를 확인합니다. `.service`는 한 회차를 마치면 정지 상태로 돌아갑니다. 수집 완료 뒤 워커가 기동하지 않으면 신호 디렉터리의 존재 여부와 감시 경로를 확인합니다. 수집 로그에 신호 기록 실패가 보이면 `~/job_search/data`와 `jobs.sqlite.logo-requests`의 쓰기 권한을 확인합니다. 권한이나 유닛 경로를 수정한 뒤 워커를 한 번 수동 시작하면 DB에 남은 요청을 처리할 수 있습니다. 처리 결과 필드는 [설치 안내](setup.md#기업-로고-워커)에 설명되어 있습니다.
 
+### 새로고침 워커와 평가 이력 전환
+
+새 버전 소스와 전체 `main` SHA를 준비한 뒤, 릴리스 방식 서버에서 최초 한 번 실행합니다. 명령은 두 DB의 복사본으로 이전을 먼저 확인합니다. 실제 전환에서는 정기 작업과 워커를 정지하고 진행 중인 모델 실행이 끝나기를 기다린 뒤 DB 두 개, 개인 프롬프트 파일, 등록된 작업의 프롬프트를 백업합니다. 백업 위치는 `.deploy/backups/<release>/`입니다. 이 단계가 완료되면 정기 작업의 프롬프트가 저장된 전달문을 반환하도록 바뀝니다.
+
+```sh
+python3 /path/to/approved-source/scripts/deploy.py --migrate-refresh FULL_MAIN_SHA
+cd ~/job_search
+install -Dm644 current/deploy/job-refresh-worker.service ~/.config/systemd/user/job-refresh-worker.service
+systemctl --user daemon-reload
+systemctl --user enable --now job-refresh-worker.service
+systemctl --user status job-refresh-worker.service
+```
+
+서비스는 `current` 릴리스와 웹앱과 같은 환경 파일·영속 DB를 사용합니다. Hermes가 다른 위치에 설치돼 있으면 해당 서버의 `HERMES_HOME`, `HERMES_REPO`, `HERMES_PYTHON`을 설정합니다. 정기 프리런과 워커에 같은 경력 자료와 평가 설정을 적용합니다. 일반 배포는 기존 활성 상태를 복원하고 워커는 미완료 작업을 다시 읽습니다. 최초 전환 실패나 중단 시 `--recover`가 이전 릴리스와 두 프롬프트를 복원합니다.
+
+이전 릴리스로 복구한 동안의 수집·검토도 같은 DB에 기록됩니다. 새 릴리스를 다시 시작하면 그동안 수집한 미검토 공고는 정기 검토 대상이 되고, 구버전에서 이미 검토한 공고의 추천 이력은 보존됩니다.
+
 ## 일반 배포 동작과 복구
 
 활성화 직전 로고 경로 감시를 먼저 멈추고 로고 서비스의 중단을 확인합니다. Hermes 채용 작업과 마감 타이머를 일시 정지하고 실행 중인 검토·마감 갱신이 끝날 때까지 최대 10분 기다립니다. 웹앱을 잠시 중지하고 SQLite 백업을 만든 다음 `current`를 전환합니다. `/healthz`가 정상이어야 성공하며, 실패하면 이전 코드로 되돌립니다. 배포 중에는 별도의 수동 수집·검토·로고 처리를 시작하지 않습니다.
