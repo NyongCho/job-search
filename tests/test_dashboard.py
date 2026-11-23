@@ -5,14 +5,16 @@ import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from functools import partial
 from html import unescape
 from pathlib import Path
 from unittest.mock import patch
 
 from job_search import collect_jobs
-from job_search import dashboard
+from job_search import dashboard, fit_work, refresh_queue, refresh_sources
 from tests.test_collect_jobs import posting
 from tests.test_dashboard_store import collect_fit_examples
+from tests.test_fit_work import response as scored_response
 
 
 class WebTests(unittest.TestCase):
@@ -54,6 +56,65 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.get("/healthz", headers={}).status_code, 200)
         response = self.client.get("/", base_url="https://evil.example", headers=self.identity)
         self.assertEqual(response.status_code, 400)
+
+    def test_navigation_returns_card_placeholders_before_the_list_query(self):
+        path = "/?view=interested&q=없는회사&sort=fit"
+        navigation = {**self.identity, "Sec-Fetch-Mode": "navigate"}
+        with patch.object(dashboard.store, "list_jobs", side_effect=AssertionError("queried before paint")):
+            html = self.get(path, headers=navigation).get_data(as_text=True)
+        self.assertIn('aria-busy="true"', html)
+        self.assertIn('class="skeleton-card"', html)
+        self.assertIn('name="q" value="없는회사"', html)
+        self.assertNotIn("검색 결과가 없어요", html)
+        data = self.get(path, headers={**self.identity, "X-Dashboard-Snapshot": "1"}).get_data(as_text=True)
+        self.assertIn("검색 결과가 없어요", data)
+        self.assertNotIn('class="skeleton-card"', data)
+        self.assertIn('data-runs=', data)
+        fallback = self.get(path + "&render=full", headers=navigation).get_data(as_text=True)
+        self.assertIn("검색 결과가 없어요", fallback)
+
+    def test_direct_navigation_displays_cached_detail_before_list_is_available(self):
+        with patch.object(dashboard.store, "list_jobs", side_effect=AssertionError("queried before paint")):
+            html = self.get("/jobs/1", headers={**self.identity, "Sec-Fetch-Mode": "navigate"}).get_data(as_text=True)
+        self.assertIn('id="job-detail"', html)
+        self.assertIn("Python Agent 업무", html)
+        self.assertIn('aria-label="현재 공고 새로고침"', html)
+        self.assertIn('class="skeleton-card"', html)
+
+    def test_split_pane_follows_refresh_for_another_visible_row(self):
+        collect_jobs.collect(self.source, lambda _: ([posting(2)], 1), datetime(2026, 11, 16, tzinfo=timezone.utc))
+        with sqlite3.connect(self.source) as db:
+            db.execute("UPDATE posts SET decision='recommend' WHERE id=2")
+        run = self.post("/refreshes", {"post_id": 2}, self.csrf())
+        self.assertEqual(self.get("/refreshes?post_id=1").json["runs"], [])
+        html = self.get("/jobs/1", headers={**self.identity, "X-Dashboard-Snapshot": "1"}).get_data(as_text=True)
+        baselines = json.loads(unescape(re.search(r"data-runs='([^']+)'", html)[1]))
+        self.assertEqual([item["id"] for item in baselines], [run.json["id"]])
+
+    def test_expired_tab_observes_a_pending_recommendation_entering_the_list(self):
+        from job_search.refresh_job_availability import write_facts
+
+        self.post("/refreshes", {"post_id": 1}, self.csrf())
+        task, = refresh_queue.claim(self.state, "deadline", 1)
+        headers = {**self.identity, "X-Dashboard-Snapshot": "1"}
+        before = self.get("/?view=expired", headers=headers).get_data(as_text=True)
+        self.assertIn("아직 공고가 없어요", before)
+        self.assertIn("data-runs='[]'", before)
+        self.assertEqual(json.loads(unescape(re.search(r"data-activity='([^']+)'", before)[1])),
+                         {"active": True, "cursor": 0})
+
+        with sqlite3.connect(self.source) as db:
+            doc = json.loads(db.execute("SELECT document FROM posts WHERE id=1").fetchone()[0])
+        with sqlite3.connect(self.state) as db:
+            write_facts(db, 1, doc, dict(closed=True, deadline_at=None, deadline_kind="unknown",
+                        deadline_word="", evidence="접수 종료"), datetime.now(timezone.utc),
+                        doc["modified_gmt"], doc["url"])
+            refresh_queue.finish(self.state, task, "done", db=db)
+        activity = self.get("/refreshes/activity").get_json()
+        self.assertGreater(activity["cursor"], 0)
+        updated = self.get("/?view=expired", headers=headers).get_data(as_text=True)
+        self.assertIn('data-job-id="1"', updated)
+        self.assertRegex(updated, r'만료 목록 <span>1건</span>')
 
     def test_sidebar_shows_authenticated_username(self):
         for path in ["/", "/jobs/1", "/jobs/999"]:
@@ -102,7 +163,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(saved.json["deadline_label"], "12.02 23:59 마감")
         body = saved.json["html"]
         self.assertIn('aria-label="마감 정보 수정 · 12.02 23:59 마감"', body)
-        self.assertIn('aria-label="마감 정보 다시 확인"', body)
+        self.assertIn('aria-label="현재 공고 새로고침"', body)
         self.assertIn('<dialog id="deadline-dialog"', body)
         self.assertIn('name="q" value="Agent"', body)
 
@@ -225,9 +286,9 @@ class WebTests(unittest.TestCase):
             result = self.post("/jobs/1/deadline" + query, {"mode": "manual", "kind": "unknown"}, token)
             self.assertEqual(result.status_code, 400)
             self.assertIsNone(dashboard.store.get_job(self.source, self.state, 1)["deadline_manual"])
-            with patch.object(dashboard, "refresh_one") as refresh:
-                self.assertEqual(self.post("/jobs/1/deadline/refresh" + query, {}, token).status_code, 400)
-                refresh.assert_not_called()
+            self.assertEqual(self.post("/jobs/1/deadline/refresh" + query, {}, token).status_code, 400)
+        with sqlite3.connect(self.state) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM refresh_runs").fetchone()[0], 0)
 
     def test_deadline_responses_keep_sorted_rows(self):
         collect_jobs.collect(self.source, lambda _: ([posting(2, content="<p>지원 마감: 2099-12-02</p>")], 1),
@@ -240,14 +301,16 @@ class WebTests(unittest.TestCase):
             return re.findall(r'class="job-row[^"]*" href="/jobs/(\d+)\?', html)
         self.assertEqual(row_ids(self.get("/" + query).get_data(as_text=True)), ["2", "1"])
         saved = self.post("/jobs/1/deadline" + query, {"mode": "manual", "kind": "date", "date": "2099-12-01"}, token)
-        with patch.object(dashboard, "refresh_one", return_value=True):
-            refreshed = self.post("/jobs/1/deadline/refresh" + query, {}, token)
-        for response in (saved, refreshed):
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(row_ids(response.json["html"]), ["1", "2"])
-            self.assertIn('<option value="deadline" selected>', response.json["html"])
+        refreshed = self.post("/jobs/1/deadline/refresh" + query, {}, token)
+        self.assertEqual(refreshed.status_code, 202)
+        self.assertEqual(refreshed.json["id"], self.post("/refreshes" + query, {"post_id": 1}, token).json["id"])
+        snapshot = self.get("/jobs/1" + query, headers={**self.identity, "X-Dashboard-Snapshot": "1"})
+        self.assertEqual(saved.status_code, 200)
+        for html in (saved.json["html"], snapshot.get_data(as_text=True)):
+            self.assertEqual(row_ids(html), ["1", "2"])
+            self.assertIn('<option value="deadline" selected>', html)
 
-    def test_imported_application_can_edit_deadline_but_cannot_refresh_source(self):
+    def test_imported_application_offers_common_refresh_with_no_deadline_source(self):
         dashboard.store.import_profile_jobs(self.source, self.state, [{
             "source_key": "applications/legacy", "company": "회사", "role": "직무", "summary": "기존 지원",
             "confirmed_on": "2026-11-15", "source_url": "https://inthiswork.com/archives/1",
@@ -255,17 +318,51 @@ class WebTests(unittest.TestCase):
         token = self.csrf()
         self.assertEqual(self.post("/jobs/-1/deadline", {"mode": "manual", "kind": "unknown"}, token).status_code, 200)
         self.assertIsNotNone(dashboard.store.get_job(self.source, self.state, -1)["deadline_manual"])
-        self.assertEqual(self.post("/jobs/-1/deadline/refresh", {}, token).status_code, 400)
-        self.assertNotIn('id="deadline-refresh"', self.get("/jobs/-1").get_data(as_text=True))
+        run = self.post("/jobs/-1/deadline/refresh", {}, token)
+        self.assertEqual(run.status_code, 202)
+        finish = partial(refresh_queue.finish, self.state)
+        def external_call(*args, **kwargs):
+            self.fail("a profile record without JD must not reach a source or model")
+        refresh_sources.refresh_deadlines(self.source, self.state, refresh_queue.claim(self.state, "deadline", 1),
+                                          finish, fetch=external_call)
+        logo, = refresh_queue.claim(self.state, "logo", 1)
+        refresh_sources.refresh_logo_task(self.source, self.state, logo, finish, fetch=external_call)
+        fit_work.refresh_fit_tasks(self.source, self.state, refresh_queue.claim(self.state, "fit", 1),
+                                   finish, profile={}, runner=external_call)
+        self.assertEqual(self.get(f"/refreshes/{run.json['id']}").json["counts"]["skipped"], 2)
+        html = self.get("/jobs/-1").get_data(as_text=True)
+        self.assertIn('aria-label="현재 공고 새로고침"', html)
+        self.assertIn("공고 적합도 보류", html)
+        self.assertIn("원문", html.split('id="fit-heading"', 1)[1].split("</section>", 1)[0])
+
+    def test_historical_fit_evidence_quotes_the_verified_jd(self):
+        record = {"title": "회사｜직무", "lines": ["개인 지원 메모"], "jd": {
+            "title": "회사｜직무", "url": "https://example.org/jobs/10", "lines": ["필수 운영 경험"],
+            "jd_source": {"source": "official", "original_id": "10"},
+        }}
+        with sqlite3.connect(self.state) as db:
+            db.execute("INSERT INTO profile_posts VALUES(-1,'applications/legacy',?,'2026-11-15','2026-11-15')",
+                       (json.dumps(record),))
+        fit_work.refresh_fit_tasks(self.source, self.state, [{"id": 77, "post_id": -1, "version": ""}],
+                                   lambda *args: None, profile={"P1": "운영 경험"}, runner=scored_response)
+        html = self.get("/jobs/-1").get_data(as_text=True)
+        evidence = html.split('id="fit-heading"', 1)[1].split("</section>", 1)[0]
+        self.assertIn("필수 운영 경험", evidence)
+        self.assertNotIn("개인 지원 메모", evidence)
 
     def test_failed_source_request_leaves_existing_manual_value_and_memo(self):
         token = self.csrf()
         self.post("/jobs/1/state", {"status": "applied"}, token)
         self.post("/jobs/1/progress", {"stage": "interview1", "result": "in_progress", "note": "keep memo"}, token)
         self.post("/jobs/1/deadline", {"mode": "manual", "kind": "rolling", "word": "상시 채용"}, token)
-        with patch.object(dashboard, "refresh_one", side_effect=dashboard.SourceCheckFailed("마지막 확인값을 유지했어요.")):
-            response = self.post("/jobs/1/deadline/refresh", {}, token)
-        self.assertEqual(response.status_code, 502)
+        response = self.post("/jobs/1/deadline/refresh", {}, token)
+        self.assertEqual(response.status_code, 202)
+        def unavailable(*args, **kwargs):
+            raise TimeoutError
+        refresh_sources.refresh_deadlines(self.source, self.state, refresh_queue.claim(self.state, "deadline", 1),
+                                          partial(refresh_queue.finish, self.state), fetch=unavailable)
+        changes = self.get(f"/refreshes/{response.json['id']}").json["changes"]
+        self.assertEqual([(event["kind"], event["status"]) for event in changes], [("deadline", "failed")])
         job = dashboard.store.get_job(self.source, self.state, 1)
         self.assertEqual(job["deadline_label"], "상시 채용")
         self.assertEqual(job["progress"]["interview1"]["note"], "keep memo")

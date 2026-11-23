@@ -1,26 +1,30 @@
-"""Inthiswork JD collection and evidence-backed review queue (stdlib only)."""
+"""Inthiswork JD collection and evidence-backed review queue."""
 
 import argparse
 import hashlib
 import html
 import json
+import os
 import sqlite3
 import time
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-from fit_digest import checked_link, dashboard_origin, review_decision, review_digest
-from job_fit import evaluate_fit, read_fit
 from prototype_job_evidence import Document, application_link
+from fit_digest import checked_link, dashboard_origin, review_decision, review_digest
+from job_availability import _stamp, has_jd_content
+from job_fit import evaluate_fit, jd_input, read_fit
+from job_sources import linked_job_locator
 
 API = "https://inthiswork.com/wp-json/wp/v2/posts"
 FIELDS = "id,date_gmt,modified_gmt,link,title,content,categories"
 JOB_CATEGORIES = {191700167, 191700168}
 CLOSED = 191700169
+PENDING_LISTING_REVISION = "pending_listing_revision:"
 KST = timezone(timedelta(hours=9))
 DEFAULT_DB = Path(__file__).resolve().parent / "data/jobs.sqlite"
 
@@ -41,6 +45,10 @@ def connect(path):
         );
     """)
     return db
+
+
+def has_table(db, table):
+    return bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone())
 
 
 def has_fit_column(db):
@@ -97,6 +105,64 @@ def extract(post):
     }
 
 
+def _listing_link(url):
+    if not isinstance(url, str):
+        return None
+    parsed = urlsplit(url)
+    return parsed.scheme, parsed.netloc.casefold(), parsed.path.rstrip("/").removesuffix("/apply")
+
+
+def _job_links(doc):
+    if doc.get("apply_url"):
+        return [doc["apply_url"]]
+    return [item["url"] for item in doc.get("links", []) if isinstance(item, dict)
+            and "".join(str(item.get("text", "")).split()).lower() in
+            {"공식채용페이지", "채용페이지", "공고원문", "공고상세", "지원하러가기", "지원하기", "applynow"}]
+
+
+def preserve_jd(previous, listing):
+    if (previous.get("title") != listing["title"] or previous.get("url") != listing["url"]
+            or has_jd_content(listing) or not has_jd_content(previous)):
+        return listing
+    origin = previous.get("jd_source")
+    links = _job_links(listing)
+    if origin:
+        if (not isinstance(origin, dict) or not origin.get("url")
+                or (links and {_listing_link(url) for url in links} != {_listing_link(origin["url"])})):
+            return listing
+    else:
+        old_roles = {role for url in _job_links(previous) if (role := linked_job_locator(previous, url))}
+        new_roles = {role for url in links if (role := linked_job_locator(listing, url))}
+        if old_roles and new_roles and old_roles != new_roles:
+            return listing
+    fields = ("lines", "images", "content_status", "jd_source", "jd_organization", "jd_modified_gmt")
+    return {**listing, "listing_lines": listing["lines"], "listing_images": listing["images"],
+            **{key: previous[key] for key in fields if key in previous}}
+
+
+def save_document(db, doc):
+    post_id = doc["id"]
+    serialized = json.dumps(doc, ensure_ascii=False, sort_keys=True)
+    fingerprint = hashlib.sha256(serialized.encode()).hexdigest()
+    old = db.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
+    if old and old["fingerprint"] == fingerprint:
+        return fingerprint
+    if old is None:
+        db.execute("INSERT INTO posts(id,document,fingerprint) VALUES(?,?,?)", (post_id, serialized, fingerprint))
+    elif jd_input(json.loads(old["document"])) == jd_input(doc):
+        fit = read_fit(old)
+        db.execute("UPDATE posts SET document=?,fingerprint=? WHERE id=?", (serialized, fingerprint, post_id))
+        if fit:
+            fit["fingerprint"] = fingerprint
+            db.execute("UPDATE posts SET fit_review=? WHERE id=?", (json.dumps(fit, ensure_ascii=False), post_id))
+    else:
+        clear_fit = ",fit_review=NULL" if has_fit_column(db) else ""
+        clear_stamp = "" if has_table(db, "fit_delivery") else ",reviewed_at=NULL"
+        db.execute(f"""UPDATE posts SET document=?,fingerprint=?,decision=NULL,reason=NULL,
+            evidence_lines=NULL{clear_fit}{clear_stamp} WHERE id=?""", (serialized, fingerprint, post_id))
+    return fingerprint
+
+
 def collect(path, fetch_page=request_json, now=None, *, start=None, advance_checkpoint=True):
     now = now or datetime.now(timezone.utc)
     previous = checkpoint(path)
@@ -120,18 +186,27 @@ def collect(path, fetch_page=request_json, now=None, *, start=None, advance_chec
     result = {"new": 0, "changed": 0, "fetched_jobs": len(documents)}
     with closing(connect(path)) as db, db:
         db.execute("BEGIN IMMEDIATE")
-        clear_fit = ",fit_review=NULL" if has_fit_column(db) else ""
         for post_id, doc in documents.items():
-            serialized = json.dumps(doc, ensure_ascii=False, sort_keys=True)
-            fingerprint = hashlib.sha256(serialized.encode()).hexdigest()
-            old = db.execute("SELECT fingerprint FROM posts WHERE id=?", (post_id,)).fetchone()
-            if old is None:
-                db.execute("INSERT INTO posts(id,document,fingerprint) VALUES(?,?,?)",
-                           (post_id, serialized, fingerprint))
+            revision_key = PENDING_LISTING_REVISION + str(post_id)
+            old = db.execute("""SELECT p.document,p.fingerprint,m.value AS pending_revision
+                FROM posts p LEFT JOIN metadata m ON m.key=? WHERE p.id=?""", (revision_key, post_id)).fetchone()
+            if old:
+                previous_doc = json.loads(old["document"])
+                previous_time = _stamp(previous_doc.get("modified_gmt"))
+                incoming = _stamp(doc["modified_gmt"])
+                pending_time = _stamp(old["pending_revision"])
+                if pending_time and (not incoming or incoming < pending_time):
+                    continue
+                if previous_time and (not incoming or incoming < previous_time
+                        or (previous_doc.get("jd_source") and incoming == previous_time)):
+                    continue
+                doc = preserve_jd(previous_doc, doc)
+                if pending_time:
+                    db.execute("DELETE FROM metadata WHERE key=?", (revision_key,))
+            fingerprint = save_document(db, doc)
+            if not old:
                 result["new"] += 1
-            elif old[0] != fingerprint:
-                db.execute(f"""UPDATE posts SET document=?,fingerprint=?,decision=NULL,reason=NULL,
-                           evidence_lines=NULL,reviewed_at=NULL{clear_fit} WHERE id=?""", (serialized, fingerprint, post_id))
+            elif old["fingerprint"] != fingerprint:
                 result["changed"] += 1
         if advance_checkpoint:
             db.execute("INSERT OR REPLACE INTO metadata VALUES('last_success',?)", (now.isoformat(),))
@@ -250,6 +325,9 @@ def record_reviews(path, entries, digest=None, execution_id=None, *, dashboard_u
                 reviews.append((doc, entry, decision, fit))
             if decision != "needs_review" and not lines:
                 raise ValueError(f"Decision requires JD evidence: {post_id}")
+            if has_table(db, "fit_delivery"):
+                db.execute("UPDATE fit_delivery SET execution_id=coalesce(execution_id,?) WHERE post_id=?",
+                           (execution_id or "legacy",post_id))
             db.execute("UPDATE posts SET decision=?,reason=?,evidence_lines=?,reviewed_at=? WHERE id=?",
                        (decision, reason, json.dumps(lines), reviewed_at, post_id))
             if fit_column:
@@ -285,11 +363,30 @@ def status(path):
         return {row[0] or "pending": row[1] for row in db.execute("SELECT decision,count(*) FROM posts GROUP BY decision")}
 
 
+def scheduled_batch(db_path):
+    """Use the live backfill's fixed ID list while its controller holds the lock."""
+    import fcntl
+    lock = Path(db_path).parent / "backfill.lock"
+    if not lock.exists():
+        return None
+    with lock.open("r") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            state = json.loads(lock.with_name("backfill-status.json").read_text())
+            return state.get("batch_ids", [])
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("collect")
+    scheduled = sub.add_parser("scheduled")
+    scheduled.add_argument("--execution-id", required=True)
+    scheduled.add_argument("--dashboard-url")
+    scheduled.add_argument("--state", type=Path)
     sub.add_parser("migrate-fit")
     backfill = sub.add_parser("prepare-backfill")
     backfill.add_argument("--days", type=int, default=14)
@@ -307,6 +404,19 @@ def main():
     args = parser.parse_args()
     if args.command == "collect":
         result = {"collection": collect(args.db), "status": status(args.db), "pending": pending(args.db)}
+    elif args.command == "scheduled":
+        from fit_work import migrate, scheduled_review
+        state = args.state or Path(os.environ.get("DASHBOARD_STATE_DB", args.db.parent / "dashboard/dashboard.sqlite"))
+        ids = scheduled_batch(args.db)
+        if ids == []:
+            result = {"scheduled_digest":"[SILENT]"}
+        else:
+            with closing(connect(args.db)):
+                pass
+            migrate(args.db,state)
+            result = {"collection":collect(args.db)} if ids is None else {}
+            result["scheduled_digest"] = scheduled_review(args.db,state,args.execution_id,
+                                                          dashboard_url=args.dashboard_url,ids=ids)
     elif args.command == "migrate-fit":
         result = migrate_fit(args.db)
     elif args.command == "prepare-backfill":

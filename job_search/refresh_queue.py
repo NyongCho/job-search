@@ -1,0 +1,225 @@
+"""Durable subscriptions to independently committed deadline, logo and fit work."""
+import hashlib
+import json
+import sqlite3
+import time
+from contextlib import closing
+from pathlib import Path
+
+KINDS = ("deadline", "logo", "fit")
+STATUSES = ("queued", "running", "done", "failed", "skipped")
+
+
+def connect(path):
+    db = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True, timeout=5)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys=ON")
+    return db
+
+
+def create_tables(db):
+    for statement in (
+        """CREATE TABLE IF NOT EXISTS refresh_runs (
+            id INTEGER PRIMARY KEY, scope TEXT NOT NULL, signature TEXT NOT NULL, created REAL NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS refresh_receipts (
+            request_id TEXT PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES refresh_runs(id))""",
+        """CREATE TABLE IF NOT EXISTS refresh_groups (
+            id INTEGER PRIMARY KEY, post_id INTEGER NOT NULL, version TEXT NOT NULL, applied_version TEXT)""",
+        """CREATE INDEX IF NOT EXISTS refresh_group_version ON refresh_groups(post_id,version,id)""",
+        """CREATE TABLE IF NOT EXISTS refresh_work (
+            id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL REFERENCES refresh_groups(id),
+            post_id INTEGER NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
+            ready_at REAL NOT NULL DEFAULT 0, recheck INTEGER NOT NULL DEFAULT 0, message TEXT NOT NULL DEFAULT '',
+            fit_run_id INTEGER REFERENCES refresh_runs(id), UNIQUE(group_id,kind))""",
+        """CREATE INDEX IF NOT EXISTS refresh_pending ON refresh_work(kind,status,ready_at,id)""",
+        """CREATE TABLE IF NOT EXISTS refresh_members (
+            run_id INTEGER NOT NULL REFERENCES refresh_runs(id), group_id INTEGER NOT NULL REFERENCES refresh_groups(id),
+            PRIMARY KEY(run_id,group_id))""",
+        """CREATE INDEX IF NOT EXISTS refresh_subscribers ON refresh_members(group_id,run_id)""",
+        """CREATE TABLE IF NOT EXISTS refresh_changes (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, work_id INTEGER NOT NULL UNIQUE REFERENCES refresh_work(id))""",
+        """CREATE INDEX IF NOT EXISTS refresh_scope ON refresh_runs(scope,id)""",
+    ):
+        db.execute(statement)
+    if "fit_run_id" not in {row[1] for row in db.execute("PRAGMA table_info(refresh_work)")}:
+        db.execute("ALTER TABLE refresh_work ADD COLUMN fit_run_id INTEGER REFERENCES refresh_runs(id)")
+
+
+def _recheck_fits(db, run):
+    # The web process never reads career files. Ask the same work item to consult its input cache
+    # after an explicit new click, including one received while an older answer was being scored.
+    db.execute("""UPDATE refresh_work SET fit_run_id=CASE WHEN recheck=0 THEN ? ELSE fit_run_id END,
+        recheck=(status='running'),
+        status=CASE WHEN status='running' THEN status ELSE 'queued' END
+        WHERE kind='fit' AND status<>'queued' AND group_id IN
+        (SELECT group_id FROM refresh_members WHERE run_id=?)""", (run, run))
+
+
+def enqueue(path, targets, scope, request_id=None):
+    encoded = json.dumps(sorted(set(map(tuple, targets))))
+    signature = hashlib.sha256(encoded.encode()).hexdigest()
+    with closing(connect(path)) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        if request_id:
+            saved = db.execute("""SELECT r.id,r.scope FROM refresh_runs r JOIN refresh_receipts t ON t.run_id=r.id
+                                  WHERE t.request_id=?""",(request_id,)).fetchone()
+            if saved:
+                if saved["scope"] != scope:
+                    raise ValueError("이 요청 번호는 다른 새로고침에 사용됐어요.")
+                return saved["id"]
+        existing = db.execute("""SELECT r.id FROM refresh_runs r WHERE scope=? AND signature=? AND EXISTS(
+            SELECT 1 FROM refresh_members m JOIN refresh_work w USING(group_id)
+            WHERE m.run_id=r.id AND w.status IN ('queued','running')) ORDER BY r.id DESC LIMIT 1""",
+                              (scope, signature)).fetchone()
+        if existing:
+            _recheck_fits(db, existing[0])
+            if request_id:
+                db.execute("INSERT INTO refresh_receipts VALUES(?,?)", (request_id, existing[0]))
+            return existing[0]
+        run = db.execute("INSERT INTO refresh_runs(scope,signature,created) VALUES(?,?,?)",
+                         (scope, signature, time.time())).lastrowid
+        if request_id:
+            db.execute("INSERT INTO refresh_receipts VALUES(?,?)", (request_id, run))
+        # Resolve all overlapping jobs against the same pre-insert snapshot.
+        db.execute("""CREATE TEMP TABLE targets AS
+            WITH requested AS (
+                SELECT json_extract(value,'$[0]') AS post_id, json_extract(value,'$[1]') AS version
+                FROM json_each(?))
+            SELECT post_id, version, (
+                SELECT g.id FROM refresh_groups g WHERE g.post_id=t.post_id
+                AND (g.version=t.version OR g.applied_version=t.version) AND EXISTS (
+                    SELECT 1 FROM refresh_work w WHERE w.group_id=g.id AND w.status IN ('queued','running'))
+                ORDER BY g.id DESC LIMIT 1) AS active_group FROM requested t""", (encoded,))
+        created = db.execute("""INSERT INTO refresh_groups(post_id,version)
+            SELECT post_id,version FROM targets WHERE active_group IS NULL RETURNING id,post_id""").fetchall()
+        if created:
+            new_groups = json.dumps([tuple(row) for row in created])
+            db.execute("""INSERT INTO refresh_work(group_id,post_id,kind)
+                SELECT json_extract(g.value,'$[0]'),json_extract(g.value,'$[1]'),k.value
+                FROM json_each(?) g CROSS JOIN json_each(?) k""", (new_groups, json.dumps(KINDS)))
+            db.execute("""INSERT INTO refresh_members(run_id,group_id)
+                SELECT ?,json_extract(value,'$[0]') FROM json_each(?)""", (run, new_groups))
+        db.execute("""INSERT INTO refresh_members(run_id,group_id)
+            SELECT DISTINCT ?,active_group FROM targets WHERE active_group IS NOT NULL""", (run,))
+        _recheck_fits(db, run)
+        return run
+
+
+def claim(path, kind, limit, *, now=None):
+    if kind not in KINDS or type(limit) is not int or limit < 1:
+        raise ValueError("Invalid refresh claim")
+    with closing(connect(path)) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        tasks = db.execute("""SELECT w.id,w.post_id,g.version,w.kind,d.id AS source_work_id,d.status AS source_status,
+            coalesce(w.fit_run_id,(SELECT min(run_id) FROM refresh_members m WHERE m.group_id=g.id)) AS run_id
+            FROM refresh_work w JOIN refresh_groups g ON g.id=w.group_id
+            JOIN refresh_work d ON d.group_id=g.id AND d.kind='deadline'
+            WHERE w.kind=? AND w.status='queued' AND w.ready_at<=?
+            AND (w.kind<>'fit' OR d.status NOT IN ('queued','running'))
+            ORDER BY w.ready_at,w.id LIMIT ?""", (kind, time.time() if now is None else now, limit)).fetchall()
+        db.executemany("UPDATE refresh_work SET status='running' WHERE id=?", ((t["id"],) for t in tasks))
+        return [dict(t) for t in tasks]
+
+
+def reset_running(path):
+    # The service holds a per-state-DB process lock before recovering an interrupted owner.
+    with closing(connect(path)) as db, db:
+        db.execute("UPDATE refresh_work SET status='queued',ready_at=0,recheck=0 WHERE status='running'")
+
+
+def defer(path, task):
+    with closing(connect(path)) as db, db:
+        db.execute("UPDATE refresh_work SET status='queued',ready_at=? WHERE id=? AND status='running'",
+                   (time.time() + 0.5, task["id"]))
+
+
+def progress(db, task):
+    db.execute("""INSERT OR REPLACE INTO refresh_changes(work_id)
+        SELECT id FROM refresh_work WHERE id=? AND status='running'""", (task["id"],))
+
+
+def finish(path, task, status, message="", *, db=None):
+    if status not in ("done", "failed", "skipped"):
+        raise ValueError("Invalid refresh result")
+    if db is None:
+        with closing(connect(path)) as handle, handle:
+            return finish(path, task, status, message, db=handle)
+    updated = db.execute("""UPDATE refresh_work SET status=CASE WHEN recheck=1 THEN 'queued' ELSE ? END,
+                         recheck=0,message=? WHERE id=? AND status='running'""",
+                         (status, message, task["id"]))
+    if updated.rowcount:
+        if task.get("applied_version"):
+            db.execute("UPDATE refresh_groups SET applied_version=? WHERE id=(SELECT group_id FROM refresh_work WHERE id=?)",
+                       (task["applied_version"], task["id"]))
+        db.execute("INSERT OR REPLACE INTO refresh_changes(work_id) VALUES(?)", (task["id"],))
+
+
+def _snapshot(db, run, after):
+    if not db.execute("SELECT 1 FROM refresh_runs WHERE id=?", (run,)).fetchone():
+        raise LookupError("Unknown refresh")
+    counts = dict.fromkeys(STATUSES, 0)
+    counts.update(db.execute("""SELECT status,count(*) FROM refresh_members m JOIN refresh_work w USING(group_id)
+        WHERE run_id=? GROUP BY status""", (run,)))
+    query = """ FROM refresh_changes c JOIN refresh_work w ON w.id=c.work_id
+        JOIN refresh_members m ON m.group_id=w.group_id WHERE m.run_id=?"""
+    cursor = db.execute("SELECT coalesce(max(seq),0)" + query, (run,)).fetchone()[0]
+    changes = [] if after is None else [dict(r) for r in db.execute(
+        "SELECT seq,w.post_id,w.kind,w.status,w.message" + query + " AND seq>? ORDER BY seq", (run, after))]
+    return {"id": run, "counts": counts, "cursor": cursor, "changes": changes,
+            "complete": not (counts["queued"] or counts["running"])}
+
+
+def snapshot(path, run, after=None):
+    with closing(connect(path)) as db:
+        db.execute("BEGIN")
+        return _snapshot(db, run, after)
+
+
+def activity(path):
+    # A job outside this page can enter its tab or change the sidebar totals.
+    with closing(connect(path)) as db:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='refresh_changes'").fetchone():
+            return {"cursor": 0, "active": False}
+        row = db.execute("""SELECT (SELECT coalesce(max(seq),0) FROM refresh_changes),
+            EXISTS(SELECT 1 FROM refresh_work WHERE kind IN ('deadline','logo','fit')
+                   AND status IN ('queued','running'))""").fetchone()
+        return {"cursor": row[0], "active": bool(row[1])}
+
+
+def find(path, scope, targets):
+    # One consistent read covers navigation during a commit on either side of a page boundary.
+    with closing(connect(path)) as db:
+        db.execute("BEGIN")
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='refresh_runs'").fetchone():
+            return []
+        candidates = db.execute("""SELECT r.id,r.scope, EXISTS(SELECT 1 FROM refresh_members m
+            JOIN refresh_work w USING(group_id) WHERE m.run_id=r.id AND w.status IN ('queued','running')) AS active
+            FROM refresh_runs r WHERE r.scope=? OR EXISTS(SELECT 1 FROM refresh_members m
+            JOIN refresh_groups g ON g.id=m.group_id WHERE m.run_id=r.id AND g.post_id IN
+            (SELECT value FROM json_each(?))) ORDER BY r.id DESC""", (scope, json.dumps(targets)))
+        ids = []
+        exact = newest = None
+        for row in candidates:
+            run = row["id"]
+            if newest is None:
+                newest = run
+            if exact is None and row["scope"] == scope:
+                exact = run
+            if row["active"] or run == exact:
+                ids.append(run)
+        if not ids and newest is not None:
+            ids.append(newest)
+        return [_snapshot(db, run, None) for run in ids]
+
+
+def receipt(path, request_id):
+    with closing(connect(path)) as db:
+        db.execute("BEGIN")
+        row = db.execute("SELECT run_id FROM refresh_receipts WHERE request_id=?", (request_id,)).fetchone()
+        return [_snapshot(db, row[0], None)] if row else []
+
+
+def fit_work_ids(path, run):
+    with closing(connect(path)) as db:
+        return [r[0] for r in db.execute("""SELECT w.id FROM refresh_work w JOIN refresh_members m USING(group_id)
+            WHERE run_id=? AND kind='fit'""", (run,))]

@@ -169,6 +169,37 @@ class PortableSkillTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "current")
 
+    def test_installed_scheduled_path_reuses_refresh_and_creates_one_delivery(self):
+        self.assertEqual(self.prepare().returncode, 0)
+        source = self.base / "source.sqlite"
+        collect_jobs.collect(source,lambda _: ([posting(1,'<p>배포</p><p>지원 마감 2099-01-01</p><a href="https://employer.example/1">지원하러 가기</a>')],1))
+        portable = self.workspace / "data/jobs.sqlite"
+        portable.parent.mkdir()
+        shutil.copyfile(source,portable)
+        scenario = """
+from fit_work import refresh_fit_tasks,scheduled_review
+from pathlib import Path
+import sqlite3
+db=Path("data/jobs.sqlite")
+state=db.with_name("state.sqlite")
+def evaluate(attempt,profile,docs):
+    doc,=docs
+    return {"calls":1,"entries":[{"id":1,"version":doc["version"],"decision":"recommend","reason":"운영 경험",
+             "evidence_lines":[1],"required_summary":"배포","assessment":{"version":1,"complete":True,
+             "eligibility":"eligible","preference":"preferred","criteria":[{"key":"deploy","label":"배포",
+             "category":"work","status":"met","evidence":"배포 담당","evidence_lines":[1],
+             "profile_ids":["P1"],"quotes":["배포"]}]}}]}
+profile={"P1":"배포 담당"}
+refresh_fit_tasks(db,state,[{"id":1,"post_id":1}],lambda *args:None,profile=profile,runner=evaluate)
+def duplicate(*args): raise AssertionError("duplicate model call")
+assert "100.0점" in scheduled_review(db,state,"scheduled",profile=profile,runner=duplicate)
+assert scheduled_review(db,state,"next",profile=profile,runner=duplicate)=="[SILENT]"
+with sqlite3.connect(db) as conn:
+    assert conn.execute("SELECT count(*) FROM outbox").fetchone()[0]==1
+"""
+        result = subprocess.run([sys.executable,"-c",scenario],cwd=self.workspace,capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+
     def backfill_fixture(self, fail_restore=False):
         self.assertEqual(self.prepare().returncode, 0)
         cron = self.hermes / "hermes-agent/cron"

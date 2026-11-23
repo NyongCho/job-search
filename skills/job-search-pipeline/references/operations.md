@@ -10,8 +10,10 @@
 - 전체 추천 실행은 기존 작업 ID에 대해 설치된 Hermes의 `cron run JOB_ID` 또는 cron 도구의 `action=run`을 사용한다. 새 작업을 만들지 않는다.
 - 프리런 스크립트는 **한 개의 실제 활성 Hermes 실행**을 요구한다. 직접 실행해 가짜 실행 ID를 주입하지 않는다.
 - `collect_jobs.py --db PATH status|pending|show|review`를 이용한다. `--db`는 하위 명령 앞에 온다. `status`도 새 DB를 만들 수 있으므로 기존 경로 존재 여부를 확인한다.
-- 판단 계약과 명령 예시는 대상의 `hermes_job_prompt.txt`를 따른다. `needs_review`는 보관 상태이며 자동 재검토 대상이 아니다.
-- 적합도 평가를 지원하는 독립 설치에서 기존 DB를 연결할 때는 `python3 collect_jobs.py --db 기존DB migrate-fit`으로 평가 열을 추가한 뒤 등록된 작업 프롬프트를 갱신한다. 새 형식의 `review … --execution-id …`는 전달문을 출력한다. 질문만 있는 배치도 같은 방식으로 전달하고 대기 중인 문구는 그대로 재시도한다. 구형 프롬프트는 기존 `--digest` 형식을 사용한다.
+- 프리런은 활성 실행의 기존 미전달 추천부터 회수한다. 신규 공고는 `collect_jobs.py scheduled --execution-id ID`로 처리하고, 외부 Hermes 작업은 반환된 `scheduled_digest`만 전달한다. 설치된 프리런이 활성 ID와 작업 프로필을 제공한다.
+- 기존 DB는 활성 쓰기가 끝난 뒤 백업하고, Hermes 프로필 환경에서 `python3 fit_work.py --db data/jobs.sqlite --state data/dashboard/dashboard.sqlite`로 이전한다. 이때 기존 평가 기준 S0가 고정된다. 그런 다음 배포된 전달 전용 프롬프트로 정기 작업을 전환한다.
+- 평가 기준은 `memories/USER.md`, `memories/MEMORY.md`의 경력 관련 문단과 명시적으로 연결된 경력 문서를 사용한다. 별도로 연결할 파일은 `FIT_PROFILE_FILES`에 경로 구분자로 지정한다. 기본 `FIT_BATCH_SIZE=3`, `FIT_CONCURRENCY=1`이다. 모델 실행은 Hermes의 도구 없는 독립 세션을 사용한다.
+- `fit_items`는 JD와 사용자 답변별 평가 결과를, `fit_attempts`는 실제 세션별 사용량을 보관한다. `uncertain`이면 `<DB>.fit-runs`의 해당 세션 출력과 제출 상태를 확인한다. 이전 실행이 남긴 출력은 다음 워커에서 회수한다.
 
 ## 기간 일괄 처리
 

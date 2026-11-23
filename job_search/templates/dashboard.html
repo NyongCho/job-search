@@ -1,10 +1,19 @@
 {% from 'deadline.html' import deadline_icon, deadline_content, editor %}
+{% macro company_mark(job) -%}
+{% if job.has_company_logo %}<img class="company-logo" src="{{ url_for('company_logo', post_id=job.id, v=job.logo_version) }}" alt="" width="24" height="24">{% else %}<span class="company-avatar" aria-hidden="true">{{ job.company[0] }}</span>{% endif %}
+{%- endmacro %}
+{% macro refresh_status(runs) -%}
+<p class="refresh-status"><span data-refresh-status role="status"></span><span data-refresh-usage>
+  {%- for run in runs|sort(attribute='id') %}<a data-run-id="{{ run.id }}" href="{{ url_for('refresh_status', run=run.id, view='usage') }}" target="_blank" rel="noopener" aria-label="새로고침 {{ run.id }} 모델 사용량 (새 탭)">모델 사용량{% if runs|length > 1 %} #{{ run.id }}{% endif %}</a>{% endfor -%}
+</span></p>
+{%- endmacro %}
 <!doctype html>
 <html lang="ko">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="csrf-token" content="{{ session.get('csrf_token', '') }}">
+  {% if shell %}<noscript><meta http-equiv="refresh" content="0;url={{ url_for(request.endpoint, **dict(request.view_args, view=view, q=q, sort=listing.sort, page=listing.page, render='full')) }}"></noscript>{% endif %}
   <meta name="theme-color" content="#f6f7f9">
   <title>{% if detail %}{{ detail.company }} · {% endif %}나의 채용함</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
@@ -30,14 +39,15 @@
     </div>
     {% endif %}
   </aside>
-  <main id="main" class="main-shell">
+  <main id="main" class="main-shell"{% if not error %} data-dashboard data-view="{{ view }}" data-query="{{ q }}" data-runs='{{ runs|tojson }}' data-activity='{{ activity|tojson }}'{% endif %}>
     {% if error %}
       <section class="error-page"><span class="eyebrow">{{ error.code }}</span><h1>{{ error.message }}</h1><a class="primary-button" href="{{ url_for('index') }}">채용함으로 돌아가기</a></section>
     {% else %}
       <section class="page-heading">
         <h1>{{ views[view] }} 공고<span class="heading-dot">.</span></h1>
-        <div class="sync-info"><span>마지막 수집 {{ listing.last_collected_at|kst }}</span><a class="refresh-button" href="{{ request.full_path.rstrip('?') }}" aria-label="현재 목록 새로고침">↻</a></div>
+        <div class="sync-info"><span class="collection-time">{% if not shell %}마지막 수집 {{ listing.last_collected_at|kst }}{% endif %}</span><button type="button" class="refresh-button" data-refresh="list" aria-label="현재 목록 새로고침" title="현재 목록 새로고침">↻</button></div>
       </section>
+      {{ refresh_status(list_runs) }}
       <section class="summary-strip" aria-label="지원 현황">
         <a href="{{ url_for('index',view='recommended') }}"><span class="summary-icon teal">✦</span><span>살펴볼 추천<strong>{{ listing.counts.recommended }}<small>건</small></strong></span></a>
         <a href="{{ url_for('index',view='interested') }}"><span class="summary-icon amber">♡</span><span>관심 있는 기회<strong>{{ listing.counts.interested }}<small>건</small></strong></span></a>
@@ -46,7 +56,7 @@
       </section>
       <section class="inbox-panel">
         <div class="inbox-toolbar">
-          <div class="list-title">{{ views[view] }} 목록 <span>{{ listing.total }}건{% if listing.question_total %} · 확인 질문 {{ listing.question_total }}건{% endif %}</span></div>
+          <div class="list-title">{{ views[view] }} 목록 <span>{% if shell %}…{% else %}{{ listing.total }}건{% if listing.question_total %} · 확인 질문 {{ listing.question_total }}건{% endif %}{% endif %}</span></div>
           <form class="search-form" action="{{ url_for('index') }}" method="get">
             <input type="hidden" name="view" value="{{ view }}">
             <input name="q" value="{{ q }}" maxlength="200" placeholder="현재 보기에서 검색" aria-label="현재 보기에서 회사·직무·추천 이유 검색">
@@ -59,13 +69,22 @@
           </form>
         </div>
         <div class="inbox-grid">
-          <section id="job-list" class="job-list" aria-label="공고 목록" data-scroll-key="{{ view }}:{{ listing.sort }}:{{ q }}:{{ listing.page }}">
+          <section id="job-list" class="job-list" tabindex="-1" aria-label="공고 목록" aria-busy="{{ 'true' if shell else 'false' }}" data-page="{{ listing.page }}" data-scroll-key="{{ view }}:{{ listing.sort }}:{{ q }}:{{ listing.page }}">
+            {% if shell %}
+            <span class="visually-hidden" role="status">공고를 불러오는 중입니다.</span>
+            {% for _ in range(4) %}
+            <div class="skeleton-card" aria-hidden="true">
+              <div class="company-line"><i class="sk-logo"></i><i class="sk-company"></i><i class="sk-deadline"></i></div>
+              <i class="sk-title"></i><i class="sk-reason"></i><i class="sk-tag"></i>
+            </div>
+            {% endfor %}
+            {% else %}
             {% for item in listing['items'] %}
             {% if view == 'recommended' and item.fit_group == 'question' and loop.changed(item.fit_group) %}
             <h2 class="list-group-title">{{ fit_groups[item.fit_group] }}</h2>
             {% endif %}
-            <a class="job-row {% if detail and detail.id == item.id %}selected{% endif %}" href="{{ url_for('detail',post_id=item.id,view=view,q=q,sort=listing.sort,page=listing.page) }}" {% if detail and detail.id == item.id %}aria-current="true"{% endif %}>
-              <div class="company-line">{% if item.has_company_logo %}<img class="company-logo" src="{{ url_for('company_logo', post_id=item.id) }}" alt="" width="24" height="24" loading="lazy">{% else %}<span class="company-avatar" aria-hidden="true">{{ item.company[0] }}</span>{% endif %}<span class="company-name">{{ item.company }}</span><span class="deadline-badge {{ item.deadline_kind }}">{{ deadline_content(item) }}</span></div>
+            <a class="job-row {% if detail and detail.id == item.id %}selected{% endif %}" href="{{ url_for('detail',post_id=item.id,view=view,q=q,sort=listing.sort,page=listing.page) }}" data-job-id="{{ item.id }}" {% if detail and detail.id == item.id %}aria-current="true"{% endif %}>
+              <div class="company-line">{{ company_mark(item) }}<span class="company-name">{{ item.company }}</span><span class="deadline-badge {{ item.deadline_kind }}">{{ deadline_content(item) }}</span></div>
               <div class="job-row-title">{{ item.role }}</div>
               {% if item.fit %}
               <p class="fit-preview">{% if item.fit.score is not none %}적합도 {{ '%.1f'|format(item.fit.score) }}점{% else %}적합도 보류{% endif %}{% if item.fit_group in ('preferred', 'outside') %} · {{ fit_groups[item.fit_group] }}{% endif %}</p>
@@ -94,21 +113,24 @@
             </div>
             {% endfor %}
             <div class="pagination"><span>{{ listing.page }} / {{ listing.total_pages }} 페이지</span><div>{% if listing.page > 1 %}<a href="{{ url_for('index',view=view,q=q,sort=listing.sort,page=listing.page-1) }}" aria-label="이전 페이지">←</a>{% endif %}{% if listing.page < listing.total_pages %}<a href="{{ url_for('index',view=view,q=q,sort=listing.sort,page=listing.page+1) }}" aria-label="다음 페이지">→</a>{% endif %}</div></div>
+            {% endif %}
           </section>
           {% if detail %}
           <article id="job-detail" class="job-detail" data-job-id="{{ detail.id }}" data-reviewed-at="{{ detail.reviewed_at or '' }}">
             <a class="back-link" href="{{ url_for('index',view=view,q=q,sort=listing.sort,page=listing.page) }}">← 목록으로</a>
             <div class="detail-topline">
-              <span class="detail-company">{{ detail.company }}</span>
+              <div class="detail-company">{{ company_mark(detail) }}<span>{{ detail.company }}</span></div>
               <div class="deadline-tools">
                 <button class="deadline-badge {{ detail.deadline_kind }}" id="deadline-edit" type="button" title="마감 정보 수정" aria-label="마감 정보 수정 · {{ detail.deadline_label }}" aria-haspopup="dialog" aria-expanded="false">{{ deadline_content(detail) }}</button>
-                {% if detail.can_refresh_deadline %}<button id="deadline-refresh" class="deadline-refresh" type="button" title="마감 정보 다시 확인" aria-label="마감 정보 다시 확인">{{ deadline_icon('refresh') }}</button>{% endif %}
+                <button data-refresh="detail" class="deadline-refresh" type="button" title="현재 공고 새로고침" aria-label="현재 공고 새로고침">{{ deadline_icon('refresh') }}</button>
               </div>
             </div>
             <h2>{{ detail.role }}</h2><div class="detail-meta">{% if detail.source_kind == 'profile' %}기록 가져옴 {{ detail.recorded_at|kst }} · 실제 지원일과 다릅니다{% else %}추천 검토 {{ detail.reviewed_at|kst }} <span>·</span> 게시 {{ detail.published_at|kst }}{% endif %} <span class="decision-tag {{ 'expired' if detail.is_expired else detail.display_decision or 'pending' }}">{{ '만료' if detail.is_expired else '기존 지원 기록' if detail.source_kind == 'profile' else decisions.get(detail.display_decision,'검토 대기') }}</span></div>
+            {{ refresh_status(detail_runs) }}
             <p id="deadline-status" class="deadline-status" role="status"></p>
             <div class="detail-actions">{% if detail.apply_url %}<a class="{{ 'source-button' if detail.is_expired else 'primary-button' }}" href="{{ detail.apply_url }}" target="_blank" rel="noopener noreferrer">{{ '마감·재공고 확인' if detail.is_expired else '지원 페이지 열기' }} <span aria-hidden="true">↗</span></a>{% elif detail.source_kind != 'profile' and not detail.is_expired %}<button class="primary-button" disabled>지원 링크 미확인</button>{% endif %}{% if detail.source_url %}<a class="source-button" href="{{ detail.source_url }}" target="_blank" rel="noopener noreferrer">{{ '원본 지원 자료 보기' if detail.source_kind == 'profile' else '원문 보기' }} ↗</a>{% endif %}</div>
             {{ editor(detail) }}
+            <div id="detail-fit">
             <section class="fit-card"><div class="section-label"><span aria-hidden="true">✦</span> {{ '지원 기록' if detail.source_kind == 'profile' else '추천 이유' if detail.display_decision == 'recommend' else '검토 내용' }}</div><p>{{ detail.reason or '아직 검토가 완료되지 않았어요. 공고 원문을 먼저 살펴볼 수 있어요.' }}</p></section>
             {% if detail.fit %}
             <section class="fit-evidence" aria-labelledby="fit-heading">
@@ -116,7 +138,7 @@
               {% if detail.fit.score is not none %}<p>획득 {{ '%.1f'|format(detail.fit.earned) }}점 / 적용 배점 {{ '%g'|format(detail.fit.possible) }}점 × 100</p>{% endif %}
               {% if detail.fit.hold_reason %}<p>{{ detail.fit.hold_reason }}</p>{% endif %}
               {% if detail.fit.question %}<p class="fit-question"><strong>확인 질문</strong> {{ detail.fit.question }}</p>{% endif %}
-              {% for key, name in fit_categories.items() %}
+              {% for key, name in fit_categories.items() if detail.fit.breakdown %}
               {% set points = detail.fit.breakdown[key] %}
               <h4>{{ name }} <span>{% if points.possible %}{% if points.earned is none %}미확인{% else %}{{ '%.1f'|format(points.earned) }}{% endif %} / {{ '%g'|format(points.possible) }}점{% else %}별도 배점 없음{% endif %}</span></h4>
               {% for criterion in detail.fit.criteria if criterion.category == key %}
@@ -124,13 +146,14 @@
                 <strong>{{ criterion.label }}</strong> · {{ fit_statuses[criterion.status] }}{% if criterion.status == 'tenure' %} {{ criterion.months }}개월 / 요구 {{ criterion.required_months }}개월{% endif %}
                 {% if criterion.earned is not none %}<span>({{ '%.1f'|format(criterion.earned) }} / {{ '%.1f'|format(criterion.possible) }}점)</span>{% endif %}
                 {% if criterion.evidence %}<p>{{ criterion.evidence }}</p>{% endif %}
-                {% for n in criterion.evidence_lines %}<blockquote><span class="line-label">L{{ n }}</span>{{ detail.lines[n-1] }}</blockquote>{% endfor %}
+                {% for n in criterion.evidence_lines %}<blockquote><span class="line-label">L{{ n }}</span>{{ (detail.fit_lines|default(detail.lines))[n-1] }}</blockquote>{% endfor %}
               </div>
               {% endfor %}
               {% endfor %}
             </section>
             {% elif detail.reviewed_at and detail.source_kind != 'profile' %}<p class="fit-preview">공고 적합도 미산정</p>
             {% endif %}
+            </div>
             {% include 'company_review.html' %}
             <section class="personal-section"><div class="section-label">내 지원 상태</div><p class="section-hint">지원 페이지를 열어도 지원 완료로 바뀌지 않아요.</p><div class="state-buttons" role="group" aria-label="지원 상태 변경">{% for state,label in statuses.items() %}{% if state != "unmarked" or detail.source_kind != "profile" %}<button type="button" data-status="{{ state }}" aria-pressed="{{ 'true' if detail.status == state else 'false' }}" class="state-button {% if detail.status == state %}active{% endif %}">{{ '표시 해제' if state == 'unmarked' else label }}</button>{% endif %}{% endfor %}</div><p id="save-status" class="save-status" role="status" aria-live="polite"></p></section>
             {% if detail.status == 'applied' %}
@@ -156,10 +179,12 @@
               </div>
             </section>
             {% endif %}
+            <div id="detail-evidence">
             {% if detail.display_error %}<p class="content-warning">{{ detail.display_error }}</p>{% endif %}
             {% if detail.evidence_lines %}<section class="evidence-section"><div class="section-label">판단에 참고한 JD</div>{% for n in detail.evidence_lines %}<blockquote><span class="line-label">L{{ n }}</span>{{ detail.lines[n-1] }}</blockquote>{% endfor %}</section>{% endif %}
             <details class="jd-section"><summary>{{ '가져온 당시 지원 자료' if detail.source_kind == 'profile' else '저장된 공고 본문' }} <span>{{ detail.lines|length }}줄</span></summary><div class="jd-lines">{% for line in detail.lines %}<p><span class="line-label">{{ loop.index }}</span>{{ line }}</p>{% else %}<p>저장된 텍스트가 없어요. 공고 원문에서 확인해 주세요.</p>{% endfor %}</div></details>
             {% if detail.images %}<div class="image-links">{% for image in detail.images %}<a href="{{ image.url }}" target="_blank" rel="noopener noreferrer">{{ image.alt or '공고 이미지 ' ~ loop.index }} ↗</a>{% endfor %}</div>{% endif %}
+            </div>
             <div class="detail-footnote">{{ '지원 기록' if detail.source_kind == 'profile' else '공고' }} #{{ detail.id }} · {{ detail.source_label }}</div>
           </article>
           {% else %}

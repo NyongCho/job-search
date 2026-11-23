@@ -42,6 +42,10 @@ def verify_completion_notice(execution):
 def snapshot(db_path, target_ids):
     with sqlite3.connect(db_path) as db:
         rows = dict(db.execute("SELECT id,decision FROM posts"))
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='fit_delivery'").fetchone():
+            for post_id, in db.execute("SELECT post_id FROM fit_delivery WHERE execution_id IS NULL"):
+                if post_id in rows:
+                    rows[post_id] = None
     missing = set(target_ids) - rows.keys()
     if missing:
         raise ValueError(f"Manifest jobs absent from database: {sorted(missing)}")
@@ -128,20 +132,8 @@ def main():
             if not pending and not outstanding:
                 break
             batch = pending[:100]
-            instructions = (
-                "\n이번 실행은 사용자가 요청한 최근 2주 전체 검토의 연속 배치입니다. "
-                f"수집 기간: {manifest['start_kst']} ~ {manifest['end_kst']}.\n"
-                f"이번 배치 ID: {json.dumps(batch)}\n"
-                "위 ID만 검토하세요. pending 목록에서 임의로 몇 개만 고르지 마세요. "
-                "retry_digests가 있으면 기존 복구 지시가 우선입니다. "
-                "그 외에는 배치의 모든 ID에 대해 JD를 읽고 recommend/exclude/needs_review를 기록한 뒤 종료하세요. "
-                "도중에 추천을 찾았어도 나머지를 생략하지 마세요. 모든 항목은 이번 실행의 JSON 한 파일로 모아 review를 한 번 호출하세요. "
-                "이미지 위주 공고에서 실제 JD를 확보할 수 없으면 needs_review로 남기세요. "
-                "원문의 마감일이 현재 한국시간보다 지났거나 마감 표시가 있으면 추천하지 마세요. "
-                "마감일이 없으면 공식 채용 페이지의 실제 모집/지원 가능 상태를 확인해야 추천할 수 있습니다. "
-                "열린 지원 페이지나 미래 마감일을 확인하지 못한 공고는 needs_review로 보류하세요. "
-                "이번 실행에 설정된 기본 프롬프트의 결과 보관 및 최종 전달 지시를 따르세요. 이번 배치에 전체 완료 알림을 추가하지 마세요.\n"
-            )
+            instructions = ("\n이번 실행은 지정 기간 공고 검토 배치입니다. 프리런이 고정 ID의 평가를 처리했습니다. "
+                            "retry_digests가 있으면 기존 전달문만, 그 외에는 scheduled_digest를 그대로 반환하세요.\n")
             save("running", batch_ids=batch, delivery_retries=outstanding)
             run(base_prompt + instructions)
             _, after = snapshot(db_path, target_ids)

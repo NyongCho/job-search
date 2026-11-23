@@ -179,10 +179,14 @@ class LogoTests(unittest.TestCase):
         client = app.test_client()
         headers = {"Tailscale-User-Login": "owner@example.com"}
         base = "https://dashboard.example"
-        body = client.get("/", base_url=base, headers=headers).get_data(as_text=True)
-        self.assertIn('src="/jobs/1/logo"', body)
+        body = client.get("/jobs/1", base_url=base, headers=headers).get_data(as_text=True)
+        logo = body.split('src="/jobs/1/logo?v=', 1)
+        self.assertEqual(len(logo), 2, "a cached logo must include its version")
+        version = logo[1].split('"', 1)[0]
+        self.assertTrue(version)
+        self.assertEqual(body.count(f'src="/jobs/1/logo?v={version}"'), 2)
         self.assertIn('aria-hidden="true">O</span>', body)
-        self.assertNotIn(self.acme_image, body)
+        self.assertNotIn(self.acme_image, client.get("/", base_url=base, headers=headers).get_data(as_text=True))
         self.assertEqual(client.get("/jobs/1/logo", base_url=base).status_code, 403)
         result = client.get("/jobs/1/logo", base_url=base, headers=headers)
         self.assertEqual(result.status_code, 200)

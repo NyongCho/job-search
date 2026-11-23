@@ -362,24 +362,24 @@ class StoreTests(unittest.TestCase):
                          [(1, "12.02 마감"), (2, "12.02 18:00 마감")])
 
     def test_expired_sort_ignores_deadlines_later_than_confirmed_closure(self):
-        early = posting(1, content="<p>지원 마감: 2020-11-20</p>")
-        ordinary = posting(2, content="<p>지원 마감: 2020-11-19</p>")
-        collected_closed = posting(3, content="<p>접수 종료</p><p>지원 마감: 2020-11-21</p>")
+        early = posting(2, content="<p>지원 마감: 2020-11-20</p>")
+        ordinary = posting(3, content="<p>지원 마감: 2020-11-19</p>")
+        collected_closed = posting(4, content="<p>접수 종료</p><p>지원 마감: 2020-11-21</p>")
         early["modified_gmt"] = "2020-11-16T00:00:00Z"
         collected_closed["modified_gmt"] = "2020-11-16T00:00:00Z"
         self.collect([early, ordinary, collected_closed])
-        for i in (1, 2, 3):
+        for i in (2, 3, 4):
             self.review(i)
         early["categories"].append(collect_jobs.CLOSED)
         refresh(self.source, self.state, lambda _: ([early], 1), datetime(2020, 11, 16, tzinfo=timezone.utc))
         def ids():
             rows = store.list_jobs(self.source, self.state, view="expired", sort="deadline")["items"]
             return [job["id"] for job in rows]
-        self.assertEqual(ids(), [2, 3, 1])
+        self.assertEqual(ids(), [3, 4, 2])
         refresh(self.source, self.state, lambda _: ([early], 1), datetime(2020, 11, 22, tzinfo=timezone.utc))
-        self.assertEqual(ids(), [2, 3, 1])
-        store.set_deadline(self.source, self.state, 1, {"mode": "manual", "kind": "date", "date": "2020-11-20"})
-        self.assertEqual(ids(), [1, 2, 3])
+        self.assertEqual(ids(), [3, 4, 2])
+        store.set_deadline(self.source, self.state, 2, {"mode": "manual", "kind": "date", "date": "2020-11-20"})
+        self.assertEqual(ids(), [2, 3, 4])
 
     def test_deadline_sort_applies_to_all_matching_pages(self):
         self.collect([posting(i) for i in range(2, 32)])

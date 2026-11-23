@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>모델 사용량 · 새로고침 #{{ run }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+  <main class="usage-report">
+    <h1>모델 사용량</h1>
+    <p>새로고침 #{{ run }} · {{ '완료' if complete else '진행 중' }}</p>
+    <dl>
+      {% for key, label in [('submitted', '평가에 제출한 공고'), ('calls', '신규 모델 호출'), ('input_tokens', '입력 토큰'), ('output_tokens', '출력 토큰'),
+                             ('cache_read_tokens', '캐시 읽기 토큰'), ('cache_write_tokens', '캐시 쓰기 토큰')] %}
+      <div><dt>{{ label }}</dt><dd>{% if totals[key] is none %}미측정{% else %}{{ '{:,}'.format(totals[key]) }}{{ {'calls': '회', 'submitted': '건'}.get(key, '') }}{% endif %}</dd></div>
+      {% endfor %}
+    </dl>
+    {% if shared %}<p>다른 요청에서 시작한 평가 {{ shared }}회는 해당 요청의 사용량에 포함됩니다.</p>{% endif %}
+  </main>
+</body>
+</html>

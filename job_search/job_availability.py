@@ -58,8 +58,27 @@ def _deadline(text, published):
         return None
 
 
+def has_jd_content(doc):
+    # A closure page, an application button, or a dated notice alone cannot replace evidence.
+    links = {link.get("text") for link in doc.get("links", []) if isinstance(link, dict)}
+    for line in doc.get("lines", []):
+        if (
+            isinstance(line, str) and line.strip()
+            and line not in links
+            and not CLOSED_TEXT.fullmatch(line.strip())
+            and not DEADLINE.search(line)
+            and not any(pattern.search(line) for _, pattern in ROLLING)
+            and not re.fullmatch(r"[0-9.\s:/~–—()년월일시분-]+", line)
+        ):
+            return True
+    return any(
+        isinstance(item, dict) and item.get("url") and not str(item.get("alt") or "").strip().lower().endswith(("로고", "logo"))
+        for item in doc.get("images", [])
+    )
+
+
 def inspect_document(doc):
-    lines = doc.get("lines", [])
+    lines = doc.get("listing_lines", doc.get("lines", []))
     if not isinstance(lines, list) or not all(isinstance(x, str) for x in lines):
         lines = []
     published = _stamp(doc.get("published_gmt"))
