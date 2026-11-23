@@ -210,6 +210,7 @@ class FitReviewTests(unittest.TestCase):
         self.collect(1, 2)
         digest = self.review_cli([self.entry(1), self.entry(2)], "--execution-id", "tie")
         self.assertLess(digest.index("직무2"), digest.index("직무1"))
+        self.assertNotIn("채용함", digest)
 
     def test_fit_migration_refuses_missing_and_unrelated_job_databases(self):
         with self.assertRaises((OSError, sqlite3.OperationalError, ValueError)):
@@ -235,7 +236,8 @@ class FitReviewTests(unittest.TestCase):
             self.assertEqual(len(jobs.pending(self.db)), 2)
         body = self.review_cli(entries, *args, "https://dashboard.example:8443/")
         for post_id in (1, 2):
-            self.assertIn(f"https://dashboard.example:8443/jobs/{post_id}", body)
+            self.assertIn(f"채용함에서 보기 https://dashboard.example:8443/jobs/{post_id}", body.splitlines())
+        self.assertEqual(body.splitlines().count("채용함 전체 목록 https://dashboard.example:8443"), 1)
         with self.assertRaises(ValueError):
             self.review_cli(entries, *args, "https://another.example")
         self.assertEqual(jobs.reconcile_outbox(self.db, {}, "later"), [body])
@@ -326,7 +328,8 @@ class FitReviewTests(unittest.TestCase):
         self.collect(1)
         entry = self.entry(1, "partial", preference="outside")
         for _ in range(2):
-            self.assertEqual(self.review_cli([entry], "--execution-id", "below"), "[SILENT]")
+            self.assertEqual(self.review_cli([entry], "--execution-id", "below",
+                                             "--dashboard-url", "https://dashboard.example"), "[SILENT]")
         self.assertEqual(jobs.reconcile_outbox(self.db, {}, "next"), [])
         self.assertEqual(jobs.get_posts(self.db, [1])[0]["fit_review"]["score"], 50)
 
