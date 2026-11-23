@@ -114,6 +114,33 @@ class DeploymentTests(unittest.TestCase):
         control, _, _ = self.run_activation(job_enabled=False)
         self.assertEqual([c.args[0] for c in control.call_args_list], ['get'])
 
+    def test_fit_cutover_checks_copy_and_migrates_only_jobs_after_backup(self):
+        jobs, state = deploy.database_paths(self.root)
+        migrated = []
+
+        def migrate(release, path):
+            self.assertEqual(release, self.new)
+            self.assertNotEqual(path, state)
+            if path == jobs:
+                journal = json.loads((self.root / '.deploy/transaction.json').read_text())
+                self.assertEqual(journal['phase'], 'migrating_fit')
+                self.assertTrue((Path(journal['backup']) / 'jobs.sqlite').is_file())
+            with sqlite3.connect(path) as db:
+                db.execute('ALTER TABLE private_data ADD COLUMN fit_review TEXT')
+            migrated.append(path)
+
+        with patch.object(deploy, 'migrate_fit_database', side_effect=migrate), \
+             patch.object(deploy, 'check_release') as check, patch.object(deploy, 'check_previous_writer') as writer, \
+             patch.object(deploy, 'hermes', return_value={'enabled': True}), patch.object(deploy, 'wait_idle'), \
+             patch.object(deploy, 'service', return_value='active'), patch.object(deploy, 'healthy', return_value=True):
+            deploy.validate_startup(self.root, self.new, self.config, migrate_fit=True)
+            self.assertEqual(check.call_args_list[0].args[1], self.old)
+            self.assertEqual(writer.call_args.args[0], self.old)
+            deploy.activate(self.root, self.new, self.config, migrate_fit=True)
+        self.assertEqual(migrated, [self.root / '.deploy/checks/new/jobs.sqlite', jobs])
+        self.assertNotEqual(deploy.schema(jobs), deploy.schema(state))
+        self.assertEqual((self.root / 'current').resolve(), self.new)
+
     def test_existing_transaction_requires_explicit_recovery(self):
         transaction = self.root / '.deploy/transaction.json'
         transaction.write_text('{}')

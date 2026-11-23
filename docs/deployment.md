@@ -86,6 +86,18 @@ python3 /path/to/approved-source/scripts/deploy.py --recover
   --jobs-db data/jobs.sqlite --state-db data/dashboard/dashboard.sqlite
 ```
 
+### 적합도 평가를 켜는 첫 배포
+
+마감·로고 이전을 마친 서버에서 새 버전의 스크립트로 아래 명령을 실행합니다. 기존 배포 잠금과 SQLite 백업 절차를 사용합니다.
+
+```sh
+python3 /path/to/approved-source/scripts/deploy.py --migrate-fit FULL_MAIN_SHA
+```
+
+DB 복사본에 `posts.fit_review` 열을 추가하고 구버전의 읽기·쓰기와 후보 웹앱 기동을 확인한 뒤, 쓰기 작업이 멈춘 운영 공고 DB에 같은 이전을 적용합니다. 기존 검토의 점수는 비어 있으며, 기존 전달 대기문은 저장된 그대로 재시도됩니다. [Hermes 프롬프트 전환](setup.md#기존-설치에서-적합도-평가-켜기)을 마치면 새 검토부터 점수가 생성됩니다.
+
+구형 검토 방식으로 되돌릴 때는 보관한 개인 프롬프트를 파일과 등록된 Hermes 작업 양쪽에 복원합니다. 추가된 열은 구버전에서도 읽기·쓰기가 가능하므로 유지합니다. 배포 중단 기록이 남으면 위의 `--recover` 절차를 사용합니다.
+
 ## 일반 배포 동작과 복구
 
 활성화 직전 채용 cron 작업만 일시 정지하고 실행 중인 검토·마감 갱신이 끝날 때까지 최대 10분 기다립니다. 웹앱을 잠시 중지하고 SQLite 백업을 만든 다음 `current`를 전환합니다. `/healthz`가 정상이어야 성공하며, 실패하면 이전 코드로 되돌립니다. 배포 전 이미 정지한 cron은 켜지 않습니다. 배포 중에는 별도의 수동 수집·검토 실행을 시작하지 않습니다.

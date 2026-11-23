@@ -170,7 +170,12 @@ def migrate_database(release, path, kind):
     run([release / '.venv-dashboard/bin/python', '-c', code, path, kind], cwd=release)
 
 
-def activate(root, release, config, *, migrate_cards=False):
+def migrate_fit_database(release, jobs):
+    run([release / '.venv-dashboard/bin/python', '-m', 'job_search.collect_jobs',
+         '--db', jobs, 'migrate-fit'], cwd=release)
+
+
+def activate(root, release, config, *, migrate_cards=False, migrate_fit=False):
     journal = root / '.deploy/transaction.json'
     if journal.exists():
         raise RuntimeError('Interrupted deployment: run local --recover before deploying again')
@@ -183,7 +188,8 @@ def activate(root, release, config, *, migrate_cards=False):
                    'resume_job': bool(hermes('get', config, reason)['enabled']),
                    'restart_timer': service('is-active', 'job-availability.timer') in {'active', 'activating'},
                    'web_was_active': service('is-active', 'job-dashboard.service') in {'active', 'activating'},
-                   'web_stopped': False, 'backup': str(backup), 'migrate_cards': migrate_cards}
+                   'web_stopped': False, 'backup': str(backup), 'migrate_cards': migrate_cards,
+                   'migrate_fit': migrate_fit}
 
     def checkpoint(phase):
         transaction['phase'] = phase
@@ -209,6 +215,10 @@ def activate(root, release, config, *, migrate_cards=False):
             migrate_database(release, jobs, 'jobs')
             checkpoint('migrating_state')
             migrate_database(release, state, 'state')
+        if migrate_fit:
+            checkpoint('migrating_fit')
+            migrate_fit_database(release, jobs)
+        if migrate_cards or migrate_fit:
             checkpoint('checking_migration')
             validate_startup(root, release, config)
         checkpoint('starting_candidate')
@@ -313,7 +323,7 @@ with closing(sqlite3.connect(state)) as db:
         raise RuntimeError('Previous release modified the migrated schema')
 
 
-def validate_startup(root, release, config, *, migrate_cards=False):
+def validate_startup(root, release, config, *, migrate_cards=False, migrate_fit=False):
     check = root / '.deploy/checks' / release.name
     jobs, state = check / 'jobs.sqlite', check / 'dashboard.sqlite'
     source, personal = database_paths(root)
@@ -322,6 +332,9 @@ def validate_startup(root, release, config, *, migrate_cards=False):
     if migrate_cards:
         run([release / '.venv-dashboard/bin/python', '-m', 'job_search.migrate_card_metadata',
              '--jobs-db', jobs, '--state-db', state], cwd=release)
+    if migrate_fit:
+        migrate_fit_database(release, jobs)
+    if migrate_cards or migrate_fit:
         previous = (root / 'current').resolve(strict=True)
         check_release(root, previous, config, jobs, state)
         check_previous_writer(previous, jobs, state)
@@ -337,7 +350,7 @@ def fetch_main(root, config):
     return repository, run(['git', '--git-dir', repository, 'rev-parse', 'refs/heads/main'])
 
 
-def deploy(root, revision, config, *, migrate_cards=False):
+def deploy(root, revision, config, *, migrate_cards=False, migrate_fit=False):
     if (root / '.deploy/transaction.json').exists():
         raise RuntimeError('Interrupted deployment: run local --recover first')
     repository, latest = fetch_main(root, config)
@@ -358,7 +371,7 @@ def deploy(root, revision, config, *, migrate_cards=False):
     run([python, '-m', 'pip', 'install', '-r', release / 'requirements.txt'])
     print('Testing candidate release', flush=True)
     run(['make', 'test', 'PYTHON=' + str(python)], cwd=release)
-    validate_startup(root, release, config, migrate_cards=migrate_cards)
+    validate_startup(root, release, config, migrate_cards=migrate_cards, migrate_fit=migrate_fit)
     for name in ['data', 'deployment.json', 'hermes_job_prompt.txt', 'company_research.json']:
         if (release / name).exists() or (release / name).is_symlink():
             raise RuntimeError('Release must not contain private runtime files')
@@ -367,7 +380,7 @@ def deploy(root, revision, config, *, migrate_cards=False):
     if fetch_main(root, config)[1] != revision:
         raise RuntimeError('Main changed during preparation; deploy the newer workflow run')
     print('Waiting for jobs, backing up data, and activating', flush=True)
-    activate(root, release, config, migrate_cards=migrate_cards)
+    activate(root, release, config, migrate_cards=migrate_cards, migrate_fit=migrate_fit)
     print('Deployed ' + revision + '; health verified', flush=True)
 
 
@@ -380,7 +393,8 @@ def main():
     command = os.environ.get('SSH_ORIGINAL_COMMAND')
     recovery = command is None and sys.argv[1:] == ['--recover']
     migrate_cards = command is None and sys.argv[1:2] == ['--migrate-card-metadata']
-    arguments = sys.argv[2:] if migrate_cards else sys.argv[1:]
+    migrate_fit = command is None and sys.argv[1:2] == ['--migrate-fit']
+    arguments = sys.argv[2:] if migrate_cards or migrate_fit else sys.argv[1:]
     revision = None if recovery else parse_revision(command if command is not None else 'deploy ' + ' '.join(arguments))
     (state / 'logs').mkdir(exist_ok=True)
     LOG = state / 'logs' / (time.strftime('%Y%m%d-%H%M%S') + '.log')
@@ -393,7 +407,7 @@ def main():
             recover(root, config)
             print('Previous release and schedules recovered')
         else:
-            deploy(root, revision, config, migrate_cards=migrate_cards)
+            deploy(root, revision, config, migrate_cards=migrate_cards, migrate_fit=migrate_fit)
 
 
 if __name__ == '__main__':

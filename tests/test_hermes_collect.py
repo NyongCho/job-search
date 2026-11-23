@@ -81,6 +81,16 @@ class HermesDashboardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)['retry_digests'], ['saved digest'])
 
+    def test_release_install_collects_from_active_release(self):
+        release = self.root / "current"
+        release.mkdir()
+        with patch.object(subprocess, "run") as run:
+            run.return_value.stdout = '{"new": 0}'
+            (self.root / "deployment.json").write_text(json.dumps({"job_id": "fixture-job"}))
+            with patch.object(Path, "home", return_value=self.home), contextlib.redirect_stdout(io.StringIO()):
+                hermes_collect.main()
+        self.assertEqual(run.call_args.kwargs["cwd"], release)
+
 
 if __name__ == "__main__":
     unittest.main()
