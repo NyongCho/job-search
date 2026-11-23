@@ -11,6 +11,7 @@
 - 프리런 스크립트는 **한 개의 실제 활성 Hermes 실행**을 요구한다. 직접 실행해 가짜 실행 ID를 주입하지 않는다.
 - `collect_jobs.py --db PATH status|pending|show|review`를 이용한다. `--db`는 하위 명령 앞에 온다. `status`도 새 DB를 만들 수 있으므로 기존 경로 존재 여부를 확인한다.
 - 판단 계약과 명령 예시는 대상의 `hermes_job_prompt.txt`를 따른다. `needs_review`는 보관 상태이며 자동 재검토 대상이 아니다.
+- 적합도 평가를 지원하는 독립 설치에서 기존 DB를 연결할 때는 `python3 collect_jobs.py --db 기존DB migrate-fit`으로 평가 열을 추가한 뒤 등록된 작업 프롬프트를 갱신한다. 새 형식의 `review … --execution-id …`는 전달문을 출력한다. 질문만 있는 배치도 같은 방식으로 전달하고 대기 중인 문구는 그대로 재시도한다. 구형 프롬프트는 기존 `--digest` 형식을 사용한다.
 
 ## 기간 일괄 처리
 

@@ -140,7 +140,7 @@ def main():
                 "원문의 마감일이 현재 한국시간보다 지났거나 마감 표시가 있으면 추천하지 마세요. "
                 "마감일이 없으면 공식 채용 페이지의 실제 모집/지원 가능 상태를 확인해야 추천할 수 있습니다. "
                 "열린 지원 페이지나 미래 마감일을 확인하지 못한 공고는 needs_review로 보류하세요. "
-                "추천은 기존과 같이 job-search에 전달하고, 아직 전체 검토가 끝났다고 쓰지 마세요.\n"
+                "이번 실행에 설정된 기본 프롬프트의 결과 보관 및 최종 전달 지시를 따르세요. 이번 배치에 전체 완료 알림을 추가하지 마세요.\n"
             )
             save("running", batch_ids=batch, delivery_retries=outstanding)
             run(base_prompt + instructions)
@@ -156,9 +156,9 @@ def main():
         summary = (
             f"최근 2주 공고 검토가 완료되었습니다.\n"
             f"기간: {manifest['start_kst']} ~ {manifest['end_kst']}\n"
-            f"수집: {len(target_ids)}건 · 추천: {final_counts['recommend']}건 · "
+            f"수집: {len(target_ids)}건 · 추천 판정: {final_counts['recommend']}건 · "
             f"제외: {final_counts['exclude']}건 · 확인 필요: {final_counts['needs_review']}건\n"
-            "추천 수에는 이전에 전달한 공고가 포함되며, 기존 추천은 중복 발송하지 않았습니다. "
+            "추천 판정 수에는 기존 검토와 선호 밖 전달 기준 미만인 공고도 포함됩니다. "
             "마감 또는 모집 여부 미확인 공고는 새 추천에서 제외했습니다. "
             "이후에는 오전 9시·오후 6시 정기 수집을 이어갑니다."
         )
