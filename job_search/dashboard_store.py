@@ -13,12 +13,14 @@ from urllib.parse import urlsplit
 from .card_metadata import create_deadline_tables, has_table
 from .company_logos import logo_references
 from .job_availability import KST, ROLLING, availability, document_version
+from .job_fit import read_fit, recommendation_group
 from .job_sources import source_locator, source_name
 
 STATUSES = {"unmarked", "interested", "preparing", "applied", "archived"}
 VIEWS = ("recommended", "interested", "preparing", "applied", "archived", "needs_review", "expired")
 PAGE_SIZE = 30
 LIST_SORTS = {"reviewed": "최근 검토순", "deadline": "마감 임박순", "company": "기업 이름순"}
+FIT_GROUPS = ("preferred", "outside", "legacy", "question")
 STAGE_LABELS = {"document": "서류", "interview1": "1차 면접", "interview2": "2차 면접", "final": "최종 결과"}
 RESULT_LABELS = {"unknown": "미확인", "not_started": "미진행", "in_progress": "진행 중",
                  "passed": "합격", "failed": "불합격", "skipped": "해당 없음"}
@@ -162,15 +164,21 @@ def _job(row, state, cached_availability=None, override=None, logo_version=None)
     reviewed = timestamp(row["reviewed_at"])
     seen = timestamp(state.get("seen_reviewed_at"))
     source_kind = source_name(doc)
+    fit = read_fit(row)
+    group = recommendation_group(row["decision"], fit)
+    if fit is None and row["decision"] == "recommend":
+        group = "legacy"
+    display_decision = "below_threshold" if row["decision"] == "recommend" and group is None else row["decision"]
     return {
         **availability(doc if row["id"] > 0 else {}, cached_availability, override=override),
         "id": row["id"], "title": title,
         "company": company.strip() if separator else "기업명 미기재",
         "role": role.strip() if separator else title,
-        "reason": row["reason"] or "", "decision": row["decision"],
+        "reason": row["reason"] or "", "decision": row["decision"], "fit": fit, "fit_group": group,
+        "display_decision": display_decision,
         "reviewed_at": reviewed, "published_at": timestamp(doc.get("published_gmt")),
         "fingerprint": row["fingerprint"], "source_url": safe_url(doc.get("url")),
-        "apply_url": safe_url(doc.get("apply_url")), "lines": lines,
+        "apply_url": safe_url((fit or {}).get("apply_url")) or safe_url(doc.get("apply_url")), "lines": lines,
         "evidence_lines": evidence,
         "images": [{"url": safe_url(item.get("url")), "alt": item.get("alt", "")}
                    for item in images if isinstance(item, dict) and safe_url(item.get("url"))],
@@ -213,17 +221,22 @@ def _with_progress(item, stages):
 
 
 def _matches(item, view):
+    active = item["status"] not in {"applied", "archived"}
+    recommended = item["fit_group"] in ("preferred", "outside", "legacy")
     if view == "expired":
-        return (item["is_expired"] and item["status"] not in {"applied", "archived"}
-                and (item["decision"] == "recommend" or item["status"] in {"interested", "preparing"}))
-    if view in {"recommended", "needs_review"}:
-        decision = "recommend" if view == "recommended" else "needs_review"
-        return (item["decision"] == decision and item["status"] not in {"applied", "archived"}
-                and (view != "recommended" or not item["is_expired"]))
+        return active and item["is_expired"] and (recommended or item["status"] in {"interested", "preparing"})
+    if view == "recommended":
+        return active and not item["is_expired"] and recommended
+    if view == "question":
+        return active and not item["is_expired"] and item["fit_group"] == "question"
+    if view == "needs_review":
+        return active and (item["decision"] == "needs_review" or item["fit_group"] == "question")
     return item["status"] == view
 
 
 def sort_options(view):
+    if view == "recommended":
+        return {"fit": "적합도순", **LIST_SORTS}
     if view == "applied":
         return {"activity": "최근 기록순", **LIST_SORTS}
     if view == "expired":
@@ -290,12 +303,12 @@ def list_jobs(jobs_db: Path, state_db: Path, *, view="recommended", q="", page=1
     items = [_with_progress(item, stages.get(item["id"], [])) for item in items]
     counts = {v: sum(_matches(item, v) for item in items) for v in VIEWS}
     needle = q.strip().casefold()
-    filtered = [item for item in items if _matches(item, view)
+    filtered = [item for item in items if (_matches(item, view) or (view == "recommended" and _matches(item, "question")))
                 and (not needle or needle in (item["title"] + " " + item["reason"]).casefold())]
     if sort == "activity":
         filtered.sort(key=lambda item: (item["activity_at"] or item["published_at"] or "", item["id"]), reverse=True)
     else:
-        # Stable secondary order for ties in the deadline and company sorts.
+        # Stable secondary order for tied scores, deadlines and company names.
         filtered.sort(key=lambda item: (bool(item["reviewed_at"]),
                       item["reviewed_at"] or item["published_at"] or item["recorded_at"] or "", item["id"]), reverse=True)
         if sort == "company":
@@ -303,12 +316,18 @@ def list_jobs(jobs_db: Path, state_db: Path, *, view="recommended", q="", page=1
         elif sort == "deadline":
             now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
             filtered.sort(key=lambda item: _deadline_order(item, now))
-    total = len(filtered)
-    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        if sort == "fit":
+            filtered.sort(key=lambda item: (FIT_GROUPS.index(item["fit_group"]),
+                          -item["fit"]["score"] if item["fit_group"] in ("preferred", "outside") else None))
+        elif view == "recommended":
+            filtered.sort(key=lambda item: item["fit_group"] == "question")
+    question_total = sum(item["fit_group"] == "question" for item in filtered) if view == "recommended" else 0
+    total_pages = max(1, (len(filtered) + PAGE_SIZE - 1) // PAGE_SIZE)
     page = min(page, total_pages)
     result = [{k: v for k, v in item.items() if k not in {"lines", "images", "progress"}}
               for item in filtered[(page - 1) * PAGE_SIZE:page * PAGE_SIZE]]
-    return {"items": result, "sort": sort, "total": total, "page": page, "total_pages": total_pages,
+    return {"items": result, "sort": sort, "total": len(filtered) - question_total, "question_total": question_total,
+            "page": page, "total_pages": total_pages,
             "counts": counts, "last_collected_at": timestamp(checkpoint[0]) if checkpoint else None}
 
 

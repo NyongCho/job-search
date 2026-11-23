@@ -21,7 +21,12 @@ VIEW_LABELS = {"recommended": "추천", "interested": "관심", "preparing": "�
                "applied": "지원 현황", "archived": "보관", "needs_review": "확인 필요", "expired": "만료"}
 STATUS_LABELS = {"unmarked": "미지정", "interested": "관심", "preparing": "지원 준비",
                  "applied": "지원 완료", "archived": "보관"}
-DECISION_LABELS = {"recommend": "추천", "needs_review": "확인 필요", "exclude": "추천 제외", None: "검토 대기"}
+DECISION_LABELS = {"recommend": "추천", "needs_review": "확인 필요", "exclude": "추천 제외",
+                   "below_threshold": "선호 밖 추천 기준 미만", None: "검토 대기"}
+FIT_GROUP_LABELS = {"preferred": "희망 직무 추천", "outside": "선호 밖 추천", "legacy": "기존 추천 · 미산정",
+                    "question": "확인 질문"}
+FIT_CATEGORIES = {"work": "핵심 업무", "required": "필수 요건", "preferred": "우대 요건"}
+FIT_STATUSES = {"met": "충족", "partial": "부분 충족", "unmet": "미충족", "unknown": "미확인", "tenure": "관련 경력"}
 
 
 def _environment():
@@ -123,6 +128,7 @@ def create_app(config=None):
         return render_template("dashboard.html", listing=listing, detail=detail, view=view, q=q,
                                sort_options=store.sort_options(view),
                                views=VIEW_LABELS, statuses=STATUS_LABELS, decisions=DECISION_LABELS,
+                               fit_groups=FIT_GROUP_LABELS, fit_categories=FIT_CATEGORIES, fit_statuses=FIT_STATUSES,
                                stages=store.STAGE_LABELS, results=store.RESULT_LABELS,
                                error=None)
 

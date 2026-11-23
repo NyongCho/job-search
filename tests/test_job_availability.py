@@ -5,12 +5,14 @@ import unittest
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from job_search import collect_jobs
 from job_search import dashboard_store as store
 from job_search.job_availability import availability, inspect_document
 from job_search.refresh_job_availability import refresh
 from tests.test_collect_jobs import posting
+from tests.test_job_fit import assessment, criterion
 
 
 def document(*lines, published="2026-11-01T02:15:44"):
@@ -128,6 +130,39 @@ class RefreshTests(unittest.TestCase):
             db.execute("UPDATE posts SET decision='recommend',reason='fit',evidence_lines='[1]'")
         store.init_state_db(self.source, self.state)
 
+    def test_periodic_refresh_closes_an_active_question_without_a_date(self):
+        posts = [posting(i, content="<p>장애 대응 경험</p><p>채용 시 마감</p>") for i in range(1, 5)]
+        collect_jobs.collect(self.source, lambda _: (posts, 1), self.now)
+        entries = [
+            {"id": doc["id"], "fingerprint": doc["fingerprint"], "decision": "needs_review",
+             "reason": "장애 대응 경험 확인", "evidence_lines": [1], "availability": "closed" if doc["id"] == 2 else "open",
+             "assessment": assessment(criterion("장애 대응", "required", "unknown", evidence=""),
+                                      question="서비스 장애를 직접 해결했나요?")}
+            for doc in collect_jobs.get_posts(self.source, [1, 2, 3])
+        ]
+        collect_jobs.record_reviews(self.source, entries, execution_id="questions")
+        with closing(sqlite3.connect(self.source)) as db, db:
+            db.execute("UPDATE posts SET decision='needs_review' WHERE id=4")
+        store.set_status(self.source, self.state, 3, "archived")
+        self.assertEqual(store.list_jobs(self.source, self.state)["question_total"], 1)
+
+        def closed_posts(url):
+            ids = parse_qs(urlsplit(url).query)["include"][0].split(",")
+            return [posting(int(i), categories=[collect_jobs.CLOSED]) for i in ids], 1
+
+        report = refresh(self.source, self.state, closed_posts, self.now)
+        self.assertEqual(report["expired_in_checked"], [1])
+        self.assertTrue(store.get_job(self.source, self.state, 1)["is_expired"])
+        self.assertEqual(store.list_jobs(self.source, self.state)["question_total"], 0)
+
+    def test_periodic_refresh_preserves_unmigrated_recommendation_and_saved_job(self):
+        with closing(sqlite3.connect(self.source)) as db, db:
+            db.execute("ALTER TABLE posts DROP COLUMN fit_review")
+            db.execute("UPDATE posts SET decision='needs_review' WHERE id=2")
+        store.set_status(self.source, self.state, 2, "preparing")
+        report = refresh(self.source, self.state, lambda _: ([posting(1), posting(2)], 1), self.now)
+        self.assertEqual((report["requested"], report["checked"]), (2, 2))
+
     def test_refresh_closure_extension_and_personal_state_preservation(self):
         store.set_status(self.source, self.state, 1, "applied")
         store.set_stage(self.source, self.state, 1, "document", "passed", "", "keep")
@@ -221,7 +256,6 @@ class RefreshTests(unittest.TestCase):
             urls.append(url)
             return [posting(1)], 1
         report = refresh(self.source, self.state, fetch, self.now)
-        from urllib.parse import parse_qs, urlsplit
         self.assertEqual(parse_qs(urlsplit(urls[0]).query)['include'], ['1'])
         self.assertEqual(report['unsupported_ids'], [2])
         self.assertFalse(store.get_job(self.source, self.state, 2)['is_expired'])

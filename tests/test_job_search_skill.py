@@ -7,7 +7,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
+
+from job_search import collect_jobs, dashboard
+from tests.test_collect_jobs import posting
+from tests.test_job_fit import assessment, criterion, posting_a, posting_b, posting_c
 
 SKILL = Path(__file__).resolve().parents[1] / "skills/job-search-pipeline"
 
@@ -43,6 +48,98 @@ class PortableSkillTests(unittest.TestCase):
         result = self.prepare()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual((self.workspace / "deployment.json").read_bytes(), original)
+
+    def test_scored_review_matches_installed_cli_outbox_and_dashboard(self):
+        prepared = self.prepare()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        reviews = [posting_a(), posting_b(), posting_c()]
+        for months in (800, 799):
+            reviews.append(assessment(criterion("관련 경력", "required", "tenure", months=months,
+                                                required_months=1000), preference="outside"))
+        posts = []
+        for index, fit in enumerate(reviews, 1):
+            content = "".join(f"<p>{c['label']}</p>" for c in fit["criteria"])
+            content += f'<p>지원 마감 2099-12-31</p><a href="https://example.com/job/{index}">지원하러 가기</a>'
+            post = posting(index, content)
+            post["title"]["rendered"] = f"익명 기업｜공고 {'ABCDE'[index-1]}"
+            posts.append(post)
+
+        source = self.base / "app.sqlite"
+        collect_jobs.collect(source, lambda _: (posts, 1))
+        entries = []
+        for doc, fit in zip(collect_jobs.get_posts(source, range(1, 6)), reviews):
+            entries.append({"id": doc["id"], "fingerprint": doc["fingerprint"], "assessment": fit,
+                            "decision": "needs_review" if fit.get("question") else "recommend",
+                            "reason": "업무 수행 경력 대조", "evidence_lines": [1], "availability": "open",
+                            "apply_url": doc["apply_url"], "deadline": "2099-12-31", "required_summary": "관련 경력"})
+        mixed_file, question_file = self.base / "mixed.json", self.base / "question.json"
+        mixed_file.write_text(json.dumps(entries[::-1]))
+        question_file.write_text(json.dumps([entries[2]]))
+        with closing(sqlite3.connect(source)) as db:
+            collected = db.execute("SELECT id, document, fingerprint FROM posts").fetchall()
+        portable = self.workspace / "data/jobs.sqlite"
+        bodies = []
+        for name, module, workdir, jobs_db in (("portable", "collect_jobs", self.workspace, portable),
+                                              ("app", "job_search.collect_jobs", SKILL.parents[1], source)):
+            with self.subTest(runtime=name):
+                def run(*args):
+                    result = subprocess.run([sys.executable, *args], cwd=workdir, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    return result.stdout.rstrip("\n")
+
+                def cli(*args):
+                    return run("-m", module, "--db", str(jobs_db), *args)
+
+                def retry(failed, retry_id, delivered=None):
+                    outcomes = {failed: "failed"}
+                    if delivered:
+                        outcomes[delivered] = "delivered"
+                    output = run("-c", f"from {module} import reconcile_outbox; import json, sys; "
+                                 "print(json.dumps(reconcile_outbox(sys.argv[1], json.loads(sys.argv[2]), sys.argv[3])))",
+                                 str(jobs_db), json.dumps(outcomes), retry_id)
+                    return json.loads(output)
+
+                if name == "portable":
+                    cli("status")
+                    with closing(sqlite3.connect(jobs_db)) as db, db:
+                        db.executemany("INSERT INTO posts(id,document,fingerprint) VALUES(?,?,?)", collected)
+                digest = cli("review", str(mixed_file), "--execution-id", "mixed")
+                for score in ("86.7점", "70.0점", "80.0점"):
+                    self.assertIn(score, digest)
+                self.assertEqual([p for p in digest.splitlines() if p.startswith("익명 기업｜")],
+                                 ["익명 기업｜공고 A · 86.7점", "익명 기업｜공고 B · 70.0점",
+                                  "익명 기업｜공고 D · 80.0점", "익명 기업｜공고 C"])
+                question = entries[2]["assessment"]["question"]
+                self.assertIn(question, digest)
+                self.assertEqual(retry("mixed", "mixed-retry"), [digest])
+                question_args = ("review", str(question_file), "--execution-id", "question")
+                question_digest = cli(*question_args)
+                self.assertIn(question, question_digest)
+                self.assertEqual(cli(*question_args), question_digest)
+                self.assertEqual(retry("question", "question-retry", delivered="mixed-retry"), [question_digest])
+                with closing(sqlite3.connect(jobs_db)) as db:
+                    saved = db.execute("SELECT digest,delivered FROM outbox ORDER BY rowid").fetchall()
+                self.assertEqual(saved, [(digest, 1), (question_digest, 0)])
+                docs = json.loads(cli("show", "1", "2", "3", "4", "5"))
+                scores = [doc["fit_review"]["score"] for doc in docs]
+                self.assertAlmostEqual(scores[0], 86.6666666667)
+                self.assertEqual(scores[1:], [70, None, 80, 79.9])
+                bodies.append((digest, question_digest))
+
+                app = dashboard.create_app({"TESTING": True, "JOBS_DB": jobs_db, "STATE_DB": self.base / f"{name}-state.sqlite",
+                                            "BASE_URL": "http://localhost", "DEV_MODE": True, "SECRET_KEY": "s" * 32})
+                client = app.test_client()
+                listing = client.get("/").get_data(as_text=True)
+                titles = [f"공고 {letter}" for letter in "ABDC"]
+                positions = [listing.index(title) for title in titles]
+                self.assertEqual(positions, sorted(positions))
+                self.assertNotIn("공고 E", listing)
+                self.assertIn(question, listing)
+                detail = client.get("/jobs/1").get_data(as_text=True).split('<article id="job-detail"', 1)[1]
+                for text in ("86.7점", "관련 경력", "사용자가 미경험 확인"):
+                    self.assertIn(text, detail)
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(*bodies)
 
     def test_installed_prerun_uses_new_target_and_recovers_saved_digest_offline(self):
         result = self.prepare()

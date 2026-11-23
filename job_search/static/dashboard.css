@@ -130,6 +130,17 @@ blockquote { margin: 14px 0; border-left: 2px solid #c6d9ce; padding: 3px 0 3px 
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; scroll-behavior: auto !important; } }
 .decision-tag.expired { color: #615d67; background: #eeedf0; }
+.list-group-title { margin: 0; padding: 10px 20px; border-bottom: 1px solid var(--line); background: #f4f8f6; color: #385e50; font-size: 13px; }
+.fit-preview, .fit-question { margin: 6px 0; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.fit-preview { color: #256957; font-weight: 650; font-variant-numeric: tabular-nums; }
+.fit-question { color: #77501f; }
+.fit-evidence { margin: 20px 0; font-size: 13px; line-height: 1.65; overflow-wrap: anywhere; }
+.fit-evidence h3 { margin: 0; font-size: 16px; }
+.fit-evidence h4 { margin: 16px 0 6px; font-size: 13px; }
+.fit-evidence h4 span, .fit-criterion > span { color: #52645b; font-size: 12px; font-weight: 500; }
+.fit-evidence p { margin: 5px 0; }
+.fit-criterion { padding: 7px 0 7px 10px; border-left: 2px solid var(--line); }
+.fit-criterion blockquote { margin: 5px 0; }
 .company-rating-preview { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 10px; color: #687680; font-size: 11px; line-height: 1.6; }
 .rating-pill { background: #eef5f2; color: #226d5e; padding: 2px 7px; border-radius: 5px; font-weight: 650; font-variant-numeric: tabular-nums; }
 .sample-hint { color: #805e29; background: #fbf4e6; border-radius: 4px; font-size: 10px; padding: 2px 6px; white-space: nowrap; }

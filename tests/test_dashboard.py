@@ -5,12 +5,14 @@ import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from html import unescape
 from pathlib import Path
 from unittest.mock import patch
 
 from job_search import collect_jobs
 from job_search import dashboard
 from tests.test_collect_jobs import posting
+from tests.test_dashboard_store import collect_fit_examples
 
 
 class WebTests(unittest.TestCase):
@@ -118,10 +120,62 @@ class WebTests(unittest.TestCase):
             self.assertIn("q=Agent", url)
         detail = self.get("/jobs/1?view=recommended&q=Agent&sort=company").get_data(as_text=True)
         self.assertIn("sort=company", re.search(r'class="back-link" href="([^"]+)"', detail)[1])
-        for view, value, label in (("applied", "activity", "최근 기록순"), ("recommended", "reviewed", "최근 검토순"),
+        for view, value, label in (("applied", "activity", "최근 기록순"), ("recommended", "fit", "적합도순"),
+                                   ("recommended&sort=reviewed", "reviewed", "최근 검토순"),
                                    ("expired&sort=deadline", "deadline", "최근 마감순")):
             page = self.get("/?view=" + view).get_data(as_text=True)
             self.assertIn(f'<option value="{value}" selected>{label}</option>', page)
+
+    def test_fit_list_and_detail_keep_evidence_questions_and_return_location(self):
+        collect_fit_examples(self.source)
+        page = self.get("/").get_data(as_text=True)
+        headings = re.findall(r'<h2 class="list-group-title">([^<]+)</h2>', page)
+        self.assertEqual(headings, ["희망 직무 추천", "선호 밖 추천", "기존 추천 · 미산정", "확인 질문"])
+        self.assertIn("75.0점", page)
+        self.assertIn("90.0점", page)
+        self.assertNotIn("79.9점", page)
+        self.assertIn("운영 장애에 직접 대응했나요?", page)
+        with patch.object(dashboard.store, "PAGE_SIZE", 2):
+            page = self.get("/?q=Agent&page=2").get_data(as_text=True)
+            location = unescape(re.search(r'href="(/jobs/3\?[^"]+)"', page)[1])
+            detail = self.get(location).get_data(as_text=True)
+            article = detail.split('<article id="job-detail"', 1)[1]
+            self.assertIn("90.0점", article)
+            self.assertIn("필수 요건", article)
+            self.assertIn("운영 경력 10개월", article)
+            self.assertIn("서비스 배포와 모니터링을 9개월 담당", article)
+            self.assertIn("L1", article)
+            returned = self.get(unescape(re.search(r'class="back-link" href="([^"]+)"', article)[1]))
+            self.assertEqual(re.findall(r'class="job-row[^"]*" href="/jobs/(\d+)\?', returned.get_data(as_text=True)),
+                             ["3", "1"])
+        question = self.get("/jobs/5?view=needs_review").get_data(as_text=True).split('<article id="job-detail"', 1)[1]
+        self.assertIn("운영 장애에 직접 대응했나요?", question)
+        self.assertIn("공고 적합도 보류", question)
+        old = self.get("/jobs/1").get_data(as_text=True).split('<article id="job-detail"', 1)[1]
+        self.assertIn("미산정", old)
+        self.assertNotIn("0.0점", old)
+
+    def test_saved_subthreshold_job_shows_score_and_delivery_threshold(self):
+        collect_fit_examples(self.source)
+        dashboard.store.set_status(self.source, self.state, 4, "interested")
+        html = self.get("/jobs/4?view=interested").get_data(as_text=True)
+        for section in html.split('<article id="job-detail"', 1):
+            self.assertIn("79.9점", section)
+            self.assertIn("선호 밖 추천 기준 미만", section)
+            self.assertNotIn("추천 제외", section)
+        self.assertNotIn("추천 이유</div>", html)
+
+    def test_closing_last_question_updates_recommendation_page_and_count(self):
+        collect_fit_examples(self.source)
+        token = self.csrf()
+        with patch.object(dashboard.store, "PAGE_SIZE", 2):
+            path = "/jobs/5/deadline?view=recommended&q=Agent&sort=fit&page=3"
+            saved = self.post(path, {"mode": "manual", "kind": "date", "date": "2000-01-01"}, token)
+            self.assertEqual(saved.status_code, 200)
+            html = saved.json["html"]
+            self.assertIn("2 / 2 페이지", html)
+            self.assertIn("추천 목록 <span>4건</span>", html)
+            self.assertIn('data-scroll-key="recommended:fit:Agent:2"', html)
 
     def test_invalid_sort_precedes_deadline_write_and_refresh(self):
         token = self.csrf()
