@@ -69,7 +69,7 @@ python3 /path/to/approved-source/scripts/deploy.py --migrate-card-metadata FULL_
 ```
 
 1. 후보 릴리스를 준비하고 테스트합니다. 실제 DB의 복사본을 후보 버전으로 이전한 뒤 기존·후보 앱의 `/healthz`와 기존 마감 갱신기의 쓰기를 확인합니다.
-2. 원래 켜져 있던 서비스·스케줄, 백업 경로와 진행 지점을 `.deploy/transaction.json`에 기록합니다. Hermes 채용 작업과 마감 타이머를 멈추고 실행 중인 작업이 끝나면 웹앱도 중지합니다. 이 동안 수동 수집·검토·지원 이력 가져오기도 실행하지 않습니다.
+2. 원래 켜져 있던 서비스·스케줄, 백업 경로와 진행 지점을 `.deploy/transaction.json`에 기록합니다. Hermes 채용 작업과 마감 타이머를 멈추고 실행 중인 작업이 끝나면 웹앱도 중지합니다. 로고 유닛이 설치되어 있으면 경로 감시와 서비스를 먼저 중지합니다. 이 동안 수동 수집·검토·지원 이력 가져오기도 실행하지 않습니다.
 3. 쓰기 작업이 멈춘 두 DB를 `.deploy/backups/<release>/`에 백업합니다. 공고 DB와 개인 상태 DB 순으로 새 테이블을 추가하고, 이전된 DB를 다시 복사해 후보 시작 검사를 실행합니다.
 4. 후보 버전을 시작해 `/healthz`를 확인합니다. 웹앱과 스케줄은 원래 활성 상태로 복귀합니다. 이후에는 일반 자동 배포를 사용합니다.
 
@@ -86,9 +86,46 @@ python3 /path/to/approved-source/scripts/deploy.py --recover
   --jobs-db data/jobs.sqlite --state-db data/dashboard/dashboard.sqlite
 ```
 
+### 기업 로고 워커를 추가하는 첫 배포
+
+기존 마감·로고 테이블이 있는 서버는 이 워커를 추가할 때 별도 DB 이전이 필요하지 않습니다. SSH 강제 명령은 현재 릴리스의 배포 스크립트를 실행하므로, 워커 도입 전 버전에서는 두 유닛을 제어하지 못합니다. 최초 배포와 그 복구가 끝날 때까지 설치와 활성화를 미룹니다. 두 유닛을 이미 설치했다면 배포 전에 감시를 비활성화하고 서비스를 중지합니다.
+
+```sh
+systemctl --user disable --now job-logo-worker.path
+systemctl --user stop job-logo-worker.service
+systemctl --user show --property=ActiveState job-logo-worker.path job-logo-worker.service
+```
+
+설치된 두 유닛이 정지 상태인지 확인합니다. 이전 버전의 배포 스크립트가 실행되는 경우 이 상태에서 첫 배포를 진행합니다. 운영 DB에 마감·로고 테이블도 없다면 위의 DB 이전 절차를 먼저 적용합니다.
+
+워커를 지원하는 릴리스가 `current`에서 정상 동작하고 `.deploy/transaction.json`이 정리된 뒤에 아래 명령을 실행합니다. 릴리스의 가상환경과 작업 디렉터리는 `current`를 따르고, 워커와 감시는 루트의 공유 DB와 신호 디렉터리를 사용합니다.
+
+```sh
+cd ~/job_search
+install -d -m 0700 data/jobs.sqlite.logo-requests
+install -Dm644 current/deploy/job-logo-worker.path ~/.config/systemd/user/job-logo-worker.path
+install -Dm644 current/deploy/job-logo-worker.service ~/.config/systemd/user/job-logo-worker.service
+install -d ~/.config/systemd/user/job-logo-worker.service.d
+cat > ~/.config/systemd/user/job-logo-worker.service.d/current.conf <<'EOF'
+[Service]
+WorkingDirectory=%h/job_search/current
+ExecStart=
+ExecStart=%h/job_search/current/.venv-dashboard/bin/python -m job_search.company_logos --db %h/job_search/data/jobs.sqlite --drain
+EOF
+systemctl --user daemon-reload
+systemctl --user enable --now job-logo-worker.path
+# 기존 공고를 처리하는 최초 1회 실행
+systemctl --user start job-logo-worker.service
+journalctl --user -u job-logo-worker.service --since today
+```
+
+로고가 갱신되지 않으면 `systemctl --user status job-logo-worker.path job-logo-worker.service`와 워커 로그를 확인합니다. `.service`는 한 회차를 마치면 정지 상태로 돌아갑니다. 수집 완료 뒤 워커가 기동하지 않으면 신호 디렉터리의 존재 여부와 감시 경로를 확인합니다. 수집 로그에 신호 기록 실패가 보이면 `~/job_search/data`와 `jobs.sqlite.logo-requests`의 쓰기 권한을 확인합니다. 권한이나 유닛 경로를 수정한 뒤 워커를 한 번 수동 시작하면 DB에 남은 요청을 처리할 수 있습니다. 처리 결과 필드는 [설치 안내](setup.md#기업-로고-워커)에 설명되어 있습니다.
+
 ## 일반 배포 동작과 복구
 
-활성화 직전 채용 cron 작업만 일시 정지하고 실행 중인 검토·마감 갱신이 끝날 때까지 최대 10분 기다립니다. 웹앱을 잠시 중지하고 SQLite 백업을 만든 다음 `current`를 전환합니다. `/healthz`가 정상이어야 성공하며, 실패하면 이전 코드로 되돌립니다. 배포 전 이미 정지한 cron은 켜지 않습니다. 배포 중에는 별도의 수동 수집·검토 실행을 시작하지 않습니다.
+활성화 직전 로고 경로 감시를 먼저 멈추고 로고 서비스의 중단을 확인합니다. Hermes 채용 작업과 마감 타이머를 일시 정지하고 실행 중인 검토·마감 갱신이 끝날 때까지 최대 10분 기다립니다. 웹앱을 잠시 중지하고 SQLite 백업을 만든 다음 `current`를 전환합니다. `/healthz`가 정상이어야 성공하며, 실패하면 이전 코드로 되돌립니다. 배포 중에는 별도의 수동 수집·검토·로고 처리를 시작하지 않습니다.
+
+정지 전에 처리하지 못한 로고 신호는 공유 DB 옆에 남습니다. 로고를 지원하는 릴리스에서 배포 전 활성 상태였던 감시만 재개합니다. 워커 도입 전 릴리스로 복구하면 감시는 정지 상태로 둡니다. 그 릴리스를 계속 운영한다면 `systemctl --user disable --now job-logo-worker.path`로 재부팅 시 시작도 막습니다. 지원 버전으로 다시 배포한 뒤 최초 활성화 절차를 적용합니다.
 
 DB 백업을 자동으로 덮어 복원하지 않습니다. 실패 시에도 새로 입력한 지원 이력을 보존하기 위해서입니다. 로그·DB 백업·실패한 릴리스는 서버에만 남습니다. 용량을 확인하면서 사용하지 않는 예전 릴리스를 수동 정리하며, `current` 대상과 진행 중인 복구 기록의 이전 버전은 남겨 둡니다.
 
@@ -98,5 +135,7 @@ DB 백업을 자동으로 덮어 복원하지 않습니다. 실패 시에도 새
 python3 ~/job_search/current/scripts/deploy.py --recover
 systemctl --user status job-dashboard.service job-availability.timer
 ```
+
+현재 릴리스가 워커 도입 전 버전이면 로고 유닛을 제어할 수 있는 검토된 새 버전의 `scripts/deploy.py --recover`를 사용합니다. 복구가 이전에 활성 상태였던 로고 유닛을 불러오지 못하면 유닛 파일을 복구하고 `daemon-reload`를 실행한 뒤 복구를 다시 실행합니다.
 
 새 배포를 일시 중지하려면 GitHub 저장소 변수 `DEPLOY_ENABLED=false`로 설정합니다. 테스트는 계속 실행됩니다. 실제 배포 완료 여부는 Actions 성공 표시, 서버 `current/.revision`, 웹 상태를 함께 확인합니다.

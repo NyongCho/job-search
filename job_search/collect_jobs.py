@@ -5,7 +5,6 @@ import hashlib
 import html
 import json
 import sqlite3
-import sys
 import time
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -15,7 +14,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .card_metadata import create_logo_tables, has_table
-from .company_logos import enqueue_logo, refresh_logos
+from .company_logos import enqueue_logo, signal_logo_worker
 from .evidence import Document, application_link
 from .job_sources import INTHISWORK_API
 
@@ -86,8 +85,7 @@ def extract(post):
     }
 
 
-def collect(path, fetch_page=request_json, now=None, *, start=None, advance_checkpoint=True, logo_fetch=None):
-    started = time.monotonic()
+def collect(path, fetch_page=request_json, now=None, *, start=None, advance_checkpoint=True):
     now = now or datetime.now(timezone.utc)
     previous = checkpoint(path)
     if start is None:
@@ -128,15 +126,9 @@ def collect(path, fetch_page=request_json, now=None, *, start=None, advance_chec
                 enqueue_logo(db, post_id, doc, fingerprint)
         if advance_checkpoint:
             db.execute("INSERT OR REPLACE INTO metadata VALUES('last_success',?)", (now.isoformat(),))
+    signal_logo_worker(path)
     if not advance_checkpoint:
         result["ids"] = sorted(documents)
-    if logos_available and (logo_fetch is not None or fetch_page is request_json):
-        deadline = min(started + 220, time.monotonic() + 8)
-        options = {"fetch": logo_fetch} if logo_fetch is not None else {}
-        try:
-            refresh_logos(path, limit=3, deadline=deadline, seed=False, **options)
-        except (OSError, sqlite3.Error):
-            print("Company logos will be retried in a later run.", file=sys.stderr)
     return result
 
 

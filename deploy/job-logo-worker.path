@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch for completed job collections
+
+[Path]
+DirectoryNotEmpty=%h/job_search/data/jobs.sqlite.logo-requests
+
+[Install]
+WantedBy=default.target

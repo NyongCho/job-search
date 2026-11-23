@@ -26,17 +26,37 @@ export DASHBOARD_SECRET_KEY="$(.venv-dashboard/bin/python -c 'import secrets; pr
 
 기본 데이터 경로는 `data/jobs.sqlite`, `data/dashboard/dashboard.sqlite`입니다. 앱 코드 폴더 안에 DB를 생성하지 않습니다. 웹앱에서는 `JOBS_DB`, `DASHBOARD_STATE_DB`로 변경할 수 있고, 수집기에서는 `--db`를 하위 명령 앞에 지정합니다.
 
-기존 DB를 다시 사용하는 경우 먼저 [마감·기업 로고 테이블 이전](deployment.md#마감기업-로고-테이블을-추가하는-첫-배포)을 진행합니다. 이전을 마친 공고의 기업 로고는 다음 명령을 반복 실행해 나눠 채울 수 있습니다. 새로 수집하거나 변경된 공고는 수집이 끝난 뒤 일부씩 처리합니다.
+기존 DB에 마감·로고 테이블이 없다면 먼저 [DB 이전](deployment.md#마감기업-로고-테이블을-추가하는-첫-배포)을 진행합니다. 수집기는 공고를 DB에 저장한 뒤 로고 워커에 신호를 남깁니다. 검토는 로고 다운로드를 기다리지 않고 진행할 수 있습니다.
+
+### 기업 로고 워커
+
+아래 명령은 코드와 가상환경을 `~/job_search`에 둔 단일 폴더 설치용입니다. 워커는 이 폴더에서 `.venv-dashboard/bin/python`과 `data/jobs.sqlite`를 사용합니다. `current`로 버전을 전환하는 서버는 [릴리스 설치 절차](deployment.md#기업-로고-워커를-추가하는-첫-배포)를 따릅니다.
 
 ```sh
-.venv-dashboard/bin/python -m job_search.company_logos --db data/jobs.sqlite --limit 20
+cd ~/job_search
+install -d -m 0700 data/jobs.sqlite.logo-requests
+install -Dm644 deploy/job-logo-worker.path ~/.config/systemd/user/job-logo-worker.path
+install -Dm644 deploy/job-logo-worker.service ~/.config/systemd/user/job-logo-worker.service
+systemctl --user daemon-reload
+systemctl --user enable --now job-logo-worker.path
+# 기존 공고를 처리하는 최초 1회 실행
+systemctl --user start job-logo-worker.service
+journalctl --user -u job-logo-worker.service --since today
+```
+
+다른 설치 경로나 DB를 사용하면 두 유닛의 경로를 함께 맞춥니다. `.path`의 `DirectoryNotEmpty`는 수집기에 지정한 DB의 `<DB>.logo-requests` 디렉터리를 가리켜야 합니다. 워커는 처리 가능한 요청을 기본 20건씩 반복 처리합니다. 한 회차의 로그에는 처리 건수(`checked`), 로고 확인 건수(`ready`), 로고 없음 건수(`missing`), 재시도 예정 건수(`retry`)가 기록됩니다. 로고 조회 중 타임아웃 같은 일시 실패는 다음 수집에서 재시도합니다. 새 공고가 없어도 성공한 수집은 신호를 남깁니다. 워커 자체가 오류로 종료하면 systemd가 30초 뒤 다시 실행합니다. 신호 디렉터리에는 수집기가 만든 신호 파일만 둡니다.
+
+systemd를 사용하지 않는 환경에서는 같은 DB를 지정해 수동으로 처리할 수 있습니다.
+
+```sh
+.venv-dashboard/bin/python -m job_search.company_logos --db data/jobs.sqlite --drain
 ```
 
 ## Hermes와 Slack
 
 루트 `deployment.json`에 실제 작업 ID·Slack 채널·웹 주소를 기록합니다. [설정 예시](../deploy/deployment.example.json)를 참고하며 기존 설정은 보존합니다. JSON만 작성하면 예약되는 것은 아닙니다. Hermes에서 작업을 만들고 그 ID와 실행 설정을 일치시켜야 합니다.
 
-이 저장소용 프리런은 [scripts/hermes_collect.py](../scripts/hermes_collect.py)입니다. 기본 앱 위치 `~/job_search`, 기본 Hermes 홈 `~/.hermes`를 사용하며, Hermes의 `scripts/`에 복사해 실행해도 앱 패키지를 찾습니다. 프리런은 설치된 릴리스의 `.venv-dashboard`에서 수집과 로고 처리를 실행합니다. 프리런은 실제 활성 실행 ID를 요구하므로 수동 시험 대신 Hermes 작업을 통해 실행합니다.
+이 저장소용 프리런은 [scripts/hermes_collect.py](../scripts/hermes_collect.py)입니다. 기본 앱 위치 `~/job_search`, 기본 Hermes 홈 `~/.hermes`를 사용하며, Hermes의 `scripts/`에 복사해 실행해도 앱 패키지를 찾습니다. 프리런은 설치된 릴리스의 `.venv-dashboard`에서 수집을 실행합니다. 로고는 수집 신호를 받은 별도 서비스가 처리합니다. 프리런은 실제 활성 실행 ID를 요구하므로 수동 시험 대신 Hermes 작업을 통해 실행합니다.
 
 새 설치에서 기본 프롬프트를 만들 때는 루트에서 다음 명령을 사용합니다. 이미 `hermes_job_prompt.txt`가 있으면 덮어쓰지 않고 실패합니다.
 
