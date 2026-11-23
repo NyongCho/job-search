@@ -97,6 +97,37 @@ class LogoTests(unittest.TestCase):
         url, page, asset = self.ashby()
         self.check_board(url, "BJAK｜Applied AI Engineer", page, asset)
 
+    def test_verified_board_links_are_discovered_from_labeled_anchors_without_apply_url(self):
+        job_id = "d3f3a6b6-8ffc-4d5c-a4e2-a80d785931de"
+        for url in (
+            "https://jobs.ashbyhq.com/bjakcareer/" + job_id,
+            "https://jobs.lever.co/palantir/" + job_id,
+            "https://corp.ninehire.site/job_posting/wwVUsjps",
+            "https://team.example.com/job_posting/wwVUsjps",
+            "https://acme.recruiter.co.kr/career/jobs/135315",
+            "https://acme.career.greetinghr.com/o/12345",
+        ):
+            with self.subTest(url=url):
+                doc = {"title": "Acme｜엔지니어", "links": [{"url": url, "text": "공고 원문"}]}
+                self.assertEqual(company_logos._plan(doc).page, url)
+                doc["links"][0]["text"] = "개인 블로그"
+                self.assertIsNone(company_logos._plan(doc).page)
+        doc = {"title": "Acme｜엔지니어", "links": [{"url": "https://example.com/team", "text": "공고 원문"}]}
+        self.assertIsNone(company_logos._plan(doc).page)
+
+    def test_worker_reads_named_job_anchor_from_collected_listing(self):
+        job_id = "d3f3a6b6-8ffc-4d5c-a4e2-a80d785931de"
+        _, page, image = self.ashby(post_id=job_id)
+        url = "https://jobs.ashbyhq.com/bjakcareer/" + job_id
+        self.collect([branded_post(1, "BJAK", f'<a href="{url}">지원하기</a>')])
+        self.assertFalse(collect_jobs.get_posts(self.jobs, [1])[0].get("apply_url"))
+        def fetch(requested, **_):
+            self.calls.append(requested)
+            return (url, page.encode(), "text/html") if requested == url else (requested, logo_png(), "image/png")
+        company_logos.refresh_logos(self.jobs, fetch=fetch)
+        self.assertEqual(self.calls, [url, image])
+        self.assert_logo(1)
+
     def test_ashby_ignores_wrong_post_and_platform_favicon(self):
         url, page, _ = self.ashby(post_id="wrong-id")
         self.check_board(url, "BJAK｜Applied AI Engineer", page, None)

@@ -120,6 +120,20 @@ def _official_domain(url, company):
     return ".".join(labels[-size:])
 
 
+def _branding_job_link(url):
+    """Allow known public posting routes as logo sources for a labeled application link."""
+    location = urlsplit(url)
+    host, path = location.hostname, location.path.rstrip("/")
+    if host in {"jobs.ashbyhq.com", "jobs.lever.co", "jobs.eu.lever.co"}:
+        return re.fullmatch(r"/[\w-]+/[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}(?:/apply|/application)?", path, re.I | re.ASCII)
+    if host.endswith(".recruiter.co.kr"):
+        return re.fullmatch(r"/career/jobs/[1-9][0-9]*", path)
+    if host.endswith(".career.greetinghr.com"):
+        return re.fullmatch(r"/(?:[a-z]{2}/)?o/[1-9][0-9]*", path)
+    # Ninehire and Greeting also publish these routes on employers' custom domains.
+    return re.fullmatch(r"/job_posting/[A-Za-z0-9]{8}|/[a-z]{2}/o/[1-9][0-9]*", path)
+
+
 def _plan(doc):
     title = doc.get("title")
     company, _, role = title.partition("｜") if isinstance(title, str) else ("", "", "")
@@ -149,6 +163,8 @@ def _plan(doc):
             if locator or domain:
                 page = url
                 break
+            if page is None and _branding_job_link(url):
+                page = url
     if locator:
         page = locator.url
         scope = f"{locator.source}:{locator.scope}"
@@ -156,8 +172,8 @@ def _plan(doc):
             scope += ":" + locator.original_id
     elif domain:
         scope = "domain:" + domain
-    elif apply_url and urlsplit(apply_url).hostname not in {"forms.gle", "docs.google.com", "tally.so", "form.naver.com"}:
-        page = apply_url
+    elif page or (apply_url and urlsplit(apply_url).hostname not in {"forms.gle", "docs.google.com", "tally.so", "form.naver.com"}):
+        page = page or apply_url
         scope = "linked:" + urlsplit(page).hostname
     elif body_url:
         scope = "body:" + body_url
