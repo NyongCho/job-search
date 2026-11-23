@@ -17,6 +17,7 @@ from uuid import uuid4
 from .card_metadata import has_table
 from .evidence import Document
 from .job_availability import document_version
+from .jobda_logos import jobda_logo
 from .job_sources import (
     _next_data, company_key, company_names, fetch_posting, linked_job_locator, matches_jd_source, parse_posting,
     role_key, source_locator,
@@ -350,6 +351,9 @@ def _official(plan, fetch, deadline, doc):
         candidate = _board_brand(page, final, plan.company)
         if candidate:
             return candidate
+        image = jobda_logo(page, final, plan.company, fetch, deadline)
+        if image:
+            return Candidate("jobda:" + urlsplit(final).hostname, final, image)
     if plan.locator and plan.locator.source == "greeting" and not plan.verified_source:
         posting = parse_posting(plan.locator, final, raw, previous=doc)
         return posting_logo(posting, plan.locator)
@@ -445,7 +449,9 @@ def _attempt(db, plan, fetch, deadline, image_module, doc):
             token = _claim_image(db, candidate, deadline)
             if token is None:
                 return "ready", candidate, None, None
-            _, data, _ = fetch(candidate.image_url, deadline=deadline, limit=MAX_IMAGE)
+            final, data, _ = fetch(candidate.image_url, deadline=deadline, limit=MAX_IMAGE)
+            if candidate.key.startswith("jobda:") and final != candidate.image_url:
+                raise ValueError("JOBDA image redirected away from its verified asset")
             png = _verified_png(data, image_module)
             if png is not None:
                 return "ready", candidate, png, token
