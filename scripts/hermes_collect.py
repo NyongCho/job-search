@@ -45,7 +45,7 @@ def main():
         python = next((path for release in (root / "current", root)
                        if (path := release / ".venv-dashboard/bin/python").is_file()), "/usr/bin/python3")
         result = subprocess.run([str(python), "-m", "job_search.collect_jobs", "collect"],
-                                cwd=root, capture_output=True, text=True, timeout=240, check=True)
+                                cwd=root, stdout=subprocess.PIPE, text=True, timeout=240, check=True)
         payload.update(json.loads(result.stdout))
     print(json.dumps(payload, ensure_ascii=False))
 
