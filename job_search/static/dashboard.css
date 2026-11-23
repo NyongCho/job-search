@@ -240,12 +240,19 @@ blockquote { margin: 14px 0; border-left: 2px solid #c6d9ce; padding: 3px 0 3px 
 .refresh-run[data-outcome="complete"] .refresh-badge { background: var(--teal-light); color: #15594d; }
 .refresh-run[data-outcome="failed"] .refresh-badge { background: #fae9dd; color: #783e13; }
 .refresh-kinds { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 8px; }
+.refresh-task-list { margin: 8px 0 0; }
+.refresh-task-list > div { display: grid; grid-template-columns: 5em minmax(0, 1fr); padding: 6px 0; border-top: 1px solid var(--line); }
+.refresh-task-list dt { font-weight: 650; }
+.refresh-task-list dd { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 8px; margin: 0; }
+.refresh-task-list [data-task-message] { color: #505e69; overflow-wrap: anywhere; }
+.refresh-task-list [data-state="failed"] strong { color: #96481f; }
+.refresh-task-list [data-state="done"] strong { color: #15594d; }
 .refresh-kind > div { justify-content: space-between; gap: 4px; }
 .refresh-kind small { display: block; color: #505e69; font-size: 11px; }
 .refresh-run progress { display: block; width: 100%; height: 5px; margin: 5px 0; border: 0; border-radius: 4px; overflow: hidden; appearance: none; background: #e6ebea; color: var(--teal); }
 .refresh-run > progress { height: 8px; margin-top: 8px; }
 .refresh-run progress::-webkit-progress-bar { background: #e6ebea; }
-.refresh-kind[data-failed="true"] { --bar-color: #a65c1f; }
+.refresh-run[data-outcome="failed"] > progress, .refresh-kind[data-failed="true"] { --bar-color: #a65c1f; }
 .refresh-run progress::-webkit-progress-value { background: var(--bar-color, var(--teal)); }
 .refresh-run progress::-moz-progress-bar { background: var(--bar-color, var(--teal)); }
 .usage-report { margin: 32px auto; width: min(480px, 90%); }

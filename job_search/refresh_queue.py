@@ -8,6 +8,27 @@ from pathlib import Path
 
 KINDS = ("deadline", "logo", "fit")
 STATUSES = ("queued", "running", "done", "failed", "skipped")
+FIT_FAILURE_REASONS = {
+    "Hermes 평가 실행 준비 실패": "Hermes가 적합도 평가를 시작하지 못했어요.",
+    "평가 응답에서 공고 누락 또는 중복": "평가 응답에서 이 공고가 누락되거나 중복됐어요.",
+    "Invalid fit tenure months or required_months": "평가 응답의 경력 개월 수가 올바르지 않아요.",
+    "Fit months are only valid for tenure": "평가 응답에 경력 기간과 무관한 항목의 개월 수가 들어 있어요.",
+    "Fit tenure must be a required criterion": "평가 응답에서 필수 경력 기간이 잘못 분류됐어요.",
+    "Invalid fit criterion evidence_lines": "평가 기준이 인용한 공고 본문의 행을 확인할 수 없어요.",
+    "Invalid fit criterion category or status": "평가 기준의 분류 또는 판정이 올바르지 않아요.",
+    "Invalid fit assessment version or JD line count": "평가 형식 버전이나 공고 본문의 행 수가 올바르지 않아요.",
+    "Invalid fit assessment completeness, preference, eligibility or criteria": "평가 응답의 지원 요건·선호도·평가 기준을 확인할 수 없어요.",
+    "Fit question must be a single line": "평가 응답의 확인 질문이 여러 줄로 나뉘어 있어요.",
+    "A question is required for unknown required experience": "필수 경험을 확인하기 위한 질문이 평가 응답에서 빠졌어요.",
+    "Invalid fit question": "평가 응답의 확인 질문 형식이 올바르지 않아요.",
+    "평가 실행 확인 필요": "평가 실행 결과를 확인할 수 없어요.",
+    "JD 버전 불일치": "평가한 공고의 버전이 요청한 버전과 달라요.",
+    "지원 판정 누락": "평가 응답에 지원 판정이 없어요.",
+    "판정 요약 누락": "평가 응답에 판정 요약이 없어요.",
+    "JD 근거 행 오류": "평가가 인용한 공고 본문의 행을 확인할 수 없어요.",
+    "JD 인용문 불일치": "평가가 인용한 문장이 공고 본문과 일치하지 않아요.",
+    "경력 근거 불일치": "평가가 인용한 경력 근거를 확인할 수 없어요.",
+}
 
 
 def connect(path):
@@ -154,8 +175,23 @@ def finish(path, task, status, message="", *, db=None):
         db.execute("INSERT OR REPLACE INTO refresh_changes(work_id) VALUES(?)", (task["id"],))
 
 
-def _snapshot(db, run, after):
-    if not db.execute("SELECT 1 FROM refresh_runs WHERE id=?", (run,)).fetchone():
+def _result_message(kind, status, message):
+    if status in ("queued", "running"):
+        return ""
+    if kind == "fit" and status == "failed":
+        # Old fit failures can contain raw model output or an exception from the evaluator.
+        if message.startswith("Conflicting fit evidence for "):
+            return "같은 평가 기준에 서로 다른 판정이 기록됐어요."
+        if message in {"Invalid fit criterion", "Invalid fit key", "Invalid fit label", "Invalid fit category",
+                       "Invalid fit status", "Invalid fit evidence"}:
+            return "평가 기준의 이름·판정·근거 형식을 확인할 수 없어요."
+        return FIT_FAILURE_REASONS.get(message, "적합도 평가를 완료하지 못해 점수를 갱신하지 못했어요.")
+    return message
+
+
+def _snapshot(db, run, after, post_id=None):
+    meta = db.execute("SELECT scope FROM refresh_runs WHERE id=?", (run,)).fetchone()
+    if meta is None:
         raise LookupError("Unknown refresh")
     counts = dict.fromkeys(STATUSES, 0)
     by_kind = {kind: dict.fromkeys(STATUSES, 0) for kind in KINDS}
@@ -167,15 +203,26 @@ def _snapshot(db, run, after):
         JOIN refresh_members m ON m.group_id=w.group_id WHERE m.run_id=?"""
     cursor = db.execute("SELECT coalesce(max(seq),0)" + query, (run,)).fetchone()[0]
     changes = [] if after is None else [dict(r) for r in db.execute(
-        "SELECT seq,w.post_id,w.kind,w.status,w.message" + query + " AND seq>? ORDER BY seq", (run, after))]
-    return {"id": run, "counts": counts, "by_kind": by_kind, "cursor": cursor, "changes": changes,
-            "complete": not (counts["queued"] or counts["running"])}
+        "SELECT seq,w.post_id,w.kind,w.status,substr(w.message,1,256) AS message" + query
+        + " AND seq>? ORDER BY seq", (run, after))]
+    for change in changes:
+        change["message"] = _result_message(change["kind"], change["status"], change["message"])
+    result = {"id": run, "counts": counts, "by_kind": by_kind, "cursor": cursor, "changes": changes,
+              "list_scope": meta["scope"].startswith("list:"), "complete": not (counts["queued"] or counts["running"])}
+    if post_id is not None:
+        result["post_tasks"] = {
+            kind: {"status": status, "message": _result_message(kind, status, message)}
+            for kind, status, message in db.execute("""SELECT w.kind,w.status,substr(w.message,1,256)
+                FROM refresh_work w JOIN refresh_members m USING(group_id)
+                WHERE m.run_id=? AND w.post_id=?""", (run, post_id))
+        }
+    return result
 
 
-def snapshot(path, run, after=None):
+def snapshot(path, run, after=None, *, post_id=None):
     with closing(connect(path)) as db:
         db.execute("BEGIN")
-        return _snapshot(db, run, after)
+        return _snapshot(db, run, after, post_id)
 
 
 def activity(path):
@@ -189,12 +236,17 @@ def activity(path):
         return {"cursor": row[0], "active": bool(row[1])}
 
 
-def find(path, scope, targets):
+def find(path, scope, targets, *, post_id=None):
     # One consistent read covers navigation during a commit on either side of a page boundary.
     with closing(connect(path)) as db:
         db.execute("BEGIN")
         if not db.execute("SELECT 1 FROM sqlite_master WHERE name='refresh_runs'").fetchone():
             return []
+        if post_id is not None:
+            # The newest refresh that included this job can be individual or list-wide.
+            run = db.execute("""SELECT max(m.run_id) FROM refresh_groups g
+                JOIN refresh_members m ON m.group_id=g.id WHERE g.post_id=?""", (post_id,)).fetchone()[0]
+            return [_snapshot(db, run, None, post_id)] if run is not None else []
         candidates = db.execute("""SELECT r.id,r.scope, EXISTS(SELECT 1 FROM refresh_members m
             JOIN refresh_work w USING(group_id) WHERE m.run_id=r.id AND w.status IN ('queued','running')) AS active
             FROM refresh_runs r WHERE r.scope=? OR EXISTS(SELECT 1 FROM refresh_members m

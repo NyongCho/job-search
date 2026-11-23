@@ -363,7 +363,7 @@ function progressSummary(counts) {
   if (!total) state = "대상 없음";
   else if (counts.running) state = "처리 중";
   else if (counts.queued) state = "대기 중";
-  else if (counts.failed) state = counts.failed === total ? "실패" : "일부 실패";
+  else if (counts.failed) state = counts.failed === total ? "전체 실패" : "일부 실패";
 
   const parts = [];
   for (const [key, label] of [["running","처리 중"], ["queued","대기"], ["done","성공"], ["skipped","해당 없음"], ["failed","실패"]]) {
@@ -381,21 +381,42 @@ function setProgress(bar, summary) {
   bar.value = summary.finished;
 }
 
+const taskStates = {queued: "대기 중", running: "처리 중", done: "성공", failed: "실패", skipped: "건너뜀"};
+
+function showPostTasks(panel, tasks) {
+  const counts = {queued: 0, running: 0, done: 0, failed: 0, skipped: 0};
+  for (const row of panel.querySelectorAll("[data-task]")) {
+    const task = tasks[row.dataset.task];
+    if (!task) continue;
+    counts[task.status]++;
+    row.dataset.state = task.status;
+    setText(row.querySelector("[data-task-status]"), taskStates[task.status]);
+    setText(row.querySelector("[data-task-message]"), task.message ||
+      (task.status === "failed" ? "세부 실패 사유가 기록되지 않았어요." : ""));
+  }
+  return counts;
+}
+
 function showProgress() {
   const now = Date.now();
   for (const panel of document.querySelectorAll("[data-refresh-panels] [data-run-id]")) {
     const run = runs.get(Number(panel.dataset.runId));
     if (!run) continue;
-    const summary = progressSummary(run.counts);
-    const signature = [run.cursor, run.counts.running, run.counts.queued].join("/");
-    if (lastProgress.get(run.id)?.signature !== signature) lastProgress.set(run.id, {signature, at: now});
-    const minutes = Math.floor((now - lastProgress.get(run.id).at) / 60000);
-    const elapsed = !run.complete && minutes ? ` · ${minutes}분간 변동 없음` : "";
+    const individual = panel.dataset.postResults !== undefined;
+    if (individual && !run.post_tasks) continue;
+    const counts = individual ? showPostTasks(panel, run.post_tasks) : run.counts;
+    const summary = progressSummary(counts);
+    const complete = summary.finished === summary.total;
+    const progressKey = `${run.id}/${individual ? "post" : "list"}`;
+    const signature = individual ? JSON.stringify(run.post_tasks) : [run.cursor, counts.running, counts.queued].join("/");
+    if (lastProgress.get(progressKey)?.signature !== signature) lastProgress.set(progressKey, {signature, at: now});
+    const minutes = Math.floor((now - lastProgress.get(progressKey).at) / 60000);
+    const elapsed = !complete && minutes ? ` · ${minutes}분간 변동 없음` : "";
     setText(panel.querySelector("[data-run-state]"), summary.state);
-    const pending = run.complete ? "" : ` · 실행 중 ${run.counts.running} · 대기 ${run.counts.queued}`;
-    setText(panel.querySelector("[data-run-total]"), `${summary.finished}/${summary.total}개 처리${pending}${elapsed}`);
+    const pending = complete ? "" : ` · 실행 중 ${counts.running} · 대기 ${counts.queued}`;
+    setText(panel.querySelector("[data-run-total]"), `작업 ${summary.finished}/${summary.total}개 처리${pending}${elapsed}`);
     setProgress(panel.querySelector("[data-run-bar]"), summary);
-    panel.dataset.outcome = run.complete && run.counts.failed ? "failed" : run.complete ? "complete" : "active";
+    panel.dataset.outcome = complete && counts.failed ? "failed" : complete ? "complete" : "active";
     for (const part of panel.querySelectorAll("[data-kind]")) {
       const counts = run.by_kind[part.dataset.kind];
       const value = progressSummary(counts);
@@ -455,7 +476,8 @@ async function poll() {
         };
         const [latest, ...updates] = await Promise.all([
           activity?.active ? read("/refreshes/activity") : null,
-          ...active.map(run => read(`/refreshes/${run.id}?after=${run.cursor}&view=progress`)),
+          ...active.map(run => read(`/refreshes/${run.id}?after=${run.cursor}&view=progress` +
+            (detail ? `&post_id=${encodeURIComponent(detail.dataset.jobId)}` : ""))),
         ]);
         if (!pageActive || version !== screenVersion) return;
         const changed = (latest && latest.cursor !== activity.cursor) || updates.some(run => run.changes.length > 0);

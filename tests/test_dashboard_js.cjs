@@ -245,7 +245,7 @@ test('a confirmed deadline repaints while the worker still reads the linked JD',
   assert.equal(snapshots, 1);
 });
 
-test('list and detail paint their own real counts, including partial failure', () => {
+test('the same run paints list totals and each selected job task with its own reason', () => {
   function fields() {
     const elements = new Map();
     return {querySelector(key) {
@@ -253,29 +253,49 @@ test('list and detail paint their own real counts, including partial failure', (
       return elements.get(key);
     }};
   }
-  function panel(id) {
-    const kinds = ['deadline', 'logo', 'fit'].map(kind => ({...fields(), dataset: {kind}}));
-    return {...fields(), dataset: {runId: String(id)}, querySelectorAll: () => kinds, kinds};
+  function panel(individual) {
+    const rows = ['deadline', 'logo', 'fit'].map(kind => ({...fields(), dataset: {kind, task: kind}}));
+    const dataset = {runId: '10', ...(individual ? {postResults: ''} : {})};
+    return {...fields(), dataset, rows, querySelectorAll: key =>
+      key === (individual ? '[data-task]' : '[data-kind]') ? rows : []};
   }
   const counts = (changes = {}) => ({queued: 0, running: 0, done: 0, failed: 0, skipped: 0, ...changes});
-  const first = {id: 10, counts: counts({done: 1, running: 1, queued: 1}), by_kind: {
-    deadline: counts({done: 1}), logo: counts({running: 1}), fit: counts({queued: 1}),
+  const run = {id: 10, counts: counts({failed: 3, done: 1, running: 1, queued: 1}), by_kind: {
+    deadline: counts({failed: 1, done: 1}), logo: counts({failed: 1, running: 1}), fit: counts({failed: 1, queued: 1}),
+  }, post_tasks: {
+    deadline: {status: 'failed', message: '원본 공고 미확인'}, logo: {status: 'failed', message: '이미지 수집 실패'},
+    fit: {status: 'failed', message: 'Hermes가 적합도 평가를 시작하지 못했어요.'},
   }};
-  const second = {id: 12, complete: true, counts: counts({done: 1, skipped: 1, failed: 1}), by_kind: {
-    deadline: counts({done: 1}), logo: counts({skipped: 1}), fit: counts({failed: 1}),
-  }};
-  const list = panel(10), detail = panel(12);
-  vm.runInNewContext(script + '\n runs.set(10, first); runs.set(12, second); showProgress();', {
-    first, second, document: {querySelector() { return null; }, querySelectorAll() { return [list, detail]; }},
+  const list = panel(false), detail = panel(true);
+  const paint = vm.runInNewContext(script + '\n runs.set(10, run); showProgress;', {
+    run, document: {querySelector() { return null; }, querySelectorAll() { return [list, detail]; }},
   });
+  paint();
   assert.equal(list.querySelector('[data-run-state]').textContent, '처리 중');
-  assert.equal(list.querySelector('[data-run-total]').textContent, '1/3개 처리 · 실행 중 1 · 대기 1');
-  assert.deepEqual(list.querySelector('[data-run-bar]'), {max: 3, value: 1});
-  assert.equal(list.kinds[0].querySelector('progress').value, 1);
-  assert.equal(list.kinds[1].querySelector('[data-kind-status]').textContent, '처리 중 1');
-  assert.equal(list.kinds[2].querySelector('[data-kind-status]').textContent, '대기 1');
+  assert.equal(list.querySelector('[data-run-total]').textContent, '작업 4/6개 처리 · 실행 중 1 · 대기 1');
+  assert.deepEqual(list.querySelector('[data-run-bar]'), {max: 6, value: 4});
+  assert.equal(list.rows[0].querySelector('progress').value, 2);
+  assert.equal(list.rows[1].querySelector('[data-kind-status]').textContent, '처리 중 1 · 실패 1');
+  assert.equal(detail.querySelector('[data-run-state]').textContent, '전체 실패');
+  assert.equal(detail.querySelector('[data-run-total]').textContent, '작업 3/3개 처리');
+  assert.deepEqual(detail.rows.map(row => row.querySelector('[data-task-status]').textContent), ['실패','실패','실패']);
+  assert.deepEqual(detail.rows.map(row => row.querySelector('[data-task-message]').textContent),
+    ['원본 공고 미확인','이미지 수집 실패','Hermes가 적합도 평가를 시작하지 못했어요.']);
+  const savedTasks = run.post_tasks;
+  delete run.post_tasks;
+  paint();
+  assert.equal(detail.querySelector('[data-run-state]').textContent, '전체 실패');
+  run.post_tasks = savedTasks;
+  run.post_tasks.logo = {status: 'queued', message: ''};
+  run.post_tasks.fit = {status: 'running', message: ''};
+  paint();
+  assert.deepEqual(detail.rows.map(row => row.querySelector('[data-task-status]').textContent), ['실패','대기 중','처리 중']);
+  assert.equal(detail.rows[2].querySelector('[data-task-message]').textContent, '');
+  run.post_tasks.logo = {status: 'skipped', message: '확인된 기업 로고가 없어요.'};
+  run.post_tasks.fit = {status: 'done', message: '기존 평가'};
+  paint();
   assert.equal(detail.querySelector('[data-run-state]').textContent, '일부 실패');
-  assert.equal(detail.kinds[2].querySelector('[data-kind-status]').textContent, '실패 1');
+  assert.deepEqual(detail.rows.map(row => row.querySelector('[data-task-status]').textContent), ['실패','건너뜀','성공']);
 });
 
 test('an empty destination tab polls until active work can no longer change its cards or totals', async () => {
