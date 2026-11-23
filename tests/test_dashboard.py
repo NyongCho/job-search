@@ -169,9 +169,10 @@ class WebTests(unittest.TestCase):
         collect_fit_examples(self.source)
         page = self.get("/").get_data(as_text=True)
         headings = re.findall(r'<h2 class="list-group-title">([^<]+)</h2>', page)
-        self.assertEqual(headings, ["희망 직무 추천", "선호 밖 추천", "기존 추천 · 미산정", "확인 질문"])
-        self.assertIn("75.0점", page)
-        self.assertIn("90.0점", page)
+        self.assertEqual(headings, ["확인 질문"])
+        self.assertIn("75.0점 · 희망 직무 추천", page)
+        self.assertIn("90.0점 · 선호 밖 추천", page)
+        self.assertIn("적합도 미산정", page)
         self.assertNotIn("79.9점", page)
         self.assertIn("운영 장애에 직접 대응했나요?", page)
         with patch.object(dashboard.store, "PAGE_SIZE", 2):
