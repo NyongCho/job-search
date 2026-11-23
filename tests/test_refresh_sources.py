@@ -462,6 +462,35 @@ class RefreshSourceTests(unittest.TestCase):
         self.assertEqual(urls[1:], [expired, home, image])
         self.assertIsNotNone(company_logos.read_logo(self.jobs, 1))
 
+    def test_verified_greeting_snapshot_tries_header_after_invalid_group_image(self):
+        host = "acme.career.greetinghr.com"
+        url = f"https://{host}/ko/o/1"
+        group = "https://profiles.greetinghr.com/group/acme"
+        header = "https://opening-attachments.greetinghr.com/header/acme.png"
+        self.seed([branded_post(1)])
+        self.update_document(1, source="greeting", source_job_id=1, url=url)
+        page = next_page({"host": host, "openingId": 1,
+            "careerBootInfo": {"design": {"header": {"logoUrl": header}}},
+            "dehydratedState": {"queries": [{"queryKey": ["career", "getOpeningById"], "state": {
+                "data": {"success": True, "data": {"groupInfo": {"name": "Acme", "imageUrl": group},
+                "openingsInfo": {"openingId": 1, "title": "엔지니어", "status": "OPEN", "dueDate": "2026-12-26"}}}}}]}})
+        calls = []
+        def fetch(requested, **_):
+            calls.append(requested)
+            if requested == url:
+                return url, page.encode(), "text/html"
+            if requested == group:
+                return group, b"Broken image", "image/png"
+            self.assertEqual(requested, header)
+            return header, logo_png(), "image/png"
+
+        task = self.task(1)
+        self.deadlines([task], fetch)
+        self.logo(dict(task, id=2, source_work_id=1), fetch)
+        self.assertEqual(self.events(), {1: "done", 2: "done"})
+        self.assertEqual(calls, [url, group, header])
+        self.assertIsNotNone(company_logos.read_logo(self.jobs, 1))
+
     def test_failed_greeting_deadline_still_refreshes_the_employers_board_logo(self):
         host = "acme.career.greetinghr.com"
         url = f"https://{host}/ko/o/1"

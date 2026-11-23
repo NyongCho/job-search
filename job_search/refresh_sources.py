@@ -96,8 +96,8 @@ def _open(path):
     return sqlite3.connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True, timeout=10)
 
 
-def _official_result(doc, locator, final_url, body, *, listing=None):
-    posting = parse_posting(locator, final_url, body, previous=doc)
+def _official_result(doc, locator, final_url, raw, *, listing=None):
+    posting = parse_posting(locator, final_url, raw, previous=doc)
     try:
         official_facts = _external_facts(doc, posting)
     except ValueError:
@@ -135,7 +135,12 @@ def _official_result(doc, locator, final_url, body, *, listing=None):
             fresh["modified_gmt"] = modified
         if posting.modified:
             fresh["jd_modified_gmt"] = posting.modified
-    candidate = company_logos.posting_logo(posting, locator) or plan.body
+    board = None
+    if locator.source == "greeting":
+        # Save the branding from this response so the logo worker need not download the posting again.
+        board = company_logos._board_brand(raw.decode("utf-8-sig"), final_url, locator.company)
+        plan = replace(plan, page=None)
+    candidate = board or company_logos.posting_logo(posting, locator) or plan.body
     return SourceResult(
         facts,
         modified,
@@ -350,7 +355,7 @@ def _snapshot_plan(serialized):
     data = json.loads(serialized)
     if data["locator"]:
         data["locator"] = SourceLocator(**data["locator"])
-        if not data.get("page") and not data.get("awaiting_official"):
+        if not data.get("page") and not data.get("awaiting_official") and not data.get("verified_source"):
             # Previously saved final snapshots omitted the board URL when the linked posting failed.
             data["page"] = company_logos.greeting_home(data["locator"].url)
     if data["body"]:

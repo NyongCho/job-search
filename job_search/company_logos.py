@@ -49,6 +49,12 @@ class Candidate:
     key: str
     source_page: str
     image_url: str
+    alternate_image_url: str | None = None
+
+
+def _brand_candidate(key, page, urls):
+    distinct = list(dict.fromkeys(url for url in urls if url))
+    return Candidate(key, page, *distinct) if distinct else None
 
 
 @dataclass(frozen=True)
@@ -209,13 +215,14 @@ def _ashby_brand(page, url, path, employer):
     if (org["hostedJobsPageSlug"] != match[1] or data["posting"]["id"] != match[2]
             or not employer & company_names(org["name"])):
         return None
+    assets = []
     for field in ("logoSquareImageUrl", "logoWordmarkImageUrl"):
         asset = _asset(org["theme"].get(field), url)
         if (asset and urlsplit(asset).hostname == "app.ashbyhq.com"
                 and re.fullmatch(r"/api/images/org-theme-(?:square|wordmark)/"
                                  + re.escape(org["organizationId"]) + r"/.+", urlsplit(asset).path)):
-            return Candidate("ashby:" + org["organizationId"], url, asset)
-    return None
+            assets.append(asset)
+    return _brand_candidate("ashby:" + org["organizationId"], url, assets)
 
 
 def _ninehire_brand(props, url, employer):
@@ -244,6 +251,7 @@ def _greeting_brand(props, url, employer):
     opening = re.fullmatch(r"/(?:[a-z]{2}/)?o/([0-9]+)/?", location.path)
     if opening and str(props.get("openingId")) != opening[1]:
         return None
+    assets = []
     for value in (workspace.get("imageUrl"), design.get("header", {}).get("logoUrl")):
         asset = _asset(value, url)
         if not asset:
@@ -251,9 +259,9 @@ def _greeting_brand(props, url, employer):
         loc = urlsplit(asset)
         if ((loc.hostname == "profiles.greetinghr.com" and loc.path.startswith("/group/"))
                 or loc.hostname == "opening-attachments.greetinghr.com"):
-            tenant = location.hostname.split(".")[0] if greeting_home(url) else f"{location.hostname}:{workspace['id']}"
-            return Candidate("greeting:" + tenant, url, asset)
-    return None
+            assets.append(asset)
+    tenant = location.hostname.split(".")[0] if greeting_home(url) else f"{location.hostname}:{workspace['id']}"
+    return _brand_candidate("greeting:" + tenant, url, assets)
 
 
 def _board_brand(page, url, company):
@@ -314,8 +322,10 @@ def _json_logo(page, plan, url):
 
 
 def posting_logo(posting, locator):
-    url = _asset(posting.logo, locator.url) or _logo_in_images(posting.body.images, locator.company, locator.url)
-    return Candidate(posting.organization, locator.url, url) if url else None
+    assets = [_asset(value, locator.url) for value in (posting.logo, posting.alternate_logo)]
+    if not any(assets):
+        assets = [_logo_in_images(posting.body.images, locator.company, locator.url)]
+    return _brand_candidate(posting.organization, locator.url, assets)
 
 
 def _official(plan, fetch, deadline, doc):
@@ -454,14 +464,26 @@ def _release_image(db, token):
         db.execute("DELETE FROM logo_image_claims WHERE token=?", (token,))
 
 
+def _image_candidates(plan, fetch, deadline, doc):
+    seen = set()
+    for source in ("body", "official"):
+        brand = plan.body if source == "body" else _official(plan, fetch, deadline, doc)
+        if brand:
+            for url in (brand.image_url, brand.alternate_image_url):
+                if url and (brand.key, url) not in seen:
+                    seen.add((brand.key, url))
+                    yield Candidate(brand.key, brand.source_page, url)
+
+
 def _attempt(db, plan, fetch, deadline, image_module, doc):
+    candidates = _image_candidates(plan, fetch, deadline, doc)
     retry = False
-    for current in ("body", "official"):
+    while True:
         token = None
         try:
-            candidate = plan.body if current == "body" else _official(plan, fetch, deadline, doc)
+            candidate = next(candidates, None)
             if not candidate:
-                continue
+                break
             token = _claim_image(db, candidate, deadline)
             if token is None:
                 return "ready", candidate, None, None

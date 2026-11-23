@@ -136,6 +136,7 @@ class SourcePosting:
     logo: str | None
     organization: str
     modified: str | None = None
+    alternate_logo: str | None = None
 
 
 def _next_data(page):
@@ -211,7 +212,7 @@ def _greeting(locator, url, page):
     header = props.get("careerBootInfo", {}).get("design", {}).get("header", {})
     logo = group.get("imageUrl") or header.get("logoUrl")
     return SourcePosting(_body(posting.get("detail"), url), posting.get("dueDate"), closed, logo,
-                         f"greeting:{locator.scope}")
+                         f"greeting:{locator.scope}", alternate_logo=header.get("logoUrl"))
 
 
 def _wanted(locator, url, page):

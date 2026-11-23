@@ -84,10 +84,10 @@ class LogoTests(unittest.TestCase):
         else:
             self.assertIsNone(company_logos.read_logo(self.jobs, 1))
 
-    def ashby(self, name="BJAK", post_id="job-123"):
+    def ashby(self, name="BJAK", post_id="job-123", square=None):
         asset = "https://app.ashbyhq.com/api/images/org-theme-wordmark/org-1/theme/brand.png"
         data = {"organization": {"name": name, "organizationId": "org-1", "hostedJobsPageSlug": "bjakcareer",
-                                 "theme": {"logoWordmarkImageUrl": asset}},
+                                 "theme": {"logoWordmarkImageUrl": asset, "logoSquareImageUrl": square}},
                 "posting": {"id": post_id, "title": "Applied AI Engineer"}}
         page = ('<link rel="icon" href="https://cdn.ashbyprd.com/favicon.png">'
                 '<script nonce="nonce">window.__appData = ' + json.dumps(data) + '; loadBundle();</script>')
@@ -96,6 +96,54 @@ class LogoTests(unittest.TestCase):
     def test_ashby_wordmark_belongs_to_posted_organization(self):
         url, page, asset = self.ashby()
         self.check_board(url, "BJAK｜Applied AI Engineer", page, asset)
+
+    def test_ashby_tries_verified_wordmark_when_square_is_gone(self):
+        from job_search.public_fetch import PublicHTTPError
+        square = "https://app.ashbyhq.com/api/images/org-theme-square/org-1/theme/square.png"
+        url, page, wordmark = self.ashby(square=square)
+        self.collect([branded_post(1, "BJAK", f'<a href="{url}">지원하러가기</a>')])
+        deadlines = []
+        def fetch(requested, **options):
+            self.calls.append(requested)
+            deadlines.append(options["deadline"])
+            if requested == url:
+                return url, page.encode(), "text/html"
+            if requested == square:
+                raise PublicHTTPError(404)
+            self.assertEqual(requested, wordmark)
+            return requested, logo_png(), "image/png"
+        company_logos.refresh_logos(self.jobs, fetch=fetch)
+        self.assertEqual(self.calls, [url, square, wordmark])
+        self.assertEqual(len(set(deadlines)), 1)
+        self.assert_logo(1)
+        with closing(sqlite3.connect(self.jobs)) as db:
+            self.assertEqual(db.execute("SELECT image_url FROM company_logos").fetchone(), (wordmark,))
+            self.assertEqual(db.execute("SELECT count(*) FROM logo_image_claims").fetchone(), (0,))
+
+    def test_greeting_duplicate_or_transient_failed_assets_preserve_queue_outcome(self):
+        from job_search.public_fetch import PublicHTTPError
+        base = "https://acme.career.greetinghr.com/ko/o/"
+        group = "https://profiles.greetinghr.com/group/acme"
+        header = "https://opening-attachments.greetinghr.com/header/acme.png"
+        self.collect([branded_post(n, "Acme", f'<a href="{base}{n}">지원하러가기</a>') for n in (1, 2)])
+        def fetch(url, **_):
+            self.calls.append(url)
+            if url.startswith(base):
+                n = url[-1]
+                page = next_page({"host": "acme.career.greetinghr.com", "openingId": n,
+                    "careerBaseInfo": {"workspace": {"id": 8, "name": "Acme", "imageUrl": group}},
+                    "careerBootInfo": {"design": {"header": {"logoUrl": group if n == "1" else header}}}})
+                return url, page.encode(), "text/html"
+            if url == group:
+                return url, b"Invalid image", "image/png"
+            self.assertEqual(url, header)
+            raise PublicHTTPError(503)
+        company_logos.refresh_logos(self.jobs, limit=2, fetch=fetch)
+        self.assertEqual(self.calls, [base + "1", group, base + "2", group, header])
+        with closing(sqlite3.connect(self.jobs)) as db:
+            self.assertEqual(db.execute("SELECT outcome FROM job_company_logos ORDER BY post_id").fetchall(),
+                             [("missing",), ("pending",)])
+            self.assertEqual(db.execute("SELECT count(*) FROM logo_image_claims").fetchone(), (0,))
 
     def test_verified_board_links_are_discovered_from_labeled_anchors_without_apply_url(self):
         job_id = "d3f3a6b6-8ffc-4d5c-a4e2-a80d785931de"
