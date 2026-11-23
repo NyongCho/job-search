@@ -390,7 +390,7 @@ def _prepare_logo(db, task):
             return "waiting", expected, None
         # A failed or superseded direct posting was just checked by the deadline worker.
         if source_locator(doc) == plan.locator and plan.locator:
-            plan = replace(plan, page=None)
+            plan = replace(plan, page=company_logos.greeting_home(plan.page) if plan.page else None)
     return None, expected, plan
 
 

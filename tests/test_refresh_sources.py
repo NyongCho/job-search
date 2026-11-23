@@ -423,6 +423,28 @@ class RefreshSourceTests(unittest.TestCase):
                 server.shutdown()
                 thread.join(3)
 
+
+    def test_failed_greeting_deadline_still_refreshes_the_employers_board_logo(self):
+        host = "acme.career.greetinghr.com"
+        url = f"https://{host}/ko/o/1"
+        asset = "https://profiles.greetinghr.com/group/acme"
+        self.seed([branded_post(1)])
+        self.update_document(1, source="greeting", source_job_id=1, url=url)
+        board = next_page({"host": host, "careerBaseInfo": {
+            "workspace": {"id": 8, "name": "Acme", "imageUrl": asset}}})
+        calls = []
+        def fetch(requested, **_):
+            calls.append(requested)
+            if requested == f"https://{host}/":
+                return f"https://{host}/ko/intro", board.encode(), "text/html"
+            self.assertEqual(requested, asset)
+            return asset, logo_png(), "image/png"
+
+        self.logo(self.task(1, id=2, source_work_id=1, source_status="failed"), fetch)
+        self.assertEqual(self.events(), {2: "done"})
+        self.assertEqual(calls, [f"https://{host}/", asset])
+        self.assertIsNotNone(company_logos.read_logo(self.jobs, 1))
+
     def test_invalid_deadline_does_not_discard_an_independently_verified_logo(self):
         self.seed([posting(1)])
         image = "https://assets.example.com/logo.png"
