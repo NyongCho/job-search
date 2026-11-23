@@ -72,6 +72,8 @@ def create_app(config=None):
 
     @app.before_request
     def authorize():
+        if isinstance(request.routing_exception, SecurityError):
+            raise request.routing_exception
         if request.endpoint == "health":
             return
         if dev:
