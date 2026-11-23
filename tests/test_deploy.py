@@ -51,6 +51,23 @@ class DeploymentTests(unittest.TestCase):
             with self.subTest(command=command), self.assertRaises(ValueError):
                 deploy.parse_revision(command)
 
+    def test_previous_writer_keeps_delivery_eligibility_through_rollback(self):
+        from job_search import collect_jobs, fit_work
+        from tests.test_collect_jobs import posting
+
+        jobs, state = deploy.database_paths(self.root)
+        collect_jobs.collect(jobs, lambda _: ([posting(1)], 1))
+        fit_work.migrate(jobs, state, profile={})
+        with closing(sqlite3.connect(jobs)) as db, db:
+            # The previous release only writes posts. It records the decision before writing fit_review.
+            for post_id in (2, 3):
+                db.execute("INSERT INTO posts(id,document,fingerprint) VALUES(?, '{}', 'old')", (post_id,))
+            db.execute("UPDATE posts SET decision='recommend',reason='검토',reviewed_at='old' WHERE id IN (1,2)")
+        fit_work.migrate(jobs, state, profile={})
+        with closing(sqlite3.connect(jobs)) as db:
+            delivered = db.execute("SELECT post_id,execution_id FROM fit_delivery ORDER BY post_id").fetchall()
+        self.assertEqual(delivered, [(1, 'legacy'), (2, 'legacy'), (3, None)])
+
     def test_regular_hermes_dispatcher_executes_current_release_from_any_directory(self):
         current = self.root / 'job_search/current/scripts'
         current.mkdir(parents=True)
@@ -73,6 +90,93 @@ class DeploymentTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT value FROM private_data').fetchone()[0], 'preserve')
             db.execute('ALTER TABLE private_data ADD COLUMN extra TEXT')
         self.assertNotEqual(deploy.schema(src), deploy.schema(dst))
+
+    def test_migration_checks_copy_the_databases_selected_by_the_worker(self):
+        env_file = self.root / 'dashboard-environment'
+        jobs = self.root / 'shared jobs.sqlite'
+        state = self.root / 'shared state.sqlite'
+        for marker, path in (('jobs', jobs), ('state', state)):
+            with closing(sqlite3.connect(path)) as db:
+                db.execute(f'CREATE TABLE {marker}_marker(value TEXT)')
+        env_file.write_text(f'JOBS_DB="{jobs}"\nDASHBOARD_STATE_DB="{state}"\n')
+        config = {**self.config, 'environment_file': str(env_file)}
+        with patch.object(deploy, 'check_release') as check:
+            deploy.validate_startup(self.root, self.new, config)
+        for marker, copy in zip(('jobs', 'state'), check.call_args.args[-2:]):
+            with closing(sqlite3.connect(copy)) as db:
+                self.assertIsNotNone(db.execute('SELECT 1 FROM sqlite_master WHERE name=?',
+                                                (marker + '_marker',)).fetchone())
+
+    def test_refresh_service_quiesces_before_backup_and_resumes_only_on_supported_release(self):
+        unit = 'job-refresh-worker.service'
+        for release in (self.old, self.new):
+            (release / 'deploy').mkdir()
+            (release / 'deploy' / unit).touch()
+        refresh = {'state': 'active'}
+        previous_service = deploy.service
+
+        def systemctl(action, name):
+            if name != unit:
+                return previous_service(action, name)
+            if action == 'load-state':
+                return 'loaded'
+            if action in ('is-active', 'active-state'):
+                return refresh['state']
+            refresh['state'] = {'stop': 'inactive', 'start': 'active'}[action]
+
+        records = []
+        def migrate(release, jobs, state, config, *, schema_only=False):
+            self.assertEqual(refresh['state'], 'inactive')
+            records.append((jobs, schema_only))
+
+        with patch.object(deploy, 'service', side_effect=systemctl), patch.object(deploy, 'wait_idle'), \
+             patch.object(deploy, 'hermes', return_value={'enabled': False}), patch.object(deploy, 'healthy', return_value=True), \
+             patch.object(deploy, 'validate_startup'), patch.object(deploy, 'refresh_prompt'), \
+             patch.object(deploy, 'migrate_refresh_databases', side_effect=migrate):
+            deploy.activate(self.root, self.new, self.config, migrate_refresh=True)
+        self.assertEqual(records, [(deploy.database_paths(self.root)[0], False)])
+        self.assertEqual(refresh['state'], 'active')
+
+    def test_migration_seeds_existing_fit_using_worker_profile_settings(self):
+        envfile = self.root / 'environment'
+        envfile.write_text('FIT_PROFILE_FILES=/private/career.md\nHERMES_HOME=/private/hermes\n')
+        jobs, state = deploy.database_paths(self.root)
+        with patch.object(deploy, 'run') as run:
+            deploy.migrate_refresh_databases(self.new, jobs, state, dict(self.config, environment_file=envfile))
+        env = run.call_args.kwargs['env']
+        self.assertEqual(env['FIT_PROFILE_FILES'], '/private/career.md')
+        self.assertEqual(env['HERMES_HOME'], '/private/hermes')
+
+    def test_prompt_cutover_recovers_exact_private_file_and_registered_job_after_interruption(self):
+        from scripts.refresh_prompt import change
+        directory = self.root / ".deploy/private"
+        directory.mkdir()
+        file = self.root / "hermes_job_prompt.txt"
+        file.write_text("private file\n")
+        template = directory / "new"
+        template.write_text("delivery only\n")
+        backup = directory / "saved.json"
+        active = {"prompt": "different active instructions"}
+        def update(prompt):
+            active["prompt"] = prompt
+        change("apply", file, backup, template, lambda:active["prompt"], update)
+        self.assertEqual(file.read_text(), "delivery only\n")
+        self.assertEqual(active["prompt"], "delivery only\n")
+        change("apply", file, backup, template, lambda:active["prompt"], update)
+        change("restore", file, backup, template, lambda:active["prompt"], update)
+        self.assertEqual(active["prompt"], "different active instructions")
+        self.assertEqual(file.read_text(), "private file\n")
+
+    def test_cutover_detects_a_live_model_child_after_parent_exit(self):
+        import fcntl
+        jobs, _ = deploy.database_paths(self.root)
+        spool = Path(str(jobs) + ".fit-runs")
+        spool.mkdir()
+        with (spool/"slot-0").open("a") as child_slot:
+            fcntl.flock(child_slot, fcntl.LOCK_EX)
+            with self.assertRaisesRegex(TimeoutError, "fit"):
+                deploy.wait_fit_writers(jobs, seconds=0)
+        deploy.wait_fit_writers(jobs, seconds=0)
 
     def test_busy_ledger_checks_only_target_job_and_requires_ledger(self):
         ledger = self.root / 'hermes/cron/executions.db'

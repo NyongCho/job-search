@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 LOG = None
 LOGO_PATH = 'job-logo-worker.path'
 LOGO_SERVICE = 'job-logo-worker.service'
+REFRESH_SERVICE = 'job-refresh-worker.service'
 
 
 def run(args, **kwargs):
@@ -111,6 +112,20 @@ def pause_logo_worker():
             raise RuntimeError(f'{unit} did not stop')
 
 
+def refresh_worker_active():
+    return (service('load-state', REFRESH_SERVICE) == 'loaded'
+            and service('is-active', REFRESH_SERVICE) in {'active', 'activating'})
+
+
+def pause_refresh_worker():
+    stopped = {'inactive', 'failed'}
+    if service('load-state', REFRESH_SERVICE) != 'loaded' and service('active-state', REFRESH_SERVICE) in stopped:
+        return
+    service('stop', REFRESH_SERVICE)
+    if service('active-state', REFRESH_SERVICE) not in stopped:
+        raise RuntimeError('Refresh worker did not stop')
+
+
 def hermes(action, config, reason):
     # Use the installed Hermes API, including its jobs-file locking and schedule semantics.
     code = '''
@@ -150,6 +165,22 @@ def wait_idle(config, seconds=600):
         time.sleep(5)
 
 
+def wait_fit_writers(jobs, seconds=600):
+    # Both producers have already stopped. A model child may still hold its inherited slot.
+    spool = Path(str(jobs.resolve()) + '.fit-runs')
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            for slot in spool.glob('slot-*'):
+                with slot.open('rb') as handle:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError('A fit evaluation is still running')
+            time.sleep(1)
+
+
 def healthy(config, seconds=30):
     deadline = time.monotonic() + seconds
     request = Request('http://127.0.0.1:8765/healthz',
@@ -167,6 +198,10 @@ def healthy(config, seconds=30):
 
 
 def restore_schedules(transaction, config, root):
+    if transaction.get('restart_refresh_worker') and (root / 'current/deploy' / REFRESH_SERVICE).is_file():
+        if service('load-state', REFRESH_SERVICE) != 'loaded':
+            raise RuntimeError('Refresh worker must be installed to resume')
+        service('start', REFRESH_SERVICE)
     if transaction['resume_job']:
         hermes('resume', config, transaction['reason'])
     if transaction['restart_timer']:
@@ -188,8 +223,13 @@ def restore_web(transaction, root, previous, config):
     return True
 
 
-def database_paths(root):
-    return root / 'data/jobs.sqlite', root / 'data/dashboard/dashboard.sqlite'
+def database_paths(root, config=None):
+    settings = (config or {}).get('environment_file')
+    env = environment(settings) if settings else {}
+    current = root / 'current'
+    jobs = current / env.get('JOBS_DB', root / 'data/jobs.sqlite')
+    state = current / env.get('DASHBOARD_STATE_DB', root / 'data/dashboard/dashboard.sqlite')
+    return jobs, state
 
 
 def migrate_database(release, path, kind):
@@ -202,7 +242,30 @@ def migrate_fit_database(release, jobs):
          '--db', jobs, 'migrate-fit'], cwd=release)
 
 
-def activate(root, release, config, *, migrate_cards=False, migrate_fit=False):
+def migrate_refresh_databases(release, jobs, state, config, *, schema_only=False):
+    args = [release / '.venv-dashboard/bin/python', '-m', 'job_search.refresh_worker',
+            '--migrate', '--jobs-db', jobs, '--state-db', state]
+    if schema_only:
+        args.append('--schema-only')
+    env = environment(config['environment_file'])
+    env.setdefault('HERMES_HOME', config['hermes_home'])
+    run(args, cwd=release, env=env)
+
+
+def refresh_prompt(action, root, release, transaction, config):
+    if not transaction.get('migrate_refresh'):
+        return
+    saved = Path(transaction['backup']) / 'hermes-prompts.json'
+    if action == 'restore' and not saved.exists():
+        return
+    env = dict(os.environ, HERMES_HOME=config['hermes_home'], PYTHONPATH=config['hermes_repo'])
+    helper = release / 'scripts/refresh_prompt.py'
+    template = release / 'skills/job-search-pipeline/assets/runtime/hermes_job_prompt.txt.tpl'
+    run([config['hermes_python'], helper, action, config['job_id'], root / 'hermes_job_prompt.txt', saved, template],
+        cwd=config['hermes_repo'], env=env)
+
+
+def activate(root, release, config, *, migrate_cards=False, migrate_fit=False, migrate_refresh=False):
     journal = root / '.deploy/transaction.json'
     if journal.exists():
         raise RuntimeError('Interrupted deployment: run local --recover before deploying again')
@@ -215,9 +278,10 @@ def activate(root, release, config, *, migrate_cards=False, migrate_fit=False):
                    'resume_job': bool(hermes('get', config, reason)['enabled']),
                    'restart_timer': service('is-active', 'job-availability.timer') in {'active', 'activating'},
                    'restart_logo_path': logo_path_active(),
+                   'restart_refresh_worker': refresh_worker_active(),
                    'web_was_active': service('is-active', 'job-dashboard.service') in {'active', 'activating'},
                    'web_stopped': False, 'backup': str(backup), 'migrate_cards': migrate_cards,
-                   'migrate_fit': migrate_fit}
+                   'migrate_fit': migrate_fit, 'migrate_refresh': migrate_refresh}
 
     def checkpoint(phase):
         transaction['phase'] = phase
@@ -226,17 +290,20 @@ def activate(root, release, config, *, migrate_cards=False, migrate_fit=False):
     checkpoint('pausing_writers')
     clear_journal = False
     try:
+        if transaction['restart_refresh_worker'] or (previous / 'deploy' / REFRESH_SERVICE).is_file():
+            pause_refresh_worker()
         pause_logo_worker()
         if transaction['resume_job']:
             hermes('pause', config, reason)
         service('stop', 'job-availability.timer')
         wait_idle(config)
+        jobs, state = database_paths(root, config)
+        wait_fit_writers(jobs)
         if fetch_main(root, config)[1] != (release / '.revision').read_text().strip():
             raise RuntimeError('Main changed while waiting; deploy the newer workflow run')
         transaction['web_stopped'] = True
         checkpoint('backing_up')
         service('stop', 'job-dashboard.service')
-        jobs, state = database_paths(root)
         backup_database(jobs, backup / 'jobs.sqlite')
         backup_database(state, backup / 'dashboard.sqlite')
         if migrate_cards:
@@ -247,9 +314,15 @@ def activate(root, release, config, *, migrate_cards=False, migrate_fit=False):
         if migrate_fit:
             checkpoint('migrating_fit')
             migrate_fit_database(release, jobs)
-        if migrate_cards or migrate_fit:
+        if migrate_refresh:
+            checkpoint('migrating_refresh')
+            migrate_refresh_databases(release, jobs, state, config)
+        if migrate_cards or migrate_fit or migrate_refresh:
             checkpoint('checking_migration')
             validate_startup(root, release, config)
+        if migrate_refresh:
+            checkpoint('switching_refresh_prompt')
+            refresh_prompt('apply', root, release, transaction, config)
         checkpoint('starting_candidate')
         switch(root, release)
         service('start', 'job-dashboard.service')
@@ -260,6 +333,7 @@ def activate(root, release, config, *, migrate_cards=False, migrate_fit=False):
         checkpoint('restoring_schedules')
         clear_journal = True
     except BaseException:
+        refresh_prompt('restore', root, release, transaction, config)
         if transaction['web_stopped'] and not restore_web(transaction, root, previous, config):
             raise RuntimeError('Rollback health failed; inspect transaction.json and recover')
         clear_journal = True
@@ -281,11 +355,19 @@ def recover(root, config):
         # Older deployers never changed the watcher's state.
         transaction['restart_logo_path'] = logo_path_active()
         write_json(journal, transaction)
+    if 'restart_refresh_worker' not in transaction:
+        transaction['restart_refresh_worker'] = refresh_worker_active()
+        write_json(journal, transaction)
+    if transaction['restart_refresh_worker'] or (root / 'current/deploy' / REFRESH_SERVICE).is_file():
+        pause_refresh_worker()
     pause_logo_worker()
     if transaction['resume_job'] and hermes('get', config, transaction['reason'])['enabled']:
         hermes('pause', config, transaction['reason'])
     service('stop', 'job-availability.timer')
     wait_idle(config)
+    wait_fit_writers(database_paths(root, config)[0])
+    if transaction.get('migrate_refresh'):
+        refresh_prompt('restore', root, Path(transaction['release']), transaction, config)
     if transaction['web_stopped']:
         if not restore_web(transaction, root, previous, config):
             raise RuntimeError('Recovery health check failed')
@@ -357,10 +439,10 @@ with closing(sqlite3.connect(state)) as db:
         raise RuntimeError('Previous release modified the migrated schema')
 
 
-def validate_startup(root, release, config, *, migrate_cards=False, migrate_fit=False):
+def validate_startup(root, release, config, *, migrate_cards=False, migrate_fit=False, migrate_refresh=False):
     check = root / '.deploy/checks' / release.name
     jobs, state = check / 'jobs.sqlite', check / 'dashboard.sqlite'
-    source, personal = database_paths(root)
+    source, personal = database_paths(root, config)
     backup_database(source, jobs)
     backup_database(personal, state)
     if migrate_cards:
@@ -368,7 +450,9 @@ def validate_startup(root, release, config, *, migrate_cards=False, migrate_fit=
              '--jobs-db', jobs, '--state-db', state], cwd=release)
     if migrate_fit:
         migrate_fit_database(release, jobs)
-    if migrate_cards or migrate_fit:
+    if migrate_refresh:
+        migrate_refresh_databases(release, jobs, state, config, schema_only=True)
+    if migrate_cards or migrate_fit or migrate_refresh:
         previous = (root / 'current').resolve(strict=True)
         check_release(root, previous, config, jobs, state)
         check_previous_writer(previous, jobs, state)
@@ -384,7 +468,7 @@ def fetch_main(root, config):
     return repository, run(['git', '--git-dir', repository, 'rev-parse', 'refs/heads/main'])
 
 
-def deploy(root, revision, config, *, migrate_cards=False, migrate_fit=False):
+def deploy(root, revision, config, *, migrate_cards=False, migrate_fit=False, migrate_refresh=False):
     if (root / '.deploy/transaction.json').exists():
         raise RuntimeError('Interrupted deployment: run local --recover first')
     repository, latest = fetch_main(root, config)
@@ -405,7 +489,7 @@ def deploy(root, revision, config, *, migrate_cards=False, migrate_fit=False):
     run([python, '-m', 'pip', 'install', '-r', release / 'requirements.txt'])
     print('Testing candidate release', flush=True)
     run(['make', 'test', 'PYTHON=' + str(python)], cwd=release)
-    validate_startup(root, release, config, migrate_cards=migrate_cards, migrate_fit=migrate_fit)
+    validate_startup(root, release, config, migrate_cards=migrate_cards, migrate_fit=migrate_fit, migrate_refresh=migrate_refresh)
     for name in ['data', 'deployment.json', 'hermes_job_prompt.txt', 'company_research.json']:
         if (release / name).exists() or (release / name).is_symlink():
             raise RuntimeError('Release must not contain private runtime files')
@@ -414,7 +498,7 @@ def deploy(root, revision, config, *, migrate_cards=False, migrate_fit=False):
     if fetch_main(root, config)[1] != revision:
         raise RuntimeError('Main changed during preparation; deploy the newer workflow run')
     print('Waiting for jobs, backing up data, and activating', flush=True)
-    activate(root, release, config, migrate_cards=migrate_cards, migrate_fit=migrate_fit)
+    activate(root, release, config, migrate_cards=migrate_cards, migrate_fit=migrate_fit, migrate_refresh=migrate_refresh)
     print('Deployed ' + revision + '; health verified', flush=True)
 
 
@@ -428,7 +512,8 @@ def main():
     recovery = command is None and sys.argv[1:] == ['--recover']
     migrate_cards = command is None and sys.argv[1:2] == ['--migrate-card-metadata']
     migrate_fit = command is None and sys.argv[1:2] == ['--migrate-fit']
-    arguments = sys.argv[2:] if migrate_cards or migrate_fit else sys.argv[1:]
+    migrate_refresh = command is None and sys.argv[1:2] == ['--migrate-refresh']
+    arguments = sys.argv[2:] if migrate_cards or migrate_fit or migrate_refresh else sys.argv[1:]
     revision = None if recovery else parse_revision(command if command is not None else 'deploy ' + ' '.join(arguments))
     (state / 'logs').mkdir(exist_ok=True)
     LOG = state / 'logs' / (time.strftime('%Y%m%d-%H%M%S') + '.log')
@@ -441,7 +526,7 @@ def main():
             recover(root, config)
             print('Previous release and schedules recovered')
         else:
-            deploy(root, revision, config, migrate_cards=migrate_cards, migrate_fit=migrate_fit)
+            deploy(root, revision, config, migrate_cards=migrate_cards, migrate_fit=migrate_fit, migrate_refresh=migrate_refresh)
 
 
 if __name__ == '__main__':

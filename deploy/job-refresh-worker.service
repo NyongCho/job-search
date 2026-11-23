@@ -1,0 +1,18 @@
+[Unit]
+Description=Refresh job inbox deadlines, logos and fit reviews
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/job_search/current
+EnvironmentFile=%h/.config/job-dashboard/environment
+ExecStart=%h/job_search/current/.venv-dashboard/bin/python -m job_search.refresh_worker
+Restart=on-failure
+RestartSec=5s
+KillMode=mixed
+TimeoutStopSec=10min
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
