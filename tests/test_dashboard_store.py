@@ -14,17 +14,20 @@ from job_search.refresh_job_availability import refresh
 from tests.test_collect_jobs import posting
 
 
-def collect_fit_examples(source):
+FIT_EXAMPLES = (
+    (2, "라온", "preferred", 9, 12),
+    (3, "가온", "outside", 9, 10),
+    (4, "다온", "outside", 799, 1000),
+    (5, "가람", "preferred", None, None),
+    (6, "나래", "preferred", 7, 8),
+)
+
+
+def collect_fit_examples(source, examples=FIT_EXAMPLES):
     """Add scored reviews alongside the existing unscored recommendation (#1)."""
     posts = []
     entries = []
-    for post_id, company, preference, months, required in (
-        (2, "라온", "preferred", 9, 12),
-        (3, "가온", "outside", 9, 10),
-        (4, "다온", "outside", 799, 1000),
-        (5, "가람", "preferred", None, None),
-        (6, "나래", "preferred", 7, 8),
-    ):
+    for post_id, company, preference, months, required in examples:
         requirement = "장애 대응 경험" if months is None else f"운영 경력 {required}개월"
         post = posting(post_id, content=f'<p>{requirement}</p><a href="https://example.com/job">지원하기</a>')
         post["title"]["rendered"] = f"{company}｜엔지니어"
@@ -118,6 +121,38 @@ class StoreTests(unittest.TestCase):
         store.set_status(self.source, self.state, 5, "unmarked")
         store.set_deadline(self.source, self.state, 5, {"mode": "manual", "kind": "date", "date": "2000-01-01"})
         self.assertEqual(store.list_jobs(self.source, self.state)["question_total"], 0)
+
+    def test_inbox_fit_sort_ranks_all_search_matches_before_pagination(self):
+        collect_fit_examples(self.source, (
+            (2, "가온", "outside", 92, 100),
+            (3, "나래", "preferred", 78, 100),
+            (4, "다온", "preferred", 78, 100),
+            (5, "라온", "outside", 0, 100),
+            (6, "마루", "preferred", None, None),
+            (7, "바다", "preferred", 100, 100),
+        ))
+        with sqlite3.connect(self.source) as db:
+            for post_id, day in ((3, "2026-11-17"), (4, "2026-11-18"), (5, "2026-11-14"), (6, "2026-11-19")):
+                db.execute("""UPDATE posts SET reviewed_at=?, fit_review=json_set(fit_review, '$.reviewed_at', ?)
+                              WHERE id=?""", (day, day, post_id))
+            db.execute("UPDATE posts SET reason='다른 업무' WHERE id=7")
+        for post_id in range(1, 8):
+            store.set_status(self.source, self.state, post_id, "interested")
+        with patch.object(store, "PAGE_SIZE", 2):
+            for page, expected in enumerate(([2, 4], [3, 5], [6, 1]), start=1):
+                listing = store.list_jobs(self.source, self.state, view="interested", q="Agent", sort="fit", page=page)
+                self.assertEqual([job["id"] for job in listing["items"]], expected)
+                self.assertEqual(listing["total"], 6)
+
+    def test_applied_fit_sort_places_imported_records_after_scored_jobs(self):
+        collect_fit_examples(self.source)
+        store.set_status(self.source, self.state, 4, "applied")
+        store.import_profile_jobs(self.source, self.state, [{
+            "source_key": "applications/legacy", "company": "기존 기업", "role": "개발자",
+            "summary": "지원 기록", "confirmed_on": "2026-11-15",
+        }])
+        listing = store.list_jobs(self.source, self.state, view="applied", sort="fit")
+        self.assertEqual([job["id"] for job in listing["items"]], [4, -1])
 
     def test_rejects_same_database(self):
         symlink, hardlink = self.source.with_name("sym.sqlite"), self.source.with_name("hard.sqlite")

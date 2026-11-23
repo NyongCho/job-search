@@ -19,7 +19,7 @@ from .job_sources import source_locator, source_name
 STATUSES = {"unmarked", "interested", "preparing", "applied", "archived"}
 VIEWS = ("recommended", "interested", "preparing", "applied", "archived", "needs_review", "expired")
 PAGE_SIZE = 30
-LIST_SORTS = {"reviewed": "최근 검토순", "deadline": "마감 임박순", "company": "기업 이름순"}
+LIST_SORTS = {"reviewed": "최근 검토순", "deadline": "마감 임박순", "company": "기업 이름순", "fit": "적합도순"}
 FIT_GROUPS = ("preferred", "outside", "legacy", "question")
 STAGE_LABELS = {"document": "서류", "interview1": "1차 면접", "interview2": "2차 면접", "final": "최종 결과"}
 RESULT_LABELS = {"unknown": "미확인", "not_started": "미진행", "in_progress": "진행 중",
@@ -236,7 +236,7 @@ def _matches(item, view):
 
 def sort_options(view):
     if view == "recommended":
-        return {"fit": "적합도순", **LIST_SORTS}
+        return {"fit": LIST_SORTS["fit"], **LIST_SORTS}
     if view == "applied":
         return {"activity": "최근 기록순", **LIST_SORTS}
     if view == "expired":
@@ -251,6 +251,11 @@ def resolve_sort(view, sort):
     if not isinstance(sort, str) or sort not in options:
         raise ValueError("이 보기에서 사용할 정렬을 선택해 주세요.")
     return sort
+
+
+def _fit_score_order(item):
+    score = item["fit"]["score"] if item["fit"] is not None else None
+    return score is not None, score
 
 
 def _company_order(item):
@@ -316,9 +321,11 @@ def list_jobs(jobs_db: Path, state_db: Path, *, view="recommended", q="", page=1
         elif sort == "deadline":
             now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
             filtered.sort(key=lambda item: _deadline_order(item, now))
-        if sort == "fit":
+        if sort == "fit" and view == "recommended":
             filtered.sort(key=lambda item: (FIT_GROUPS.index(item["fit_group"]),
                           -item["fit"]["score"] if item["fit_group"] in ("preferred", "outside") else None))
+        elif sort == "fit":
+            filtered.sort(key=_fit_score_order, reverse=True)
         elif view == "recommended":
             filtered.sort(key=lambda item: item["fit_group"] == "question")
     question_total = sum(item["fit_group"] == "question" for item in filtered) if view == "recommended" else 0
