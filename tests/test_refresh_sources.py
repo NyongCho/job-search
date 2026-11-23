@@ -424,6 +424,44 @@ class RefreshSourceTests(unittest.TestCase):
                 thread.join(3)
 
 
+
+    def test_expired_linked_greeting_job_keeps_employer_logo_fallback_in_snapshot(self):
+        from job_search.public_fetch import PublicHTTPError
+
+        host = "siliconii.career.greetinghr.com"
+        home = f"https://{host}/"
+        expired = home + "ko/o/239254"
+        image = "https://profiles.greetinghr.com/group/logo"
+        listing = branded_post(1, "Silicon2", f'<a href="{expired}">지원하러가기</a>')
+        self.seed([listing])
+        board = next_page({"host": host, "careerBaseInfo": {
+            "workspace": {"id": 5, "name": "(주) 실리콘투", "imageUrl": image}},
+            "careerBootInfo": {"design": {"footer": {"companyName": "Silicon2"}}}})
+        urls = []
+        def fetch(url, **_):
+            urls.append(url)
+            if url.startswith(collect_jobs.API):
+                return url, json.dumps([listing]).encode(), "application/json"
+            if url == expired:
+                raise PublicHTTPError(404)
+            if url == home:
+                return home + "ko/home", board.encode(), "text/html"
+            self.assertEqual(url, image)
+            return url, logo_png(), "image/png"
+
+        task = self.task(1)
+        self.deadlines([task], fetch)
+        self.assertEqual(self.events(), {1: "failed"})
+        with closing(sqlite3.connect(self.jobs)) as db, db:
+            row = db.execute("SELECT logo_plan FROM refresh_source_snapshots WHERE work_id=1").fetchone()
+            self.assertEqual(json.loads(row[0])["page"], home)
+            # Existing terminal snapshots contain the same verified locator with a null page.
+            db.execute("UPDATE refresh_source_snapshots SET logo_plan=json_set(logo_plan,'$.page',NULL) WHERE work_id=1")
+        self.logo(dict(task, id=2, source_work_id=1, source_status="failed"), fetch)
+        self.assertEqual(self.events(), {1: "failed", 2: "done"})
+        self.assertEqual(urls[1:], [expired, home, image])
+        self.assertIsNotNone(company_logos.read_logo(self.jobs, 1))
+
     def test_failed_greeting_deadline_still_refreshes_the_employers_board_logo(self):
         host = "acme.career.greetinghr.com"
         url = f"https://{host}/ko/o/1"

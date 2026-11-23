@@ -291,7 +291,9 @@ def _read_results(future, group):
                     facts = listing.facts
                     if not facts["closed"] and facts["deadline_kind"] == "unknown":
                         facts = None
-                    result = replace(listing, facts=facts, plan=replace(listing.plan, page=None))
+                    # A closed or unverifiable job can still have independently verifiable employer branding.
+                    home = company_logos.greeting_home(selection.locator.url)
+                    result = replace(listing, facts=facts, plan=replace(listing.plan, page=home))
                 else:
                     result = None
         yield selection, result
@@ -348,6 +350,9 @@ def _snapshot_plan(serialized):
     data = json.loads(serialized)
     if data["locator"]:
         data["locator"] = SourceLocator(**data["locator"])
+        if not data.get("page") and not data.get("awaiting_official"):
+            # Previously saved final snapshots omitted the board URL when the linked posting failed.
+            data["page"] = company_logos.greeting_home(data["locator"].url)
     if data["body"]:
         data["body"] = company_logos.Candidate(**data["body"])
     return company_logos.LogoPlan(**data)
