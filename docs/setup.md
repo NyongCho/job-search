@@ -64,8 +64,10 @@ systemd를 사용하지 않는 환경에서는 같은 DB를 지정해 수동으�
 python3 - <<'PY'
 from pathlib import Path
 root = Path.cwd()
+current = Path.home() / 'job_search/current'
+workdir = current if current.is_dir() and current.samefile(root) else root
 template = root / 'skills/job-search-pipeline/assets/runtime/hermes_job_prompt.txt.tpl'
-prompt = template.read_text().replace('__APP_DIR_TEXT__', str(root))
+prompt = template.read_text().replace('__APP_DIR_TEXT__', str(workdir))
 prompt = prompt.replace('python3 collect_jobs.py', 'python3 -m job_search.collect_jobs')
 with (root / 'hermes_job_prompt.txt').open('x') as output:
     output.write(prompt)
@@ -73,6 +75,18 @@ PY
 ```
 
 Hermes 작업에 프롬프트, 프리런, Python, 작업 디렉터리, 시간대, 일정과 전달 채널을 등록합니다. 실제 Slack 인증과 봇 초대도 필요합니다. 토큰과 사용자 경력은 기존 Hermes의 개인 설정에 둡니다.
+
+### 기존 설치에서 적합도 평가 켜기
+
+새 DB에는 평가 결과를 담을 열이 있습니다. 기존 개발 DB는 아래 명령으로 이전합니다. 릴리스 방식의 운영 서버는 [적합도 이전 절차](deployment.md#적합도-평가를-켜는-첫-배포)를 따릅니다.
+
+```sh
+.venv-dashboard/bin/python -m job_search.collect_jobs --db data/jobs.sqlite migrate-fit
+```
+
+진행 중인 검토가 끝나면 현재 개인 프롬프트를 백업합니다. 템플릿의 항목별 평가, 모집 상태 확인, 결과 저장·전달 지시를 개인 프롬프트와 등록된 Hermes 작업 양쪽에 반영합니다. 패키지 설치에서는 템플릿의 `python3 collect_jobs.py`를 `python3 -m job_search.collect_jobs`로 바꾸고, 릴리스 방식의 작업 디렉터리는 `~/job_search/current`로 지정합니다. 기존의 `--digest` 파일 생성 지시는 새 `review … --execution-id …` 호출로 교체합니다.
+
+새 검토부터 핵심 업무 60점, 필수 요건 30점, 우대 요건 10점을 적용합니다. 상세에서 항목별 경력 근거와 JD 줄 번호를 확인할 수 있습니다. 80점은 선호 밖 추천의 노출 기준입니다. 기존 추천에는 '미산정'을 표시합니다.
 
 별도 경로나 Hermes 프로필에 **수집 전용 인스턴스**를 만들려면 [스킬 설치 안내](../skills/job-search-pipeline/references/setup.md)를 사용합니다. 스킬 번들은 독립 배포를 위해 자체 런타임을 포함하며, 그 생성 결과는 기존 `collect_jobs.py` 방식입니다. 웹앱은 이 저장소를 사용합니다.
 

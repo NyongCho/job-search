@@ -14,6 +14,40 @@ from job_search.refresh_job_availability import refresh
 from tests.test_collect_jobs import posting
 
 
+def collect_fit_examples(source):
+    """Add scored reviews alongside the existing unscored recommendation (#1)."""
+    posts = []
+    entries = []
+    for post_id, company, preference, months, required in (
+        (2, "라온", "preferred", 9, 12),
+        (3, "가온", "outside", 9, 10),
+        (4, "다온", "outside", 799, 1000),
+        (5, "가람", "preferred", None, None),
+        (6, "나래", "preferred", 7, 8),
+    ):
+        requirement = "장애 대응 경험" if months is None else f"운영 경력 {required}개월"
+        post = posting(post_id, content=f'<p>{requirement}</p><a href="https://example.com/job">지원하기</a>')
+        post["title"]["rendered"] = f"{company}｜엔지니어"
+        posts.append(post)
+        criterion = {"key": "operations", "category": "required", "label": requirement, "evidence_lines": [1]}
+        if months is None:
+            criterion.update(status="unknown", evidence="")
+        else:
+            criterion.update(status="tenure", months=months, required_months=required,
+                             evidence=f"서비스 배포와 모니터링을 {months}개월 담당")
+        entries.append({
+            "id": post_id, "decision": "needs_review" if months is None else "recommend",
+            "reason": "Agent 서비스 운영 업무", "evidence_lines": [1], "apply_url": "https://example.com/job",
+            "deadline": "미기재", "availability": "open", "required_summary": requirement,
+            "assessment": {"version": 1, "complete": True, "preference": preference, "eligibility": "eligible",
+                           "criteria": [criterion], "question": "운영 장애에 직접 대응했나요?" if months is None else ""},
+        })
+    collect_jobs.collect(source, lambda _: (posts, 1), datetime(2026, 11, 16, tzinfo=timezone.utc))
+    for entry in entries:
+        entry["fingerprint"] = collect_jobs.get_posts(source, [entry["id"]])[0]["fingerprint"]
+    collect_jobs.record_reviews(source, entries, execution_id="dashboard-examples")
+
+
 class StoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -46,6 +80,44 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             store.init_state_db(missing, self.state)
         self.assertFalse(missing.exists())
+
+    def test_verified_application_link_is_shared_by_digest_and_current_dashboard_review(self):
+        collect_fit_examples(self.source)
+        verified = "https://example.com/job"
+        doc = collect_jobs.get_posts(self.source, [2])[0]
+        self.assertIsNone(doc["apply_url"])  # The original anchor says only "지원하기".
+        digest, = collect_jobs.reconcile_outbox(self.source, {}, "retry")
+        self.assertIn("지원 " + verified, digest)
+        self.assertEqual(doc["fit_review"].get("apply_url"), verified)
+        listing = store.list_jobs(self.source, self.state)
+        self.assertEqual(next(j for j in listing["items"] if j["id"] == 2)["apply_url"], verified)
+        self.assertEqual(store.get_job(self.source, self.state, 2)["apply_url"], verified)
+
+        replacement = "https://example.com/new-opening"
+        self.collect([posting(2, content=f'<p>변경 공고</p><a href="{replacement}">지원하러 가기</a>')])
+        current = store.get_job(self.source, self.state, 2)
+        self.assertIsNone(current["fit"])
+        self.assertNotEqual(current["fingerprint"], doc["fingerprint"])
+        self.assertEqual(current["apply_url"], replacement)
+
+    def test_fit_groups_and_questions_are_filtered_before_pagination(self):
+        collect_fit_examples(self.source)
+        with patch.object(store, "PAGE_SIZE", 2):
+            pages = [store.list_jobs(self.source, self.state, q="엔지니어", page=p) for p in (1, 2, 3)]
+        self.assertEqual([[job["id"] for job in page["items"]] for page in pages], [[6, 2], [3, 1], [5]])
+        for page in pages:
+            self.assertEqual((page["counts"]["recommended"], page["total"], page["question_total"]), (4, 4, 1))
+        self.assertEqual([job["id"] for job in store.list_jobs(self.source, self.state, sort="company")["items"]],
+                         [3, 6, 2, 1, 5])
+        only_question = store.list_jobs(self.source, self.state, q="가람")
+        self.assertEqual((only_question["total"], only_question["question_total"]), (0, 1))
+        self.assertEqual([job["id"] for job in store.list_jobs(self.source, self.state, view="needs_review")["items"]], [5])
+        for status in ("applied", "archived"):
+            store.set_status(self.source, self.state, 5, status)
+            self.assertEqual(store.list_jobs(self.source, self.state)["question_total"], 0)
+        store.set_status(self.source, self.state, 5, "unmarked")
+        store.set_deadline(self.source, self.state, 5, {"mode": "manual", "kind": "date", "date": "2000-01-01"})
+        self.assertEqual(store.list_jobs(self.source, self.state)["question_total"], 0)
 
     def test_rejects_same_database(self):
         symlink, hardlink = self.source.with_name("sym.sqlite"), self.source.with_name("hard.sqlite")

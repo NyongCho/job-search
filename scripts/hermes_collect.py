@@ -23,7 +23,9 @@ def public_dashboard_url(value):
 
 def main():
     root = Path.home() / "job_search"
-    sys.path.insert(0, str(root))
+    current_release = root / "current"
+    release = current_release if (current_release / "job_search/collect_jobs.py").is_file() else root
+    sys.path.insert(0, str(release))
     from job_search.collect_jobs import reconcile_outbox
 
     config = json.loads((root / "deployment.json").read_text())
@@ -42,10 +44,10 @@ def main():
     if dashboard_url:
         payload["dashboard_url"] = dashboard_url
     if not retry:
-        python = next((path for release in (root / "current", root)
-                       if (path := release / ".venv-dashboard/bin/python").is_file()), "/usr/bin/python3")
+        python = next((path for path in (current_release / ".venv-dashboard/bin/python",
+                                         root / ".venv-dashboard/bin/python") if path.is_file()), sys.executable)
         result = subprocess.run([str(python), "-m", "job_search.collect_jobs", "collect"],
-                                cwd=root, stdout=subprocess.PIPE, text=True, timeout=240, check=True)
+                                cwd=release, stdout=subprocess.PIPE, text=True, timeout=240, check=True)
         payload.update(json.loads(result.stdout))
     print(json.dumps(payload, ensure_ascii=False))
 

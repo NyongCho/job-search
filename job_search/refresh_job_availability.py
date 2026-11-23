@@ -11,6 +11,7 @@ from urllib.parse import urlencode, urlsplit
 from .collect_jobs import API, FIELDS, extract, request_json
 from .dashboard_store import init_state_db, read_job_document
 from .job_availability import KST, _stamp, availability, document_version, inspect_document
+from .job_fit import read_fit, recommendation_group
 from .job_sources import fetch_posting, same_inthiswork_post, source_locator
 from .public_fetch import fetch_public
 
@@ -125,15 +126,20 @@ def refresh(jobs_db, state_db, fetch_page=request_json, now=None):
     now = now or datetime.now(timezone.utc)
     init_state_db(jobs_db, state_db)
     with closing(sqlite3.connect(Path(state_db).resolve().as_uri() + "?mode=ro", uri=True)) as db:
-        saved = {r[0] for r in db.execute("SELECT post_id FROM job_state WHERE post_id>0 AND status IN ('interested','preparing','applied')")}
+        statuses = dict(db.execute("SELECT post_id,status FROM job_state WHERE post_id>0"))
     with closing(sqlite3.connect(Path(jobs_db).resolve().as_uri() + "?mode=ro", uri=True)) as db:
-        candidates = [(r[0], json.loads(r[2])) for r in db.execute("SELECT id,decision,document FROM posts")
-                      if r[1] == "recommend" or r[0] in saved]
-    stored = dict(candidates)
-    locators = {i: locator for i, doc in candidates if (locator := source_locator(doc))
+        db.row_factory = sqlite3.Row
+        stored = {}
+        for row in db.execute("SELECT * FROM posts"):
+            status = statuses.get(row["id"])
+            if (row["decision"] == "recommend" or status in ("interested", "preparing", "applied")
+                    or (status != "archived" and row["decision"] == "needs_review"
+                        and recommendation_group(row["decision"], read_fit(row)) == "question")):
+                stored[row["id"]] = json.loads(row["document"])
+    locators = {i: locator for i, doc in stored.items() if (locator := source_locator(doc))
                 and locator.source == "inthiswork" and locator.original_id == str(i)}
     ids = sorted(locators)
-    unsupported = sorted(i for i, _ in candidates if i not in ids)
+    unsupported = sorted(stored.keys() - locators.keys())
     checked = {}
     seen = set()
     for start in range(0, len(ids), 100):
