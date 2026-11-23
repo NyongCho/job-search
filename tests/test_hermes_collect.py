@@ -67,6 +67,31 @@ class HermesDashboardTests(unittest.TestCase):
         self.assertEqual(payload["retry_digests"], [original])
         self.assertEqual(calls, 0)
 
+    def test_installed_launcher_surfaces_collect_warning_with_successful_json(self):
+        (self.root / "deployment.json").write_text(json.dumps({"job_id": "fixture-job"}))
+        python = self.root / "current/.venv-dashboard/bin/python"
+        python.parent.mkdir(parents=True)
+        python.symlink_to(sys.executable)
+        package = self.root / "job_search"
+        package.mkdir()
+        (package / "__init__.py").touch()
+        (package / "collect_jobs.py").write_text(
+            "import sys\n"
+            "def reconcile_outbox(*args): return []\n"
+            "if __name__ == '__main__':\n"
+            "    print('logo signal write failed', file=sys.stderr)\n"
+            "    print('{\"new\": 1}')\n"
+        )
+        installed = self.home / ".hermes/scripts/collect.py"
+        installed.parent.mkdir()
+        shutil.copyfile(hermes_collect.__file__, installed)
+        result = subprocess.run([sys.executable, str(installed)], cwd=self.home,
+            env={**os.environ, "HOME": str(self.home), "PYTHONPATH": ""}, capture_output=True, text=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"execution_id": "current", "retry_digests": [], "new": 1})
+        self.assertIn("logo signal write failed", result.stderr)
+
     def test_installed_launcher_finds_package_from_another_directory(self):
         shutil.copytree(Path(collect_jobs.__file__).parent, self.root / 'job_search',
                         ignore=shutil.ignore_patterns('__pycache__'))
@@ -83,7 +108,8 @@ class HermesDashboardTests(unittest.TestCase):
 
     def test_release_install_collects_from_active_release(self):
         release = self.root / "current"
-        release.mkdir()
+        (release / "job_search").mkdir(parents=True)
+        (release / "job_search/collect_jobs.py").touch()
         with patch.object(subprocess, "run") as run:
             run.return_value.stdout = '{"new": 0}'
             (self.root / "deployment.json").write_text(json.dumps({"job_id": "fixture-job"}))

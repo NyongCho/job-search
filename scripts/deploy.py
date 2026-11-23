@@ -17,6 +17,8 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 LOG = None
+LOGO_PATH = 'job-logo-worker.path'
+LOGO_SERVICE = 'job-logo-worker.service'
 
 
 def run(args, **kwargs):
@@ -87,7 +89,26 @@ def service(action, unit):
         if state not in {'active', 'activating', 'deactivating', 'inactive', 'failed'}:
             raise RuntimeError('Cannot determine service state')
         return state
+    if action in ('load-state', 'active-state'):
+        property_name = 'LoadState' if action == 'load-state' else 'ActiveState'
+        return run(['systemctl', '--user', 'show', f'--property={property_name}', '--value', unit])
     return run(['systemctl', '--user', action, unit])
+
+
+def logo_path_active():
+    if service('load-state', LOGO_PATH) == 'not-found':
+        return False
+    return service('is-active', LOGO_PATH) in {'active', 'activating'}
+
+
+def pause_logo_worker():
+    stopped = {'inactive', 'failed'}
+    for unit in (LOGO_PATH, LOGO_SERVICE):
+        if service('load-state', unit) == 'not-found' and service('active-state', unit) in stopped:
+            continue
+        service('stop', unit)
+        if service('active-state', unit) not in stopped:
+            raise RuntimeError(f'{unit} did not stop')
 
 
 def hermes(action, config, reason):
@@ -145,11 +166,17 @@ def healthy(config, seconds=30):
         time.sleep(1)
 
 
-def restore_schedules(transaction, config):
+def restore_schedules(transaction, config, root):
     if transaction['resume_job']:
         hermes('resume', config, transaction['reason'])
     if transaction['restart_timer']:
         service('start', 'job-availability.timer')
+    if (transaction['restart_logo_path']
+            and (root / 'current/deploy' / LOGO_SERVICE).is_file()):
+        for unit in (LOGO_SERVICE, LOGO_PATH):
+            if service('load-state', unit) != 'loaded':
+                raise RuntimeError(f'{unit} must be loaded to restore the logo watcher')
+        service('start', LOGO_PATH)
 
 
 def restore_web(transaction, root, previous, config):
@@ -187,6 +214,7 @@ def activate(root, release, config, *, migrate_cards=False, migrate_fit=False):
     transaction = {'previous': str(previous), 'release': str(release), 'reason': reason,
                    'resume_job': bool(hermes('get', config, reason)['enabled']),
                    'restart_timer': service('is-active', 'job-availability.timer') in {'active', 'activating'},
+                   'restart_logo_path': logo_path_active(),
                    'web_was_active': service('is-active', 'job-dashboard.service') in {'active', 'activating'},
                    'web_stopped': False, 'backup': str(backup), 'migrate_cards': migrate_cards,
                    'migrate_fit': migrate_fit}
@@ -198,6 +226,7 @@ def activate(root, release, config, *, migrate_cards=False, migrate_fit=False):
     checkpoint('pausing_writers')
     clear_journal = False
     try:
+        pause_logo_worker()
         if transaction['resume_job']:
             hermes('pause', config, reason)
         service('stop', 'job-availability.timer')
@@ -238,7 +267,7 @@ def activate(root, release, config, *, migrate_cards=False, migrate_fit=False):
     finally:
         # If restoring schedules fails or the process is killed, retain the journal for recovery.
         if clear_journal:
-            restore_schedules(transaction, config)
+            restore_schedules(transaction, config, root)
             journal.unlink()
 
 
@@ -248,6 +277,11 @@ def recover(root, config):
     previous = Path(transaction['previous']).resolve(strict=True)
     if previous.parent != (root / 'releases').resolve():
         raise RuntimeError('Recovery release must belong to this installation')
+    if 'restart_logo_path' not in transaction:
+        # Older deployers never changed the watcher's state.
+        transaction['restart_logo_path'] = logo_path_active()
+        write_json(journal, transaction)
+    pause_logo_worker()
     if transaction['resume_job'] and hermes('get', config, transaction['reason'])['enabled']:
         hermes('pause', config, transaction['reason'])
     service('stop', 'job-availability.timer')
@@ -255,7 +289,7 @@ def recover(root, config):
     if transaction['web_stopped']:
         if not restore_web(transaction, root, previous, config):
             raise RuntimeError('Recovery health check failed')
-    restore_schedules(transaction, config)
+    restore_schedules(transaction, config, root)
     journal.unlink()
 
 

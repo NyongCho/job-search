@@ -1,3 +1,4 @@
+from contextlib import closing
 import importlib.util
 import json
 from pathlib import Path
@@ -25,6 +26,10 @@ class DeploymentTests(unittest.TestCase):
         self.old.mkdir(parents=True)
         self.new.mkdir()
         (self.new / '.revision').write_text('a' * 40 + '\n')
+        _, systemctl = self.logo_units(path_state=None, worker_state=None)
+        service = patch.object(deploy, 'service', side_effect=systemctl)
+        service.start()
+        self.addCleanup(service.stop)
         fetch = patch.object(deploy, 'fetch_main', return_value=(None, 'a' * 40))
         self.fetch = fetch.start()
         self.addCleanup(fetch.stop)
@@ -34,7 +39,7 @@ class DeploymentTests(unittest.TestCase):
         for name in ['data/jobs.sqlite', 'data/dashboard/dashboard.sqlite']:
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 db.execute('CREATE TABLE private_data(value TEXT)')
                 db.execute("INSERT INTO private_data VALUES ('preserve')")
 
@@ -64,7 +69,7 @@ class DeploymentTests(unittest.TestCase):
         dst = self.root / '.deploy/copy.sqlite'
         deploy.backup_database(src, dst)
         self.assertEqual(deploy.schema(src), deploy.schema(dst))
-        with sqlite3.connect(dst) as db:
+        with closing(sqlite3.connect(dst)) as db, db:
             self.assertEqual(db.execute('SELECT value FROM private_data').fetchone()[0], 'preserve')
             db.execute('ALTER TABLE private_data ADD COLUMN extra TEXT')
         self.assertNotEqual(deploy.schema(src), deploy.schema(dst))
@@ -74,11 +79,11 @@ class DeploymentTests(unittest.TestCase):
         ledger.parent.mkdir(parents=True)
         with self.assertRaises(sqlite3.OperationalError):
             deploy.busy(self.config)
-        with sqlite3.connect(ledger) as db:
+        with closing(sqlite3.connect(ledger)) as db, db:
             db.execute('CREATE TABLE executions(job_id TEXT, status TEXT)')
             db.execute("INSERT INTO executions VALUES ('other','running')")
         self.assertFalse(deploy.busy(self.config))
-        with sqlite3.connect(ledger) as db:
+        with closing(sqlite3.connect(ledger)) as db, db:
             db.execute("INSERT INTO executions VALUES ('test','claimed')")
         self.assertTrue(deploy.busy(self.config))
 
@@ -86,7 +91,7 @@ class DeploymentTests(unittest.TestCase):
         def hermes(action, config, reason):
             return {'enabled': job_enabled} if action == 'get' else None
         with patch.object(deploy, 'hermes', side_effect=hermes) as control, \
-             patch.object(deploy, 'service', return_value='active') as service, \
+             patch.object(deploy, 'service', wraps=deploy.service) as service, \
              patch.object(deploy, 'wait_idle'), \
              patch.object(deploy, 'healthy', side_effect=[healthy, True]) as health:
             if healthy:
@@ -102,7 +107,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertFalse((self.root / '.deploy/transaction.json').exists())
         self.assertEqual([c.args[0] for c in control.call_args_list], ['get', 'pause', 'resume'])
         self.assertEqual(len(list((self.root / '.deploy/backups').glob('*/jobs.sqlite'))), 1)
-        with sqlite3.connect(self.root / 'data/jobs.sqlite') as db:
+        with closing(sqlite3.connect(self.root / 'data/jobs.sqlite')) as db, db:
             self.assertEqual(db.execute('SELECT value FROM private_data').fetchone()[0], 'preserve')
 
     def test_failed_health_restores_old_release_without_restoring_database(self):
@@ -116,12 +121,17 @@ class DeploymentTests(unittest.TestCase):
 
     def test_fit_cutover_checks_copy_and_migrates_only_jobs_after_backup(self):
         jobs, state = deploy.database_paths(self.root)
+        self.enable_logo_support(self.old)
+        self.enable_logo_support(self.new)
+        states, systemctl = self.logo_units()
         migrated = []
 
         def migrate(release, path):
             self.assertEqual(release, self.new)
             self.assertNotEqual(path, state)
             if path == jobs:
+                self.assertEqual(states['job-logo-worker.service'], 'inactive')
+                self.assertEqual(states['job-logo-worker.path'], 'inactive')
                 journal = json.loads((self.root / '.deploy/transaction.json').read_text())
                 self.assertEqual(journal['phase'], 'migrating_fit')
                 self.assertTrue((Path(journal['backup']) / 'jobs.sqlite').is_file())
@@ -132,7 +142,7 @@ class DeploymentTests(unittest.TestCase):
         with patch.object(deploy, 'migrate_fit_database', side_effect=migrate), \
              patch.object(deploy, 'check_release') as check, patch.object(deploy, 'check_previous_writer') as writer, \
              patch.object(deploy, 'hermes', return_value={'enabled': True}), patch.object(deploy, 'wait_idle'), \
-             patch.object(deploy, 'service', return_value='active'), patch.object(deploy, 'healthy', return_value=True):
+             patch.object(deploy, 'service', side_effect=systemctl), patch.object(deploy, 'healthy', return_value=True):
             deploy.validate_startup(self.root, self.new, self.config, migrate_fit=True)
             self.assertEqual(check.call_args_list[0].args[1], self.old)
             self.assertEqual(writer.call_args.args[0], self.old)
@@ -140,6 +150,171 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(migrated, [self.root / '.deploy/checks/new/jobs.sqlite', jobs])
         self.assertNotEqual(deploy.schema(jobs), deploy.schema(state))
         self.assertEqual((self.root / 'current').resolve(), self.new)
+        self.assertEqual(states['job-logo-worker.path'], 'active')
+
+    def logo_units(self, *, path_state='active', worker_state='active', stop_result=None, unloaded=()):
+        states = {'job-logo-worker.path': path_state, 'job-logo-worker.service': worker_state}
+
+        def systemctl(action, unit):
+            if unit not in states:
+                return 'active' if action == 'is-active' else None
+            if action == 'load-state':
+                return 'not-found' if states[unit] is None or unit in unloaded else 'loaded'
+            if action == 'is-active' and states[unit] is None:
+                raise RuntimeError('Cannot determine service state')
+            if action in ('is-active', 'active-state'):
+                return states[unit] or 'inactive'
+            if states[unit] is None:
+                self.fail(f'{action} called for missing unit {unit}')
+            if action == 'stop':
+                if unit == 'job-logo-worker.service':
+                    self.assertIn(states['job-logo-worker.path'], {'inactive', None})
+                    if stop_result == 'error':
+                        raise RuntimeError('cannot stop logo worker')
+                    if stop_result == 'still active':
+                        return
+                states[unit] = 'inactive'
+            if action == 'start':
+                release = (self.root / 'current').resolve()
+                self.assertTrue((release / 'deploy/job-logo-worker.service').is_file())
+                states[unit] = 'active'
+
+        return states, systemctl
+
+    def enable_logo_support(self, release):
+        (release / 'deploy').mkdir()
+        (release / 'deploy/job-logo-worker.service').touch()
+
+    def test_logo_worker_stops_before_live_backup_and_watcher_resumes_after_switch(self):
+        self.enable_logo_support(self.old)
+        self.enable_logo_support(self.new)
+        states, systemctl = self.logo_units()
+        marker_dir = self.root / 'data/jobs.sqlite.logo-requests'
+        marker_dir.mkdir()
+        marker = marker_dir / 'pending'
+        marker.touch()
+        backup_database = deploy.backup_database
+
+        def backup(source, destination):
+            self.assertEqual(set(states.values()), {'inactive'})
+            transaction = json.loads((self.root / '.deploy/transaction.json').read_text())
+            self.assertTrue(transaction['restart_logo_path'])
+            backup_database(source, destination)
+
+        with patch.object(deploy, 'hermes', return_value={'enabled': True}), \
+             patch.object(deploy, 'service', side_effect=systemctl), patch.object(deploy, 'wait_idle'), \
+             patch.object(deploy, 'healthy', return_value=True), \
+             patch.object(deploy, 'backup_database', side_effect=backup):
+            deploy.activate(self.root, self.new, self.config)
+
+        self.assertTrue(marker.exists())
+        self.assertEqual((self.root / 'current').resolve(), self.new)
+        self.assertEqual(states['job-logo-worker.path'], 'active')
+
+    def test_logo_worker_stop_failure_prevents_backup_and_switch(self):
+        self.enable_logo_support(self.old)
+        self.enable_logo_support(self.new)
+        for result, expected in (('error', 'cannot stop logo worker'), ('still active', 'did not stop')):
+            with self.subTest(result=result):
+                _, systemctl = self.logo_units(stop_result=result)
+                with patch.object(deploy, 'hermes', return_value={'enabled': True}), \
+                     patch.object(deploy, 'service', side_effect=systemctl), patch.object(deploy, 'wait_idle'), \
+                     patch.object(deploy, 'healthy', return_value=True):
+                    with self.assertRaisesRegex(RuntimeError, expected):
+                        deploy.activate(self.root, self.new, self.config)
+
+                self.assertFalse((self.root / '.deploy/backups').exists())
+                self.assertEqual((self.root / 'current').resolve(), self.old)
+
+    def test_logo_worker_started_before_its_unit_was_removed_still_stops(self):
+        self.enable_logo_support(self.new)
+        states, systemctl = self.logo_units(path_state='inactive', unloaded=('job-logo-worker.service',))
+        with patch.object(deploy, 'hermes', return_value={'enabled': False}), \
+             patch.object(deploy, 'service', side_effect=systemctl), patch.object(deploy, 'wait_idle'), \
+             patch.object(deploy, 'healthy', return_value=True):
+            deploy.activate(self.root, self.new, self.config)
+
+        self.assertEqual(set(states.values()), {'inactive'})
+
+    def test_first_logo_release_keeps_uninstalled_or_inactive_watcher_inactive(self):
+        self.enable_logo_support(self.new)
+        for state in (None, 'inactive'):
+            with self.subTest(state=state):
+                states, systemctl = self.logo_units(path_state=state, worker_state=state)
+                with patch.object(deploy, 'hermes', return_value={'enabled': False}), \
+                     patch.object(deploy, 'service', side_effect=systemctl), patch.object(deploy, 'wait_idle'), \
+                     patch.object(deploy, 'healthy', return_value=True):
+                    deploy.activate(self.root, self.new, self.config)
+
+                self.assertEqual((self.root / 'current').resolve(), self.new)
+                self.assertEqual(states['job-logo-worker.path'], state)
+                deploy.switch(self.root, self.old)
+
+    def test_failed_health_keeps_logo_watcher_stopped_on_old_release(self):
+        self.enable_logo_support(self.new)
+        states, systemctl = self.logo_units()
+        with patch.object(deploy, 'hermes', return_value={'enabled': False}), \
+             patch.object(deploy, 'service', side_effect=systemctl), patch.object(deploy, 'wait_idle'), \
+             patch.object(deploy, 'healthy', side_effect=[False, True]):
+            with self.assertRaisesRegex(RuntimeError, 'failed health check'):
+                deploy.activate(self.root, self.new, self.config)
+
+        self.assertEqual((self.root / 'current').resolve(), self.old)
+        self.assertEqual(set(states.values()), {'inactive'})
+
+    def test_recovery_quiesces_logo_worker_with_legacy_journal_before_switching_back(self):
+        self.enable_logo_support(self.new)
+        deploy.switch(self.root, self.new)
+        journal = self.root / '.deploy/transaction.json'
+        journal.write_text(json.dumps({'previous': str(self.old), 'resume_job': False,
+                                      'reason': 'test', 'restart_timer': False, 'web_stopped': True}))
+        states, systemctl = self.logo_units()
+
+        def healthy(config):
+            self.assertEqual(set(states.values()), {'inactive'})
+            return True
+
+        with patch.object(deploy, 'service', side_effect=systemctl), patch.object(deploy, 'wait_idle'), \
+             patch.object(deploy, 'healthy', side_effect=healthy):
+            deploy.recover(self.root, self.config)
+
+        self.assertEqual((self.root / 'current').resolve(), self.old)
+        self.assertFalse(journal.exists())
+
+    def test_recovery_resumes_previously_active_watcher_after_failed_recovery(self):
+        self.enable_logo_support(self.old)
+        self.enable_logo_support(self.new)
+        deploy.switch(self.root, self.new)
+        journal = self.root / '.deploy/transaction.json'
+        journal.write_text(json.dumps({'previous': str(self.old), 'resume_job': False,
+                                      'reason': 'test', 'restart_timer': False, 'web_stopped': True}))
+        states, systemctl = self.logo_units()
+        with patch.object(deploy, 'service', side_effect=systemctl), patch.object(deploy, 'wait_idle'), \
+             patch.object(deploy, 'healthy', side_effect=[False, True]):
+            with self.assertRaisesRegex(RuntimeError, 'Recovery health check failed'):
+                deploy.recover(self.root, self.config)
+            self.assertEqual(set(states.values()), {'inactive'})
+            deploy.recover(self.root, self.config)
+
+        self.assertEqual(states['job-logo-worker.path'], 'active')
+        self.assertFalse(journal.exists())
+
+    def test_recovery_reports_missing_previously_active_watcher_on_supported_release(self):
+        self.enable_logo_support(self.old)
+        journal = self.root / '.deploy/transaction.json'
+        journal.write_text(json.dumps({'previous': str(self.old), 'resume_job': False,
+                                      'reason': 'test', 'restart_timer': False, 'web_stopped': False,
+                                      'restart_logo_path': True}))
+        states, systemctl = self.logo_units(path_state=None)
+        with patch.object(deploy, 'service', side_effect=systemctl), patch.object(deploy, 'wait_idle'):
+            with self.assertRaisesRegex(RuntimeError, 'job-logo-worker.path.*loaded'):
+                deploy.recover(self.root, self.config)
+            self.assertTrue(journal.exists())
+            states['job-logo-worker.path'] = 'inactive'
+            deploy.recover(self.root, self.config)
+
+        self.assertEqual(states['job-logo-worker.path'], 'active')
+        self.assertFalse(journal.exists())
 
     def test_existing_transaction_requires_explicit_recovery(self):
         transaction = self.root / '.deploy/transaction.json'
@@ -150,7 +325,6 @@ class DeploymentTests(unittest.TestCase):
 
     def test_busy_timeout_restores_schedule_without_switching(self):
         with patch.object(deploy, 'hermes', return_value={'enabled': True}) as control, \
-             patch.object(deploy, 'service', return_value='active'), \
              patch.object(deploy, 'wait_idle', side_effect=TimeoutError('busy')):
             with self.assertRaises(TimeoutError):
                 deploy.activate(self.root, self.new, self.config)
@@ -163,7 +337,6 @@ class DeploymentTests(unittest.TestCase):
                 raise RuntimeError('control unavailable')
             return {'enabled': True}
         with patch.object(deploy, 'hermes', side_effect=hermes), \
-             patch.object(deploy, 'service', return_value='active'), \
              patch.object(deploy, 'wait_idle'), patch.object(deploy, 'healthy', return_value=True):
             with self.assertRaisesRegex(RuntimeError, 'control unavailable'):
                 deploy.activate(self.root, self.new, self.config)
@@ -174,7 +347,7 @@ class DeploymentTests(unittest.TestCase):
         def finish_wait(config):
             self.fetch.return_value = (None, 'b' * 40)
         with patch.object(deploy, 'hermes', return_value={'enabled': True}) as control, \
-             patch.object(deploy, 'service', return_value='active') as services, \
+             patch.object(deploy, 'service', wraps=deploy.service) as services, \
              patch.object(deploy, 'wait_idle', side_effect=finish_wait):
             with self.assertRaisesRegex(RuntimeError, 'Main changed'):
                 deploy.activate(self.root, self.new, self.config)
@@ -184,7 +357,7 @@ class DeploymentTests(unittest.TestCase):
 
     def test_failed_rollback_keeps_writers_paused_and_recovery_journal(self):
         with patch.object(deploy, 'hermes', return_value={'enabled': True}) as control, \
-             patch.object(deploy, 'service', return_value='active') as services, \
+             patch.object(deploy, 'service', wraps=deploy.service) as services, \
              patch.object(deploy, 'wait_idle'), patch.object(deploy, 'healthy', return_value=False):
             with self.assertRaisesRegex(RuntimeError, 'Rollback health failed'):
                 deploy.activate(self.root, self.new, self.config)
@@ -197,7 +370,6 @@ class DeploymentTests(unittest.TestCase):
         journal.write_text(json.dumps({'previous': str(self.old), 'resume_job': True,
                                       'reason': 'test', 'restart_timer': True, 'web_stopped': True}))
         with patch.object(deploy, 'hermes', return_value={'enabled': True}), \
-             patch.object(deploy, 'service'), \
              patch.object(deploy, 'wait_idle', side_effect=TimeoutError('busy')):
             with self.assertRaises(TimeoutError):
                 deploy.recover(self.root, self.config)
@@ -215,11 +387,11 @@ class DeploymentTests(unittest.TestCase):
             changes.append(kind)
             if kind == 'state':
                 raise RuntimeError('second migration failed')
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 db.execute('CREATE TABLE migrated_jobs(id INTEGER)')
         with patch.object(deploy, 'migrate_database', side_effect=migrate_database), \
              patch.object(deploy, 'hermes', return_value={'enabled': True}) as hermes, \
-             patch.object(deploy, 'service', return_value='active'), patch.object(deploy, 'wait_idle'), \
+             patch.object(deploy, 'wait_idle'), \
              patch.object(deploy, 'healthy', return_value=True):
             with self.assertRaisesRegex(RuntimeError, 'second migration failed'):
                 deploy.activate(self.root, self.new, self.config, migrate_cards=True)
@@ -227,13 +399,15 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual((self.root / 'current').resolve(), self.old)
         self.assertFalse(journal.exists())
         self.assertEqual(hermes.call_args.args[0], 'resume')
-        with sqlite3.connect(self.root / 'data/jobs.sqlite') as db:
+        with closing(sqlite3.connect(self.root / 'data/jobs.sqlite')) as db, db:
             self.assertEqual(db.execute("SELECT value FROM private_data").fetchone()[0], 'preserve')
             self.assertIsNotNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='migrated_jobs'").fetchone())
 
     def test_card_cutover_failed_startup_restores_previously_disabled_services(self):
         def service(action, unit):
-            if action == 'is-active':
+            if action == 'load-state':
+                return 'not-found'
+            if action in ('is-active', 'active-state'):
                 return 'inactive'
         with patch.object(deploy, 'migrate_database'), patch.object(deploy, 'hermes', return_value={'enabled': False}), \
              patch.object(deploy, 'service', side_effect=service) as start_stop, patch.object(deploy, 'wait_idle'), \

@@ -1,0 +1,10 @@
+[Unit]
+Description=Process pending company logos
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/job_search
+ExecStart=%h/job_search/.venv-dashboard/bin/python -m job_search.company_logos --db data/jobs.sqlite --drain
+Restart=on-failure
+RestartSec=30s
