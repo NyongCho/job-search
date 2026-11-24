@@ -24,6 +24,8 @@ from .job_sources import (
     role_key, source_locator,
 )
 from .logo_scope import default_state_path, eligible_post_ids
+from .logo_svg import render_icon_svg
+from .official_icons import is_official_job_page, official_icon, toss_icon_size
 from .public_fetch import PublicHTTPError, fetch_public
 
 MAX_PAGE = 2_000_000
@@ -166,6 +168,9 @@ def _plan(doc):
         for url in dict.fromkeys(urls):
             if not url:
                 continue
+            if is_official_job_page(url):
+                page = url
+                break
             locator = linked_job_locator(doc, url)
             domain = _official_domain(url, company)
             if locator or domain:
@@ -178,6 +183,9 @@ def _plan(doc):
         scope = f"{locator.source}:{locator.scope}"
         if locator.source in {"ascent", "wanted"}:
             scope += ":" + locator.original_id
+    elif is_official_job_page(page):
+        # The same careers site serves several companies, sometimes even within one parent job.
+        scope = "posting:" + page
     elif domain:
         scope = "domain:" + domain
     elif page or (apply_url and urlsplit(apply_url).hostname not in {"forms.gle", "docs.google.com", "tally.so", "form.naver.com"}):
@@ -354,6 +362,12 @@ def _official(plan, fetch, deadline, doc):
         if greeting_home(final) != home:
             return None
         return _board_brand(raw.decode("utf-8-sig"), final, plan.company)
+    if is_official_job_page(requested):
+        if final == requested:
+            icon = official_icon(raw.decode("utf-8-sig"), final, plan.company)
+            if icon:
+                return Candidate("official:" + urlsplit(final).hostname, final, icon)
+        return None
     if plan.locator:
         match = linked_job_locator({"title": plan.company + "｜" + plan.role}, final)
         if not match or (match.scope, match.original_id) != (plan.locator.scope, plan.locator.original_id):
@@ -391,19 +405,30 @@ def _official(plan, fetch, deadline, doc):
     return Candidate(key, final, logo) if logo else None
 
 
-def _verified_png(raw, image_module):
+def _verified_png(raw, image_module, *, icon_url=None):
     if not raw or len(raw) > MAX_IMAGE:
         return None
-    formats = ("PNG", "JPEG", "WEBP", "GIF")
+    formats = ("PNG",) if icon_url else ("PNG", "JPEG", "WEBP", "GIF")
     try:
         with image_module.open(io.BytesIO(raw), formats=formats) as image:
             width, height = image.size
+            declared = toss_icon_size(icon_url) if icon_url else None
+            if declared and image.size != (declared, declared):
+                return None
             if not (10 <= width <= 2048 and 10 <= height <= 2048 and width * height <= 2_000_000
                     and 0.45 <= width / height <= 12 and not getattr(image, "is_animated", False)):
                 return None
             image.verify()
         with image_module.open(io.BytesIO(raw), formats=formats) as image, image.convert("RGBA") as raster:
             raster.thumbnail((256, 256))
+            if icon_url:
+                # Require visible ink on the white background at the dashboard's actual card size.
+                preview = raster.copy()
+                preview.thumbnail((24, 24))
+                card = image_module.new("RGBA", (24, 24), "white")
+                card.alpha_composite(preview)
+                if sum(card.convert("L").histogram()[:240]) * 100 < card.width * card.height:
+                    return None
             raster.info.clear()
             result = io.BytesIO()
             raster.save(result, format="PNG")
@@ -469,13 +494,22 @@ def _release_image(db, token):
 
 def _image_candidates(plan, fetch, deadline, doc):
     seen = set()
-    for source in ("body", "official"):
-        brand = plan.body if source == "body" else _official(plan, fetch, deadline, doc)
+    sources = ("official", "body") if is_official_job_page(plan.page) else ("body", "official")
+    discovery_error = None
+    for source in sources:
+        try:
+            brand = plan.body if source == "body" else _official(plan, fetch, deadline, doc)
+        except (OSError, ValueError) as error:
+            # Try any independent listing image before reporting the page failure for retry.
+            discovery_error = error
+            continue
         if brand:
             for url in (brand.image_url, brand.alternate_image_url):
                 if url and (brand.key, url) not in seen:
                     seen.add((brand.key, url))
                     yield Candidate(brand.key, brand.source_page, url)
+    if discovery_error:
+        raise discovery_error
 
 
 def _attempt(db, plan, fetch, deadline, image_module, doc):
@@ -491,9 +525,12 @@ def _attempt(db, plan, fetch, deadline, image_module, doc):
             if token is None:
                 return "ready", candidate, None, None
             final, data, _ = fetch(candidate.image_url, deadline=deadline, limit=MAX_IMAGE)
-            if candidate.key.startswith("jobda:") and final != candidate.image_url:
-                raise ValueError("JOBDA image redirected away from its verified asset")
-            png = _verified_png(data, image_module)
+            icon = candidate.key.startswith("official:")
+            if (icon or candidate.key.startswith("jobda:")) and final != candidate.image_url:
+                raise ValueError("Image redirected away from its verified asset")
+            if icon and candidate.image_url.endswith(".svg"):
+                data = render_icon_svg(data)
+            png = _verified_png(data, image_module, icon_url=candidate.image_url if icon else None)
             if png is not None:
                 return "ready", candidate, png, token
         except ImageClaimInProgress:
@@ -576,7 +613,8 @@ def _refresh_post(db, post_id, *, deadline, fetch, image_module, retry_before=No
             (started, started + 15, post_id, started, *args)).fetchone()
         if not claim:
             return None
-    outcome, candidate, png, token = _attempt(db, plan or _plan(doc), fetch, deadline, image_module, doc)
+    plan = plan or _plan(doc)
+    outcome, candidate, png, token = _attempt(db, plan, fetch, deadline, image_module, doc)
     with db:
         db.execute("BEGIN IMMEDIATE")
         current = db.execute("""SELECT p.document, j.attempted_at FROM posts p JOIN job_company_logos j ON j.post_id=p.id
@@ -605,9 +643,9 @@ def _refresh_post(db, post_id, *, deadline, fetch, image_module, retry_before=No
         db.execute("""UPDATE job_company_logos SET company_key=COALESCE(?,company_key), outcome=?,
             attempted_at=?,lease_until=0 WHERE post_id=?""",
             (candidate.key if candidate else None, outcome, attempted, post_id))
+        if outcome == "ready" and (plan.awaiting_official or is_official_job_page(plan.page)):
+            db.execute("UPDATE job_company_logos SET identity=? WHERE post_id=?", (plan.identity, post_id))
         if work:
-            if plan.awaiting_official and outcome == "ready":
-                db.execute("UPDATE job_company_logos SET identity=? WHERE post_id=?", (plan.identity, post_id))
             record_logo_receipt(db, work, {"ready": "done", "pending": "failed", "missing": "skipped"}[outcome])
     return outcome
 
