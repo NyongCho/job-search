@@ -70,7 +70,7 @@ class HermesDashboardTests(unittest.TestCase):
         env_file = self.home / ".config/job-dashboard/environment"
         env_file.parent.mkdir(parents=True)
         env_file.write_text(f'HERMES_HOME="{hermes_home}"\nJOBS_DB="{jobs}"\nFIT_PROFILE_FILES="{profile}"\n'
-                            'FIT_BATCH_SIZE=2\nDASHBOARD_SECRET_KEY=web-only-test-value\n')
+                            'FIT_BATCH_SIZE=2\nPOSTER_TESSERACT="/opt/poster ocr/bin/tesseract"\nTESSDATA_PREFIX=/opt/ocr/data\nDASHBOARD_SECRET_KEY=web-only-test-value\n')
         collect_jobs.connect(jobs).close()
         with sqlite3.connect(jobs) as db:
             db.execute("INSERT INTO outbox VALUES(?,?,?,0)", ("old", "saved in shared database", '["old"]'))
@@ -88,6 +88,8 @@ class HermesDashboardTests(unittest.TestCase):
         env = command.call_args.kwargs["env"]
         self.assertEqual((env["FIT_PROFILE_FILES"], env["FIT_BATCH_SIZE"]), (str(profile), "2"))
         self.assertEqual(env["DASHBOARD_STATE_DB"], str(self.root / "data/dashboard/dashboard.sqlite"))
+        self.assertEqual(env["POSTER_TESSERACT"], "/opt/poster ocr/bin/tesseract")
+        self.assertEqual(env["TESSDATA_PREFIX"], "/opt/ocr/data")
         self.assertNotIn("DASHBOARD_SECRET_KEY", env)
 
     def test_rollback_keeps_saved_digest(self):

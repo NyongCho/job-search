@@ -13,9 +13,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import collect_jobs, company_logos, refresh_queue
-from .job_availability import _automatic, _stamp, document_version, has_jd_content, inspect_document
+from .job_availability import _automatic, _stamp, document_version, has_jd_content, inspect_document, source_document
 from .logo_scope import eligible_post_ids
-from .job_sources import SourceLocator, matches_jd_source, parse_posting, role_key, source_locator
+from .job_sources import SourceLocator, has_review_text, matches_jd_source, official_jd, parse_posting, source_locator
+from .poster_evidence import poster_candidates
 from .public_fetch import fetch_public
 from .refresh_job_availability import (
     _external_facts,
@@ -109,33 +110,16 @@ def _official_result(doc, locator, final_url, raw, *, listing=None):
     modified = listing.modified if listing else posting.modified
     plan = listing.plan if listing else company_logos._plan(doc)
     fresh = listing.jd if listing else None
-    origin = {"source": locator.source, "url": locator.url, "original_id": locator.original_id}
     previous = _stamp(doc.get("jd_modified_gmt")) if matches_jd_source(doc, locator) else None
     incoming = _stamp(posting.modified)
-    body = posting.body
-    if has_jd_content({"lines": body.lines, "images": body.images, "links": body.links}) and (
-        not previous or (incoming and incoming > previous)
-    ):
-        lines = body.lines.copy()
-        for image in body.images:
-            alt = (image.get("alt") or "").strip()
-            if alt and alt not in lines and not role_key(alt).endswith(("로고", "logo")):
-                lines.append(alt)
-        fresh = {
-            **(listing.linked_listing if listing else doc),
-            "lines": lines,
-            "images": body.images,
-            "jd_source": origin,
-            "jd_organization": posting.organization,
-            "content_status": "text_available" if len("".join(lines)) >= 80 else "needs_review",
-        }
-        if listing:
-            fresh["listing_lines"] = listing.linked_listing["lines"]
-            fresh["listing_images"] = listing.linked_listing["images"]
-        if modified:
-            fresh["modified_gmt"] = modified
-        if posting.modified:
-            fresh["jd_modified_gmt"] = posting.modified
+    if not previous or (incoming and incoming > previous):
+        official = official_jd(listing.linked_listing if listing else doc, locator, posting)
+        if official is not None:
+            fresh = official
+            if modified:
+                fresh["modified_gmt"] = modified
+            if fresh == source_document(doc):
+                fresh = doc
     board = None
     if locator.source == "greeting":
         # Save the branding from this response so the logo worker need not download the posting again.
@@ -166,7 +150,7 @@ def _inthiswork_result(doc, fresh):
         modified,
         revised,
         company_logos._plan(fresh),
-        linked_listing=fresh if doc.get("jd_source") or not has_jd else None,
+        linked_listing=fresh if doc.get("jd_source") or not has_jd or not has_review_text(fresh) or poster_candidates(fresh) else None,
     )
 
 

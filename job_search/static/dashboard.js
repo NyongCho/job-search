@@ -302,11 +302,24 @@ function syncList(next) {
   }
 }
 
+// A background refresh must never attach an unsaved answer to a different JD or question.
+function syncReviewAnswers(current, fresh) {
+  if (current.dataset.fingerprint === fresh.dataset.fingerprint &&
+      current.dataset.questions === fresh.dataset.questions) return;
+  if ([...current.querySelectorAll("textarea")].some(input => input.value)) {
+    current.querySelector("[data-stale-answer]").hidden = false;
+    for (const button of current.querySelectorAll("button")) button.disabled = true;
+    return;
+  }
+  current.replaceWith(fresh);
+}
+
 function applySnapshot(html) {
   const next = new DOMParser().parseFromString(html, "text/html");
   syncList(next.querySelector("#job-list"));
   const selectors = [".list-title > span", ".collection-time", ".nav-count", ".summary-strip strong", "[data-refresh-panels]"];
   if (detail) {
+    syncReviewAnswers(document.querySelector("#review-answers"), next.querySelector("#review-answers"));
     selectors.push(".detail-company", "#job-detail > h2", ".detail-meta", ".detail-actions", "#detail-fit",
                    "#detail-evidence", "#deadline-auto-value", "#deadline-manual-value");
     next.querySelector(".jd-section").open = document.querySelector(".jd-section").open;

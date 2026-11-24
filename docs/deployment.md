@@ -150,6 +150,16 @@ systemctl --user status job-refresh-worker.service
 
 이전 릴리스로 복구한 동안의 수집·검토도 같은 DB에 기록됩니다. 새 릴리스를 다시 시작하면 그동안 수집한 미검토 공고는 정기 검토 대상이 되고, 구버전에서 이미 검토한 공고의 추천 이력은 보존됩니다.
 
+### 지원자 확인함과 개인 답변
+
+이 버전을 처음 적용할 때도 위의 `--migrate-refresh FULL_MAIN_SHA` 전환 절차를 사용합니다. 개인 상태 DB에 `review_answers`가 있어야 새 릴리스의 시작 검사와 `/healthz`가 통과합니다. 전환 도구는 정기 실행 프롬프트도 번들 값으로 맞추므로 해당 서버의 기존 프롬프트와 백업을 확인하세요. 이후 같은 스키마의 릴리스는 일반 배포 절차를 사용합니다.
+
+확인 필요·처리 보류·만료 목록은 저장된 JD, 검토 근거와 현재 마감 정보에서 즉시 계산합니다. 기존 공고를 분류하기 위해 일괄 새로고침을 누를 필요가 없습니다. 개인 답변은 해당 공고의 JD 버전과 질문에 연결합니다. 답변 접수 뒤 같은 공고의 평가 작업 하나가 생기며, 워커가 설정된 평가 모델에 이 공고만 보냅니다. 원문 답변은 개인 상태 DB에 보관합니다.
+
+전환 전에 전달 대기열도 확인하세요. 이미 저장된 미전달 알림의 재시도는 당시 작성한 전달문과 영수증을 사용합니다.
+
+이전 릴리스는 답변 전용 작업을 가져가지 않습니다. 새 워커로 복귀하면 대기 작업을 이어서 처리합니다. 전환 뒤 합성 공고로 확인하려면 복사 DB에서 질문 제출 → 처리 보류 → 워커 재평가 → 추천 또는 새 판정 순서를 점검하세요.
+
 ## 일반 배포 동작과 복구
 
 활성화 직전 로고 경로 감시를 먼저 멈추고 로고 서비스의 중단을 확인합니다. Hermes 채용 작업과 마감 타이머를 일시 정지하고 실행 중인 검토·마감 갱신이 끝날 때까지 최대 10분 기다립니다. 웹앱을 잠시 중지하고 SQLite 백업을 만든 다음 `current`를 전환합니다. `/healthz`가 정상이어야 성공하며, 실패하면 이전 코드로 되돌립니다. 배포 중에는 별도의 수동 수집·검토·로고 처리를 시작하지 않습니다.
@@ -168,3 +178,44 @@ systemctl --user status job-dashboard.service job-availability.timer
 현재 릴리스가 워커 도입 전 버전이면 로고 유닛을 제어할 수 있는 검토된 새 버전의 `scripts/deploy.py --recover`를 사용합니다. 복구가 이전에 활성 상태였던 로고 유닛을 불러오지 못하면 유닛 파일을 복구하고 `daemon-reload`를 실행한 뒤 복구를 다시 실행합니다.
 
 새 배포를 일시 중지하려면 GitHub 저장소 변수 `DEPLOY_ENABLED=false`로 설정합니다. 테스트는 계속 실행됩니다. 실제 배포 완료 여부는 Actions 성공 표시, 서버 `current/.revision`, 웹 상태를 함께 확인합니다.
+
+### 채용 포스터 OCR과 과거 공고 복구
+
+정기 수집과 웹 새로고침 워커는 직무가 일치하는 공식 원문을 우선 사용합니다. 포스터가 필요하면 Tesseract의 한국어·영어 언어 자료를 사용합니다. 서버의 저장소 패키지로 설치할 때는 `tesseract-ocr tesseract-ocr-kor tesseract-ocr-eng`가 필요합니다. 서비스 계정 전용 설치에서는 실행 파일, 공유 라이브러리, 언어 자료를 함께 넣은 래퍼를 쓸 수 있습니다.
+
+1. 서비스 사용자로 실행 파일과 두 언어를 확인합니다.
+2. `~/.config/job-dashboard/environment`에 `POSTER_TESSERACT`의 **절대 경로**를 적습니다. 래퍼가 언어 자료 경로를 설정합니다. 시스템 CLI에 별도 언어 자료를 쓰는 경우에는 `TESSDATA_PREFIX`도 지정합니다. 정기 프리런의 `scripts/hermes_collect.py`와 새로고침 워커가 이 환경 파일을 함께 사용합니다.
+3. 릴리스 교체 후 `systemctl --user restart job-refresh-worker.service`로 워커에 환경을 적용합니다. 정기 프리런은 다음 실행 때 파일을 읽습니다.
+
+```sh
+"$HOME/job_search/.tools/ocr/bin/tesseract" --version
+"$HOME/job_search/.tools/ocr/bin/tesseract" --list-langs
+```
+
+하루 두 번의 일반 정기 실행은 미처리 포스터를 회당 **최대 공고 2건, 공고마다 이미지 4장**까지 복구합니다. 접수 가능 근거가 있는 공고, 시도한 적 없는 공고 순으로 처리합니다. 같은 실행을 재시도하면 앞서 예약한 공고 ID를 사용합니다. 자동 포스터 모델 호출은 0회입니다. 텍스트 적합성 평가는 기존 모델 경로를 사용합니다. 운영자가 고정 ID로 요청한 기간 백필은 해당 목록을 따릅니다.
+
+로컬 판독은 번호 매기기·연락처와 달력상 유효한 접수일을 직무 근거에서 분리합니다. 경력·어학 점수 같은 수치 행은 첫 판독의 숫자 토큰 신뢰도와 원본 행을 확대해 다시 읽은 문장을 함께 확인합니다. 두 판독이 다르거나 여러 직무의 행을 연결하기 어려우면 보류합니다.
+
+배포 후 복구 명령은 서비스 계정으로 현재 릴리스에서 실행합니다. 아래의 환경 파일은 운영자가 관리하는 셸 호환 설정 파일입니다.
+
+```sh
+cd "$HOME/job_search/current"
+set -a
+. "$HOME/.config/job-dashboard/environment"
+set +a
+.venv-dashboard/bin/python -m job_search.poster_backfill --dry-run --limit 3
+.venv-dashboard/bin/python -m job_search.poster_backfill --limit 3
+```
+
+`--dry-run`은 저장된 공고와 접수 상태만 조회합니다. 일반 배치는 확인된 마감을 건너뛰고, 접수 가능 근거가 있는 공고부터 처리합니다. 결과의 `ready`는 근거 확보, `uncertain`은 원본 대조 필요, `failed`는 기술적 실패입니다. 다운로드와 실행 환경의 일시 실패는 10분 후 다시 처리할 수 있습니다. 판독 결과가 충분하면 다음 정규 평가가 새 근거를 사용합니다. 이미 전달한 공고의 발송 영수증을 보존합니다.
+
+어려운 공고는 실제 ID를 지정해 모델 판독을 실행할 수 있습니다. `POST_ID`를 판독할 공고의 숫자 ID로 설정합니다.
+
+```sh
+.venv-dashboard/bin/python -m job_search.poster_backfill --post-id "$POST_ID" --dry-run
+.venv-dashboard/bin/python -m job_search.poster_backfill --post-id "$POST_ID" --model
+```
+
+한 번의 명령은 로컬 결과가 불확실한 이미지 최대 한 장을 기존 Hermes의 vision 공급자에 보냅니다. 입력은 공개 포스터입니다. Hermes가 별도 위치에 설치되었다면 기존 적합성 평가와 같은 `HERMES_HOME`, `HERMES_REPO`, `HERMES_PYTHON` 설정을 사용합니다. 정기 수집과 웹 새로고침에서는 저장된 모델 결과만 사용합니다.
+
+공고 DB 옆의 `<DB 파일명>.posters/`에는 원본 이미지, 행 좌표, 판독 결과와 모델 호출 영수증이 저장됩니다. 영속 볼륨의 여유 공간과 백업 범위에 이 디렉터리를 포함합니다. 같은 이미지 내용의 결과는 여러 공고에서 공유합니다. 모델 전송 결과를 잃은 경우 `model_interrupted` 또는 `model_failed` 사유가 남고 같은 이미지를 재전송하지 않습니다. `poster_evidence.images[].lines[].bbox`는 원본 픽셀 기준의 `[x, y, 너비, 높이]`입니다. 모델 좌표는 근사 영역입니다. `ready` 행의 `line_number`는 `document.lines`의 1부터 시작하는 줄 번호입니다.

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from flask import Flask, Response, abort, g, jsonify, render_template, request, session, url_for
+from flask import Flask, Response, abort, flash, g, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.exceptions import HTTPException, SecurityError
 
 from . import dashboard_store as store, refresh_api, refresh_queue
@@ -17,7 +17,8 @@ from .company_research import load_research, lookup_research
 
 ROOT = Path(__file__).resolve().parents[1]
 VIEW_LABELS = {"recommended": "추천", "interested": "관심", "preparing": "지원 준비",
-               "applied": "지원 현황", "archived": "보관", "needs_review": "확인 필요", "expired": "만료"}
+               "applied": "지원 현황", "archived": "보관", "needs_review": "확인 필요",
+               "processing_hold": "처리 보류", "expired": "만료"}
 STATUS_LABELS = {"unmarked": "미지정", "interested": "관심", "preparing": "지원 준비",
                  "applied": "지원 완료", "archived": "보관"}
 DECISION_LABELS = {"recommend": "추천", "needs_review": "확인 필요", "exclude": "추천 제외",
@@ -84,7 +85,9 @@ def create_app(config=None):
         g.profile_name = "로컬 사용자" if dev else app.config["ALLOWED_LOGIN"].partition("@")[0]
         if request.method == "POST":
             token, expected = request.headers.get("X-CSRF-Token", ""), session.get("csrf_token", "")
-            if not token or not expected or not hmac.compare_digest(token, expected):
+            if request.endpoint == "answer_question" and not token:
+                token = request.form.get("csrf_token", "")
+            if not token or not expected or not token.isascii() or not hmac.compare_digest(token, expected):
                 abort(403)
 
     @app.after_request
@@ -165,6 +168,24 @@ def create_app(config=None):
             abort(404)
         return Response(image, mimetype="image/png")
 
+    @app.post("/jobs/<int:post_id>/answers")
+    def answer_question(post_id):
+        from . import review_answers
+
+        if post_id >= 2**63:
+            abort(404)
+        view, q, page, sort = context()
+        g.answer_url = url_for("detail", post_id=post_id, view=view, q=q, sort=sort, page=page, render="full")
+        try:
+            review_answers.submit(source, state, post_id, request.form.get("fingerprint", ""),
+                                  request.form.get("question", ""), request.form.get("answer", ""))
+        except review_answers.AnswerChanged:
+            return error_response(409, "공고 또는 질문이 바뀌었어요. 현재 공고를 다시 확인해 주세요.")
+        except ValueError:
+            return error_response(400, "답변을 1자 이상 2,000자 이하로 입력해 주세요.")
+        flash("답변을 저장했어요. 이 공고의 재평가 상태를 확인할 수 있어요.", f"review_answer_{post_id}")
+        return redirect(g.answer_url + "#review-feedback", code=303)
+
     @app.post("/jobs/<int(signed=True):post_id>/state")
     def change_state(post_id):
         data = request.get_json(silent=True)
@@ -210,7 +231,7 @@ def create_app(config=None):
         return jsonify(status="ok")
 
     def error_response(code, message):
-        if request.method == "POST":
+        if request.method == "POST" and request.endpoint != "answer_question":
             return jsonify(error=code, message=message), code
         return render_template("dashboard.html", error={"code": code, "message": message},
                                listing=None, detail=None, view="recommended", q="", views=VIEW_LABELS,

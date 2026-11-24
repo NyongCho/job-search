@@ -357,3 +357,13 @@ blockquote { margin: 14px 0; border-left: 2px solid #c6d9ce; padding: 3px 0 3px 
   .has-detail .main-shell > .refresh-status { display: none; }
   .job-detail > .refresh-status:has([data-refresh-status]:not(:empty)), .job-detail > .refresh-status:has(a) { display: block; margin: 10px 0; }
 }
+
+.decision-tag.processing_hold { color: #4e5965; background: #eef1f3; }
+.review-questions { padding: 16px; margin-bottom: 16px; border: 1px solid var(--line); border-radius: 9px; }
+.review-questions h3 { margin: 0; }
+.answer-hint, .answer-feedback { color: #526158; font-size: 12px; line-height: 1.6; }
+.answer-feedback a { text-decoration: underline; }
+.review-answer-form label { display: block; font-weight: 600; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+.review-answer-form textarea { display: block; width: 100%; margin: 8px 0; padding: 10px; border: 1px solid #93a39c; border-radius: 6px; font: inherit; resize: vertical; }
+.review-answer-form button { min-height: 44px; }
+.review-answer-form + .review-answer-form { margin-top: 16px; }

@@ -41,8 +41,15 @@ class Document(HTMLParser):
             self.fragments.append("\n")
         if tag == "a" and attrs.get("href"):
             self.anchor = {"url": urljoin(self.base_url, attrs["href"]), "parts": []}
-        if tag == "img" and attrs.get("src"):
-            self.images.append({"url": urljoin(self.base_url, attrs["src"]), "alt": attrs.get("alt", "")})
+        if tag == "img":
+            source = attrs.get("data-src") or attrs.get("data-lazy-src") or attrs.get("src")
+            if source:
+                image = {"url": urljoin(self.base_url, source), "alt": attrs.get("alt", "")}
+                for axis in ("width", "height"):
+                    raw = attrs.get(axis) or ""
+                    if re.fullmatch(r"[1-9][0-9]{0,5}", raw):
+                        image[axis] = int(raw)
+                self.images.append(image)
 
     def handle_endtag(self, tag):
         if tag in self.HIDDEN:

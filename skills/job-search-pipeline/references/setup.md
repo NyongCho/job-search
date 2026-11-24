@@ -30,3 +30,5 @@ python3 collect_jobs.py status
 5. 검토·전달 시험도 요청 범위 안에서 한다. 실제 전송을 시험하지 않았다면 연결 준비만 끝났다고 보고한다. 실제 시험을 했다면 새 실행 ID의 완료·전달 기록과 수신 채널을 확인한다.
 
 새 프로필의 Hermes 위치를 설정만 했다고 해당 계정이 생성되거나 로그인되는 것은 아니다. 계정 연결이 필요한 경우 그 단계만 사용자에게 안내한다.
+
+포스터 판독을 사용할 설치에서는 선택한 Python 환경에 Pillow를 설치하고 Tesseract에서 `kor`와 `eng` 언어 자료를 확인합니다. 시스템 경로에 없는 경우 정기 실행 환경의 `POSTER_TESSERACT`에 실행 파일 또는 래퍼의 절대 경로를 지정합니다. 준비한 작업 폴더에서는 `python poster_backfill.py --db data/jobs.sqlite --dry-run --limit 3`으로 판독 대상을 확인한 뒤 `--dry-run`을 빼고 소량 처리할 수 있습니다. 모델은 `--post-id ID --model`로 요청한 불확실한 포스터에만 사용합니다.

@@ -384,3 +384,27 @@ test('an empty destination tab polls until active work can no longer change its 
   assert.equal(snapshots, 1);
   assert.deepEqual(delays, [1500]);
 });
+
+test('a background JD or question change cannot rebind a draft answer', () => {
+  const sync = vm.runInNewContext(script + '\n;syncReviewAnswers;', {
+    document: {querySelector() { return null; }},
+  });
+  const draft = {value: '아직 저장하지 않은 답변'};
+  const notice = {hidden: true}, button = {disabled: false};
+  const current = {
+    dataset: {fingerprint: 'first', questions: '["근무 가능 여부"]'},
+    querySelector: () => notice, querySelectorAll: selector => selector === 'textarea' ? [draft] : [button],
+    replaceWith(fresh) { this.replacement = fresh; },
+  };
+  sync(current, {dataset: {...current.dataset}});
+  assert.equal(button.disabled, false);
+  const changed = {dataset: {...current.dataset, fingerprint: 'second'}};
+  sync(current, changed);
+  assert.equal(current.replacement, undefined);
+  assert.equal(draft.value, '아직 저장하지 않은 답변');
+  assert.equal(button.disabled, true);
+  assert.equal(notice.hidden, false);
+  draft.value = '';
+  sync(current, changed);
+  assert.equal(current.replacement, changed);
+});

@@ -18,7 +18,7 @@ def worker_environment(root):
     if settings.is_file():
         keys = {"JOBS_DB", "DASHBOARD_STATE_DB", "HERMES_HOME", "HERMES_REPO", "HERMES_PYTHON",
                 "FIT_PROFILE_FILES", "FIT_BATCH_SIZE", "FIT_CONCURRENCY", "FIT_INPUT_CHAR_LIMIT",
-                "FIT_MODEL", "FIT_PROVIDER"}
+                "FIT_MODEL", "FIT_PROVIDER", "POSTER_TESSERACT", "TESSDATA_PREFIX"}
         for line in settings.read_text().splitlines():
             key, separator, value = line.partition("=")
             if separator and key in keys:

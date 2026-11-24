@@ -208,7 +208,7 @@ class WebTests(unittest.TestCase):
             self.assertIn(f'<option value="{value}" selected>{label}</option>', page)
 
     def test_inbox_views_offer_fit_sort_and_keep_their_defaults(self):
-        for view in ("interested", "preparing", "applied", "archived", "needs_review", "expired"):
+        for view in ("interested", "preparing", "applied", "archived", "needs_review", "processing_hold", "expired"):
             with self.subTest(view=view):
                 path = "/?view=" + view
                 default = "activity" if view == "applied" else "reviewed"
@@ -275,6 +275,68 @@ class WebTests(unittest.TestCase):
         old = self.get("/jobs/1").get_data(as_text=True).split('<article id="job-detail"', 1)[1]
         self.assertIn("미산정", old)
         self.assertNotIn("0.0점", old)
+
+    def answer_form(self):
+        collect_fit_examples(self.source)
+        fit_work.migrate(self.source, self.state, profile={"P1": "합성 경력"})
+        location = "/jobs/5?view=needs_review&q=Agent&sort=fit"
+        html = self.get(location).get_data(as_text=True)
+        form = re.search(r'<form[^>]+class="review-answer-form".*?</form>', html, re.S)
+        self.assertIsNotNone(form, "An applicant question needs a server-rendered answer form")
+        self.assertIn('enctype="multipart/form-data"', form[0])
+        action = unescape(re.search(r'action="([^"]+)"', form[0])[1])
+        fields = {name: unescape(value) for name, value in re.findall(
+            r'<input type="hidden" name="([^"]+)" value="([^"]*)"', form[0])}
+        return action, {**fields, "answer": "테스트용 개인 답변입니다."}
+
+    def test_answer_form_is_private_idempotent_and_redirects_to_its_context(self):
+        action, fields = self.answer_form()
+        self.assertEqual(fields["question"], "운영 장애에 직접 대응했나요?")
+        with sqlite3.connect(self.source) as db:
+            self.assertEqual(fields["fingerprint"], db.execute("SELECT fingerprint FROM posts WHERE id=5").fetchone()[0])
+        for _ in range(2):
+            submitted = self.client.post(action, base_url=self.base, headers=self.identity, data=fields)
+            self.assertEqual(submitted.status_code, 303)
+            self.assertNotIn(fields["answer"], submitted.location + submitted.get_data(as_text=True))
+            self.assertIn("/jobs/5?", submitted.location)
+            self.assertIn("view=needs_review", submitted.location)
+            self.assertIn("sort=fit", submitted.location)
+        with sqlite3.connect(self.state) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM refresh_runs").fetchone()[0], 1)
+        detail = self.get(submitted.location).get_data(as_text=True)
+        self.assertIn("답변을 저장했어요", detail)
+        self.assertNotIn('class="review-answer-form"', detail)
+        self.assertNotIn(fields["answer"], detail)
+
+    def test_answer_form_rejects_unauthorized_invalid_and_stale_submissions(self):
+        action, fields = self.answer_form()
+        for changes, headers, expected in [
+            ({}, {}, 403), ({"csrf_token": ""}, self.identity, 403),
+            ({"answer": " "}, self.identity, 400), ({"fingerprint": "old"}, self.identity, 409),
+            ({"question": "변경된 질문"}, self.identity, 409),
+        ]:
+            with self.subTest(changes=changes, expected=expected):
+                result = self.client.post(action, base_url=self.base, headers=headers, data={**fields, **changes})
+                self.assertEqual(result.status_code, expected)
+                self.assertEqual(result.mimetype, "text/html")
+                self.assertNotIn(fields["answer"], result.get_data(as_text=True))
+                if expected == 409:
+                    self.assertIn("/jobs/5?", result.get_data(as_text=True))
+
+    def test_processing_hold_has_its_reason_and_no_applicant_prompt(self):
+        collect_fit_examples(self.source)
+        question = "접수 중인지 채용 담당자에게 물어봐 주시겠어요?"
+        with sqlite3.connect(self.source) as db:
+            db.execute("UPDATE posts SET fit_review=json_set(fit_review,'$.question',?) WHERE id=5", (question,))
+        for path in ("/?view=processing_hold", "/jobs/5?view=processing_hold"):
+            response = self.get(path)
+            self.assertEqual(response.status_code, 200)
+            html = response.get_data(as_text=True)
+            self.assertIn("처리 보류", html)
+            self.assertNotIn(question, html)
+            self.assertNotIn('class="review-answer-form"', html)
+            self.assertIn('data-job-id="5"', html)
+        self.assertNotIn('data-job-id="5"', self.get("/?view=needs_review").get_data(as_text=True))
 
     def test_saved_subthreshold_job_shows_score_and_delivery_threshold(self):
         collect_fit_examples(self.source)
@@ -470,7 +532,8 @@ class WebTests(unittest.TestCase):
         with sqlite3.connect(self.source) as db:
             db.execute("UPDATE posts SET document='broken',reviewed_at=NULL,decision=NULL,reason=NULL")
         detail = self.get("/jobs/1").get_data(as_text=True)
-        self.assertIn("검토 대기", detail)
+        self.assertIn('class="decision-tag processing_hold">처리 보류', detail)
+        self.assertIn("직무와 요건을 확인할 공고 본문이 없어요.", detail)
         self.assertIn("표시할 수 없습니다", detail)
         self.assertNotIn('data-reviewed-at="2026', detail)
 

@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import runpy
 import sqlite3
 import subprocess
 import sys
@@ -33,9 +34,18 @@ ID 목록), evidence(확인한 사실의 간단한 요약)를 가진다. 경험 
 """
 
 
+# Routing metadata does not alter the scoring rubric used for existing cached fits.
+ROUTING = """assessment.question_owner는 답할 주체(applicant/employer/system)를 뜻한다.
+확인할 사항이 없으면 question_owner는 생략한다. 지원자의 실제 경험·근무 가능 여부에는 applicant와 구체적인 question을 쓴다.
+회사 정책·근무 조건이 모호하면 employer, JD 누락·이미지 판독·접수 확인 문제는 system으로 두고 question은 비운다.
+각 공고의 answer_facts(A번호)는 해당 JD 질문에 지원자가 직접 제출한 근거다. 그 JD에서만 사용하고
+해당 기준의 profile_ids에서 인용한다. 답변 원문과 개인 식별 정보는 결과에 옮기지 않는다.
+"""
+
+
 def prompt(profile, docs):
     payload = {"facts": profile, "jobs": [{**doc, "lines": list(enumerate(doc["lines"], 1))} for doc in docs]}
-    return PROMPT + json.dumps(payload, ensure_ascii=False)
+    return PROMPT + ROUTING + json.dumps(payload, ensure_ascii=False)
 
 
 def atomic_json(path, data):
@@ -58,12 +68,11 @@ def parse_entries(text):
     return json.loads(fenced[1] if fenced else stripped)
 
 
-def run(attempt, profile, docs, directory, lock_fds):
+def run_adapter(adapter, args, *, payload, lock_fds=(), stdout=subprocess.DEVNULL, timeout=None):
     home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
     repo = Path(os.environ.get("HERMES_REPO", home / "hermes-agent"))
     resolver = repo / "venv/bin/python"
     python = os.environ.get("HERMES_PYTHON") or (str(resolver) if resolver.exists() else sys.executable)
-    adapter = str(Path(__file__).resolve())
     lock_fds = (lock_fds,) if isinstance(lock_fds, int) else lock_fds
     # Managed Hermes selects its own dependency generation and Python ABI before imports.
     # The first interpreter resolves the launch command only and leaves stdin untouched.
@@ -74,17 +83,47 @@ def run(attempt, profile, docs, directory, lock_fds):
         "code=\"sys.argv.pop(0); runpy.run_path(sys.argv[0],run_name='__main__')\"); "
         "os.execv(command[0],command)"
     )
-    subprocess.run(
-        [python, "-c", launcher, adapter, str(directory), attempt],
-        input=prompt(profile, docs),
+    return subprocess.run(
+        [python, "-c", launcher, str(adapter), *args],
+        input=payload,
         text=True,
         cwd=repo,
         env={**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(repo)},
-        stdout=subprocess.DEVNULL,
+        stdout=stdout,
+        timeout=timeout,
         stderr=subprocess.DEVNULL,
         pass_fds=lock_fds,
         check=True,
     )
+
+
+def run(attempt, profile, docs, directory, lock_fds):
+    args = [str(directory), attempt]
+    if any(doc.get("answer_facts") for doc in docs):
+        args.append("--private")
+        payload = json.dumps([profile, docs], ensure_ascii=False)
+    else:
+        payload = prompt(profile, docs)
+    run_adapter(Path(__file__).resolve(), args, payload=payload, lock_fds=lock_fds)
+
+
+def private_receipt(result, profile, doc):
+    """Only journal the verified projection, even if the parent has already exited."""
+    if __package__:
+        from .job_fit import private_answer_entry
+    else:
+        # Managed Hermes uses isolated Python (-I); the adapter directory is absent from sys.path.
+        private_answer_entry = runpy.run_path(str(Path(__file__).with_name("job_fit.py")))["private_answer_entry"]
+    counters = ("calls", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+    receipt = {k: result[k] for k in counters if type(result.get(k)) is int}
+    receipt["entries"] = []
+    try:
+        entry, = result["entries"]
+        if entry["id"] == doc["id"]:
+            receipt["entries"].append(private_answer_entry(entry, profile, doc))
+    except (KeyError, IndexError, TypeError, ValueError):
+        pass
+    return receipt
 
 
 def recover(directory, attempt):
@@ -129,7 +168,11 @@ def main():
         model_cfg if isinstance(model_cfg, str) else model_cfg.get("default")
     )
     runtime = resolve_runtime_provider(target_model=model, requested=os.environ.get("FIT_PROVIDER"))
-    session = SessionDB(directory / (attempt + ".sqlite"))
+    private = "--private" in sys.argv[3:]
+    if private:
+        profile, docs = json.loads(message)
+        message = prompt(profile, docs)
+    session = None if private else SessionDB(directory / (attempt + ".sqlite"))
     agent = AIAgent(
         model=model,
         **{k: runtime.get(k) for k in ("provider", "api_key", "base_url", "api_mode", "request_overrides")},
@@ -144,6 +187,10 @@ def main():
         platform="cli",
         cwd=str(directory),
     )
+    if private:
+        # Hermes uses the same persistence isolation for internal tool-free review turns.
+        # Never lazily reopen the global session DB for applicant answers.
+        agent._persist_disabled = True
     if agent.tools:
         raise RuntimeError("Hermes did not provide a tool-free session")
     atomic_json(directory / (attempt + ".submitted"), {"session_id": attempt})
@@ -164,11 +211,12 @@ def main():
     }
     if not any(tokens.values()):
         tokens = dict.fromkeys(tokens)
-    atomic_json(
-        directory / (attempt + ".json"),
-        {**tokens, "calls": getattr(agent, "session_api_calls", None), "entries": entries, "model": model},
-    )
-    session.close()
+    receipt = {**tokens, "calls": getattr(agent, "session_api_calls", None), "entries": entries, "model": model}
+    if private:
+        receipt = private_receipt(receipt, profile, docs[0])
+    atomic_json(directory / (attempt + ".json"), receipt)
+    if session is not None:
+        session.close()
 
 
 if __name__ == "__main__":

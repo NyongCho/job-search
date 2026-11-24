@@ -1,0 +1,23 @@
+{% set message = get_flashed_messages(category_filter=['review_answer_' ~ detail.id])|last %}
+{% if message %}
+<p id="review-feedback" class="answer-feedback" role="status" tabindex="-1">{{ message }} <a href="{{ url_for('detail', post_id=detail.id, view=view, q=q, sort=listing.sort, page=listing.page, render='full') }}">현재 상태 다시 보기</a></p>
+{% endif %}
+<div id="review-answers" data-fingerprint="{{ detail.fingerprint }}" data-questions='{{ detail.review_questions|default([])|tojson }}'>
+  {% if detail.review_route == 'question' %}
+  <section class="review-questions" aria-labelledby="question-heading">
+    <h3 class="section-label" id="question-heading">확인 질문</h3>
+    <p class="answer-hint">답변은 비공개로 저장되며, 설정된 평가 모델이 이 공고의 현재 채용 요건을 재평가할 때 사용합니다.</p>
+    {% for question in detail.review_questions %}
+    <form class="review-answer-form" method="post" enctype="multipart/form-data" action="{{ url_for('answer_question', post_id=detail.id, view=view, q=q, sort=listing.sort, page=listing.page) }}">
+      <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+      <input type="hidden" name="fingerprint" value="{{ detail.fingerprint }}">
+      <input type="hidden" name="question" value="{{ question }}">
+      <label for="review-answer-{{ loop.index }}">{{ question }}</label>
+      <textarea id="review-answer-{{ loop.index }}" name="answer" rows="2" maxlength="2000" required></textarea>
+      <button class="primary-button" type="submit">답변 저장하고 재평가</button>
+    </form>
+    {% endfor %}
+    <p class="answer-hint" data-stale-answer hidden role="status">입력 중 공고나 질문이 바뀌었어요. <a href="{{ url_for('detail', post_id=detail.id, view=view, q=q, sort=listing.sort, page=listing.page, render='full') }}">현재 공고 다시 보기</a></p>
+  </section>
+  {% endif %}
+</div>
