@@ -2,7 +2,9 @@
 
 from urllib.parse import urlsplit
 
+from .job_availability import availability
 from .job_fit import recommendation_group
+from .review_routing import route_review
 
 
 def review_decision(decision, fit):
@@ -31,17 +33,26 @@ def dashboard_origin(value):
     return value.rstrip("/")
 
 
-def review_digest(reviews, dashboard_url):
+def review_digest(reviews, dashboard_url, *, timing=availability):
     groups = {"preferred": [], "outside": [], "question": []}
     titles = {"preferred": "희망 직무 추천", "outside": "선호 밖 추천", "question": "확인 질문"}
     for doc, entry, decision, fit in reviews:
         group = recommendation_group(decision, fit)
+        current = timing(doc)
+        if current["is_expired"]:
+            continue
+        source_doc = {**doc, "evidence_lines": entry.get("evidence_lines", [])}
+        review = route_review(source_doc, decision, fit, current, reason=entry["reason"])
+        if review["route"] == "question":
+            group = "question"
+        elif review["route"] == "hold" or group == "question":
+            continue
         if not group:
             continue
         title = " ".join(doc["title"].split())
         source = checked_link(doc["url"])
         if group == "question":
-            text = f'{title}\n{fit["question"]}\n원문 {source}'
+            text = "\n".join([title, *review["questions"], f"원문 {source}"])
         else:
             for field in ("deadline", "required_summary"):
                 if not isinstance(entry.get(field), str) or not entry[field].strip():

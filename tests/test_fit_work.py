@@ -565,7 +565,7 @@ class FitWorkTests(unittest.TestCase):
             self.assertNotIn("공고와 무관한 개인 기록", values)
 
     def test_unconfirmed_application_retries_without_rerating_or_delivering_a_source_link(self):
-        missing = posting(1, "<p>필수 조건</p><p>지원 마감 2099-01-01</p>")
+        missing = posting(1, "<p>서버 장애 대응 경험이 필요합니다.</p><p>지원 마감 2099-01-01</p>")
         missing["modified_gmt"] = "2026-11-16T00:00:00"
         jobs.collect(self.path, lambda _: ([missing], 1))
         self.refresh([1])

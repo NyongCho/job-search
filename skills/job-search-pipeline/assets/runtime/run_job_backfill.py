@@ -55,6 +55,11 @@ def snapshot(db_path, target_ids):
     return counts, pending
 
 
+def completion_counts(counts):
+    reviewed = counts["recommend"] + counts["exclude"] + counts["needs_review"]
+    return f"검토 완료 {reviewed}건 · 추천 판정 {counts['recommend']}건 · 제외 판정 {counts['exclude']}건"
+
+
 def main():
     configuration = json.loads((ROOT / "deployment.json").read_text())
     if not JOB_ID:
@@ -147,8 +152,8 @@ def main():
         summary = (
             f"지정 기간 공고 검토가 완료되었습니다.\n"
             f"기간: {manifest['start_kst']} ~ {manifest['end_kst']}\n"
-            f"수집: {len(target_ids)}건 · 추천 판정: {final_counts['recommend']}건 · "
-            f"제외: {final_counts['exclude']}건 · 확인 필요: {final_counts['needs_review']}건\n"
+            f"{completion_counts(final_counts)}\n"
+            "지원자가 답할 확인 질문은 해당 공고의 알림에서 확인할 수 있습니다. "
             "추천 판정 수에는 기존 검토와 선호 밖 전달 기준 미만인 공고도 포함됩니다. "
             "마감 또는 모집 여부 미확인 공고는 새 추천에서 제외했습니다. "
             f"이후 정기 수집 설정: {configuration['schedule']} ({configuration['timezone']})."
