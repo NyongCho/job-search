@@ -1,4 +1,5 @@
 {% from 'deadline.html' import deadline_icon, deadline_content, editor %}
+{% set recommended = view == 'recommended' %}
 {% macro company_mark(job) -%}
 {% if job.has_company_logo %}<img class="company-logo" src="{{ url_for('company_logo', post_id=job.id, v=job.logo_version) }}" alt="" width="24" height="24">{% else %}<span class="company-avatar" aria-hidden="true">{{ job.company[0] }}</span>{% endif %}
 {%- endmacro %}
@@ -91,10 +92,17 @@
             <button type="submit">적용</button>
           </form>
         </div>
-        <div class="inbox-grid">
+        <div class="inbox-grid{% if recommended and not detail %} comparison-list{% endif %}">
           <section id="job-list" class="job-list" tabindex="-1" aria-label="공고 목록" aria-busy="{{ 'true' if shell else 'false' }}" data-page="{{ listing.page }}" data-scroll-key="{{ view }}:{{ listing.sort }}:{{ q }}:{{ listing.page }}">
             {% if shell %}
+            {% if recommended %}
+            <div class="list-load-feedback">
+              <p data-list-load-status role="status">추천 공고를 불러오는 중…</p>
+              <button type="button" data-list-retry hidden>다시 불러오기</button>
+            </div>
+            {% else %}
             <span class="visually-hidden" role="status">공고를 불러오는 중입니다.</span>
+            {% endif %}
             {% for _ in range(4) %}
             <div class="skeleton-card" aria-hidden="true">
               <div class="company-line"><i class="sk-logo"></i><i class="sk-company"></i><i class="sk-deadline"></i></div>
@@ -102,18 +110,27 @@
             </div>
             {% endfor %}
             {% else %}
+            {% if recommended and not detail and listing['items'] %}
+            <div class="comparison-head" aria-hidden="true"><span>기업 · 직무</span><span>적합도 · 추천 근거</span><span>마감</span></div>
+            {% endif %}
             {% for item in listing['items'] %}
             {% if view == 'recommended' and item.fit_group == 'question' and loop.changed(item.fit_group) %}
             <h2 class="list-group-title">{{ fit_groups[item.fit_group] }}</h2>
             {% endif %}
-            <a class="job-row {% if detail and detail.id == item.id %}selected{% endif %}" href="{{ url_for('detail',post_id=item.id,view=view,q=q,sort=listing.sort,page=listing.page) }}" data-job-id="{{ item.id }}" {% if detail and detail.id == item.id %}aria-current="true"{% endif %}>
-              <div class="company-line">{{ company_mark(item) }}<span class="company-name">{{ item.company }}</span><span class="deadline-badge {{ item.deadline_kind }}">{{ deadline_content(item) }}</span></div>
-              <div class="job-row-title">{{ item.role }}</div>
+            <a class="job-row {% if detail and detail.id == item.id %}selected{% endif %}" href="{{ url_for('detail',post_id=item.id,view=view,q=q,sort=listing.sort,page=listing.page, _anchor='job-detail' if recommended else none) }}" data-job-id="{{ item.id }}"
+               {% if recommended %}id="job-{{ item.id }}" aria-labelledby="role-{{ item.id }} company-{{ item.id }}" aria-describedby="match-{{ item.id }} deadline-{{ item.id }}"{% endif %}
+               {% if detail and detail.id == item.id %}aria-current="true"{% endif %}>
+              <div class="company-line">{{ company_mark(item) }}<span class="company-name" id="company-{{ item.id }}">{{ item.company }}</span>{% if not recommended %}<span class="deadline-badge {{ item.deadline_kind }}">{{ deadline_content(item) }}</span>{% endif %}</div>
+              <div class="job-row-title" id="role-{{ item.id }}">{{ item.role }}</div>
+              {% if recommended %}
+              <span id="deadline-{{ item.id }}" class="deadline-badge {{ item.deadline_kind }}">{{ deadline_content(item) }}</span>
+              {% endif %}
+              <div class="row-assessment" id="match-{{ item.id }}">
               {% if item.fit %}
               <p class="fit-preview">{% if item.fit.score is not none %}적합도 {{ '%.1f'|format(item.fit.score) }}점{% else %}적합도 보류{% endif %}{% if item.fit_group in ('preferred', 'outside') %} · {{ fit_groups[item.fit_group] }}{% endif %}</p>
               {% elif item.fit_group == 'legacy' %}<p class="fit-preview">적합도 미산정</p>
               {% endif %}
-              {% if item.company_review %}{% set review = item.company_review %}
+              {% if not recommended and item.company_review %}{% set review = item.company_review %}
               <div class="company-rating-preview">
                 {% if review.status == 'reviewed' %}<span class="rating-pill"><span aria-hidden="true">★</span> 잡플래닛 {{ '%.1f'|format(review.rating) }}</span><span>리뷰 {{ review.review_count }}건</span>{% if review.review_count < 10 %}<span class="sample-hint">표본 적음</span>{% endif %}
                 {% elif review.status == 'no_reviews' %}<span>잡플래닛 · 등록된 리뷰 없음</span>
@@ -124,6 +141,8 @@
               {% if item.fit_group == 'question' %}<p class="fit-question">{{ item.fit.question }}</p>{% endif %}
               <div class="row-tags"><span class="decision-tag {{ 'expired' if item.is_expired else item.display_decision or 'pending' }}">{{ '만료' if item.is_expired else '기존 지원 기록' if item.source_kind == 'profile' else decisions.get(item.display_decision, '검토 대기') }}</span>{% if item.status != 'unmarked' %}<span class="personal-tag">{{ statuses[item.status] }}</span>{% endif %}{% if item.is_unread %}<span class="new-tag"><i></i>새 검토</span>{% endif %}</div>
               {% if item.status == 'applied' %}<p class="progress-preview">{{ item.progress_label }}</p>{% endif %}
+              </div>
+              {% if recommended %}<span class="row-open" aria-hidden="true">상세 보기 <span>→</span></span>{% endif %}
             </a>
             {% else %}
             <div class="list-empty">
@@ -139,8 +158,8 @@
             {% endif %}
           </section>
           {% if detail %}
-          <article id="job-detail" class="job-detail" data-job-id="{{ detail.id }}" data-reviewed-at="{{ detail.reviewed_at or '' }}">
-            <a class="back-link" href="{{ url_for('index',view=view,q=q,sort=listing.sort,page=listing.page) }}">← 목록으로</a>
+          <article id="job-detail" class="job-detail" data-job-id="{{ detail.id }}" data-reviewed-at="{{ detail.reviewed_at or '' }}"{% if recommended %} tabindex="-1" aria-label="선택한 공고 상세"{% endif %}>
+            <a class="back-link" href="{{ url_for('index',view=view,q=q,sort=listing.sort,page=listing.page, _anchor='job-' ~ detail.id if recommended else none) }}">← 목록으로</a>
             <div class="detail-topline">
               <div class="detail-company">{{ company_mark(detail) }}<span>{{ detail.company }}</span></div>
               <div class="deadline-tools">
@@ -210,7 +229,7 @@
             </div>
             <div class="detail-footnote">{{ '지원 기록' if detail.source_kind == 'profile' else '공고' }} #{{ detail.id }} · {{ detail.source_label }}</div>
           </article>
-          {% else %}
+          {% elif not recommended %}
           <section class="detail-placeholder">
             <div class="placeholder-art" aria-hidden="true"><div class="paper-icon"><span></span><span></span><span></span><i>✦</i></div></div>
             <h2>목록에서 공고를 선택하세요</h2>

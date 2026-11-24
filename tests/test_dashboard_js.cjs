@@ -47,6 +47,67 @@ test('deadline preview applies the same closure and Korea time rules as saving',
   assert.equal(deadlineWarning(false, false), '');
 });
 
+test('hydrating a recommended return link focuses its row unless the user has moved on', () => {
+  function returnedFocus(hash, moved = false, view = 'recommended') {
+    const body = {}, focused = [];
+    const row = {focus() { focused.push('row'); }};
+    const list = {dataset: {scrollKey: 'list'}, focus() { focused.push('list'); }};
+    const selectors = {'#job-list': list, '[data-dashboard]': {dataset: {view}}};
+    vm.runInNewContext(script + '\nwireScroll();', {
+      document: {body, activeElement: moved ? {} : body,
+        querySelector(key) { return selectors[key] || null; }, querySelectorAll() { return []; },
+        getElementById(id) { return id === 'job-7' ? row : null; }},
+      location: {hash}, performance: {getEntriesByType() { return [{type: 'navigate'}]; }},
+      window: {addEventListener() {}}, clearTimeout() {}, setTimeout() {},
+    });
+    return focused;
+  }
+  assert.deepEqual(returnedFocus('#job-7'), ['row']);
+  assert.deepEqual(returnedFocus('#job-8'), ['list']);
+  assert.deepEqual(returnedFocus('#job-7', true), []);
+  assert.deepEqual(returnedFocus('#job-7', false, 'interested'), []);
+  assert.deepEqual(returnedFocus(''), []);
+});
+
+test('a failed initial recommendation read offers a read-only retry without replacing loaded rows', async () => {
+  const status = {textContent: ''}, refreshStatus = {textContent: ''};
+  const retry = {hidden: true, isConnected: true, setAttribute() {}, removeAttribute() {},
+    addEventListener(name, handler) { this[name] = handler; }};
+  let shell = true, pending, reads = 0;
+  const list = {dataset: {}, busy: 'true',
+    setAttribute(key, value) { if (key === 'aria-busy') this.busy = value; }, getAttribute() { return this.busy; },
+    querySelector(key) { return shell && {'[data-list-load-status]': status, '[data-list-retry]': retry}[key]; }};
+  const selectors = {'#job-list': list, '[data-dashboard]': {dataset: {view: 'recommended'}}, '[data-list-retry]': retry};
+  vm.runInNewContext(script, {
+    document: {querySelector(key) { return selectors[key] || null; },
+      querySelectorAll(key) { return key === '[data-refresh-status]' ? [refreshStatus] : []; }},
+    location: {href: 'https://dashboard.example/?view=recommended'},
+    async fetch(url, options) {
+      assert.equal(options.method, undefined);
+      assert.equal(options.headers['X-Dashboard-Snapshot'], '1');
+      reads++;
+      return {ok: false};
+    },
+    window: {addEventListener() {}}, clearTimeout() {}, setTimeout(fn, delay) { pending = {fn, delay}; },
+  });
+  await pending.fn();
+  assert.equal(retry.hidden, false);
+  assert.equal(list.busy, 'false');
+  assert.match(status.textContent, /불러오지 못/);
+  assert.ok(pending.delay > 0);
+  retry.click();
+  assert.equal(pending.delay, 0);
+  const retryRead = pending.fn();
+  assert.equal(list.busy, 'true');
+  assert.match(status.textContent, /다시 불러오는 중/);
+  await retryRead;
+  assert.equal(reads, 2);
+  shell = false;
+  await pending.fn();
+  assert.match(refreshStatus.textContent, /화면을 불러오지 못/);
+  assert.equal(list.busy, 'false');
+});
+
 test('deadline cancel writes nothing and failed saves retain editable input', async () => {
   const element = (extra = {}) => ({
     events: {}, textContent: '', focused: false,

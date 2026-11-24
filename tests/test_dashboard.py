@@ -87,6 +87,20 @@ class WebTests(unittest.TestCase):
         self.assertIn('aria-label="현재 공고 새로고침"', html)
         self.assertIn('class="skeleton-card"', html)
 
+    def test_recommendation_selection_and_return_target_the_same_result(self):
+        query = "/?view=recommended&q=Agent&sort=company"
+        page = self.get(query).get_data(as_text=True)
+        self.assertNotIn('class="detail-placeholder"', page)
+        location = unescape(re.search(r'href="(/jobs/1\?[^"]+)"', page)[1])
+        self.assertTrue(location.endswith("#job-detail"))
+        article = self.get(location).get_data(as_text=True).split('<article id="job-detail"', 1)[1]
+        self.assertIn('tabindex="-1"', article.split(">", 1)[0])
+        back = unescape(re.search(r'class="back-link" href="([^"]+)"', article)[1])
+        self.assertIn("q=Agent", back)
+        self.assertIn("sort=company", back)
+        self.assertTrue(back.endswith("#job-1"))
+        self.assertIn('id="job-1"', self.get(back).get_data(as_text=True))
+
     def test_split_pane_follows_refresh_for_another_visible_row(self):
         collect_jobs.collect(self.source, lambda _: ([posting(2)], 1), datetime(2026, 11, 16, tzinfo=timezone.utc))
         with sqlite3.connect(self.source) as db:
