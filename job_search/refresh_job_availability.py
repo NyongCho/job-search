@@ -15,7 +15,8 @@ from .collect_jobs import API, FIELDS, extract, request_json
 from .company_logos import _plan
 from .dashboard_store import init_state_db, read_job_document
 from .job_availability import KST, _stamp, availability, document_version, inspect_document
-from .job_fit import group_before_closure, read_fit, recommendation_group
+from .job_fit import group_before_closure, read_fit
+from .review_routing import question_if_open
 from .job_sources import fetch_posting, same_inthiswork_post, source_locator
 from .public_fetch import fetch_public
 
@@ -197,10 +198,21 @@ def refresh(jobs_db, state_db, fetch_page=request_json, now=None):
             fit = read_fit(row)
             prior_group = group_before_closure(fit)
             if (row["decision"] == "recommend" or prior_group in {"preferred", "outside"}
-                    or status in ("interested", "preparing", "applied")
-                    or (status != "archived" and
-                        (prior_group == "question" or recommendation_group(row["decision"], fit) == "question"))):
+                    or status in ("interested", "preparing", "applied")):
                 stored[row["id"]] = json.loads(row["document"])
+                continue
+            decision = (fit.get("assessment_decision", row["decision"]) if fit and
+                        fit.get("availability") == "closed" else row["decision"])
+            if status == "archived" or decision not in {"needs_review", "recommend"}:
+                continue
+            try:
+                refs = json.loads(row["evidence_lines"] or "[]")
+            except (ValueError, TypeError):
+                refs = []
+            doc = json.loads(row["document"])
+            if question_if_open({**doc, "evidence_lines": refs if isinstance(refs, list) else []},
+                                decision, fit, row["reason"] or ""):
+                stored[row["id"]] = doc
     locators = {i: locator for i, doc in stored.items() if (locator := source_locator(doc))
                 and locator.source == "inthiswork" and locator.original_id == str(i)}
     ids = sorted(locators)

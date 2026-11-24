@@ -11,7 +11,7 @@ from contextlib import closing
 from functools import partial
 from pathlib import Path
 
-from . import fit_work
+from . import fit_work, review_answers
 from . import refresh_queue as queue
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +47,7 @@ def serve(jobs, state, stop, *, deadlines, logos, fits, poll=0.5, fit_batch=fit_
     with lock_path.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         queue.reset_running(state)
+        review_answers.restore_completed(jobs, state)
         with ThreadPoolExecutor(max_workers=5) as pool:
             futures = [pool.submit(run, kind, batch) for kind, batch in
                        (("deadline", 25), ("deadline", 25), ("logo", 1), ("logo", 1), ("fit", fit_batch))]
@@ -71,6 +72,7 @@ def migrate(jobs, state, *, schema_only=False):
         db.execute("BEGIN IMMEDIATE")
         queue.create_tables(db)
     fit_work.migrate(jobs, state, profile={} if schema_only else None)
+    review_answers.restore_completed(jobs, state)
 
 
 def main():

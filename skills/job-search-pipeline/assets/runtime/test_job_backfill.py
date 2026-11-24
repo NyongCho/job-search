@@ -5,6 +5,10 @@ import run_job_backfill as backfill
 
 
 class ExecutionResultTests(unittest.TestCase):
+    def test_completion_counts_distinguish_reviewed_jobs_from_applicant_questions(self):
+        counts = {"pending": 0, "recommend": 2, "exclude": 1, "needs_review": 5}
+        self.assertEqual(backfill.completion_counts(counts), "검토 완료 8건 · 추천 판정 2건 · 제외 판정 1건")
+
     def test_completion_notice_requires_confirmed_delivery(self):
         for outcome in (None, "failed", "suppressed", "queued"):
             with self.assertRaises(RuntimeError):

@@ -19,7 +19,7 @@ from urllib.parse import unquote, urlsplit
 import fit_hermes
 from fit_digest import checked_link, dashboard_origin, review_decision, review_digest
 from job_availability import _stamp, availability, deadline_view
-from job_fit import evaluate_fit, jd_input, profile_jd, read_fit, recommendation_group, stable_hash
+from job_fit import evaluate_fit, jd_input, profile_jd, read_fit, recommendation_group, stable_hash, validate_entry
 
 DEFAULT_BATCH_SIZE = 3
 RUBRIC = stable_hash([2, fit_hermes.PROMPT])
@@ -97,8 +97,49 @@ def _exists(db, table):
     return bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone())
 
 
-def _key(doc, profile):
-    return stable_hash([RUBRIC, stable_hash(jd_input(doc)), stable_hash(profile)])
+def _answer_facts(state, post_id, jd_version):
+    if post_id <= 0 or not _exists(state, "review_answers"):
+        return {}, None
+    rows = state.execute("""SELECT question,answer,run_id FROM review_answers
+        WHERE post_id=? AND jd_version=? ORDER BY question""", (post_id, jd_version)).fetchall()
+    facts = {f"A{i:04d}": f"{row[0]}\n{row[1]}" for i, row in enumerate(rows, 1)}
+    return facts, max((row[2] for row in rows), default=None)
+
+
+def _key(doc, profile, answers=None):
+    parts = [RUBRIC, stable_hash(jd_input(doc)), stable_hash(profile)]
+    if answers:
+        parts.append(stable_hash(answers))
+    return stable_hash(parts)
+
+
+def _versioned_key(db, doc, profile, answers):
+    base = _key(doc, profile, answers)
+    if doc["id"] <= 0:
+        return base
+    row = db.execute("SELECT value FROM metadata WHERE key=?", (f"manual_review:{doc['id']}:{base}",)).fetchone()
+    return f"{base}:{row[0]}" if row else base
+
+
+def cache_manual_review(db, post_id, entry, fit):
+    """Supersede this job's active input while keeping earlier attempts and receipts recoverable."""
+    current = db.execute("SELECT input_key FROM fit_current WHERE post_id=?", (post_id,)).fetchone()
+    if current:
+        base = current[0].partition(":")[0]
+    else:
+        row = db.execute("SELECT document FROM posts WHERE id=?", (post_id,)).fetchone()
+        base = _key(json.loads(row[0]), read_profile())
+    revision = uuid.uuid4().hex
+    db.execute("INSERT OR REPLACE INTO metadata VALUES(?,?)", (f"manual_review:{post_id}:{base}", revision))
+    key = f"{base}:{revision}"
+    db.execute("INSERT OR REPLACE INTO fit_current VALUES(?,?)", (post_id, key))
+    if fit:
+        # A human-verified opening has the same fallback semantics as an imported assessment.
+        cached = {**fit, "legacy_input_unknown": True}
+        saved = {k: entry[k] for k in ("id", "decision", "reason", "required_summary") if k in entry}
+        saved["evidence_lines"] = entry.get("evidence_lines", [])
+        db.execute("""INSERT INTO fit_items(post_id,input_key,status,entry,fit,legacy)
+            VALUES(?,?,'done',?,?,1)""", (post_id, key, json.dumps(saved), json.dumps(cached)))
 
 
 def migrate(jobs_path, state_path, *, profile=None):
@@ -201,7 +242,7 @@ def usage(jobs_path, work_ids, state_path=None):
         return result
 
 
-def _facts(state, doc):
+def _timing(state, doc):
     cached, override = None, None
     if state and _exists(state, "job_availability"):
         row = state.execute("SELECT * FROM job_availability WHERE post_id=?", (doc["id"],)).fetchone()
@@ -218,7 +259,11 @@ def _facts(state, doc):
         row = state.execute("SELECT * FROM job_deadline_overrides WHERE post_id=?", (doc["id"],)).fetchone()
         if row:
             override = dict(row)
-    view = availability(doc, cached, override=override)
+    return availability(doc, cached, override=override)
+
+
+def _facts(state, doc):
+    view = _timing(state, doc)
     apply = doc.get("apply_url")
     try:
         apply = checked_link(apply)
@@ -231,68 +276,6 @@ def _facts(state, doc):
     else:
         status = "unknown"
     return status, apply, view["deadline_label"]
-
-
-def validate_entry(entry, doc, profile):
-    if entry.get("version") != doc["version"] or type(entry.get("id")) is not int:
-        raise ValueError("JD 버전 불일치")
-    if entry.get("decision") not in {"recommend", "needs_review", "exclude"}:
-        raise ValueError("지원 판정 누락")
-    if any(not isinstance(entry.get(k), str) or not entry[k].strip() for k in ("reason", "required_summary")):
-        raise ValueError("판정 요약 누락")
-    assessment = entry.get("assessment")
-    lines = doc["lines"]
-    fit = evaluate_fit(assessment, line_count=len(lines))
-    evidence_lines = entry.get("evidence_lines")
-    if (
-        not isinstance(evidence_lines, list)
-        or (not evidence_lines and entry["decision"] != "needs_review")
-        or any(type(i) is not int or not 1 <= i <= len(lines) for i in evidence_lines)
-    ):
-        raise ValueError("JD 근거 행 오류")
-    for item in assessment["criteria"]:
-        refs, quotes, ids = item["evidence_lines"], item.get("quotes"), item.get("profile_ids")
-        if (
-            not isinstance(quotes, list)
-            or len(refs) != len(quotes)
-            or any(
-                not isinstance(q, str) or not q.strip() or q not in lines[n - 1] for n, q in zip(refs, quotes)
-            )
-        ):
-            raise ValueError("JD 인용문 불일치")
-        if (
-            not isinstance(ids, list)
-            or any(not isinstance(k, str) or k not in profile for k in ids)
-            or (not ids and item["status"] != "unknown")
-        ):
-            raise ValueError("경력 근거 불일치")
-    if (
-        fit["complete"]
-        and fit["eligibility"] == "eligible"
-        and entry["decision"] != "exclude"
-        and not fit["question"]
-    ):
-        gaps = sorted(
-            (
-                item
-                for item in fit["criteria"]
-                if item["status"] == "unknown" and item["category"] in ("work", "preferred")
-            ),
-            key=lambda item: (item["category"] != "work", min(item["evidence_lines"])),
-        )
-        for item in gaps:
-            label = " ".join(item["label"].split())
-            if re.fullmatch(
-                r"(?:핵심\s*)?업무|(?:우대|직무)\s*(?:요건|사항|조건)|(?:공고|원문)\s*(?:확인|접근)|"
-                r"(?:(?:접수|채용|지원)\s*)?마감(?:일|시각)?|채용\s*일정|근무지|급여|고용\s*형태",
-                label,
-            ):
-                continue
-            if re.search(r"미기재|미공개|(?:원문|공고|요건)\s*(?:정보\s*)?(?:없음|확인 불가)", label):
-                continue
-            fit["question"] = f"공고에 나온 ‘{label}’ 요건과 관련해 직접 수행한 업무나 프로젝트가 있나요?"
-            break
-    return fit
 
 
 def _post(db, post_id):
@@ -386,8 +369,11 @@ def _batch(path, state_path, tasks, profile, fixed_profile, runner, slots, direc
     ):
         todo, cached, recovering, aliases = [], [], {}, {}
         docs, overflow = [], []
-        with db:
+        with state, db:
             db.execute("BEGIN IMMEDIATE")
+            if tasks[0]["post_id"] > 0:
+                # Serialize the input snapshot and cache publication with concurrent form submissions.
+                state.execute("BEGIN IMMEDIATE")
             if not fixed_profile:
                 profile = read_profile()
             for task in tasks:
@@ -396,7 +382,13 @@ def _batch(path, state_path, tasks, profile, fixed_profile, runner, slots, direc
                     cached.append((task, "skipped", "공고가 존재하지 않습니다."))
                     continue
                 doc = json.loads(row["document"])
-                key = _key(doc, profile)
+                jd = jd_input(doc)
+                version = stable_hash(jd)
+                if task.get("version", "").startswith("answer:") and task["version"] != "answer:" + version:
+                    cached.append((task, "skipped", "답변 이후 공고 내용이 변경됐어요."))
+                    continue
+                facts, revision = _answer_facts(state, row["id"], version)
+                key = _versioned_key(db, doc, profile, facts)
                 current = db.execute(
                     "SELECT input_key FROM fit_current WHERE post_id=?", (row["id"],)
                 ).fetchone()
@@ -414,7 +406,10 @@ def _batch(path, state_path, tasks, profile, fixed_profile, runner, slots, direc
                     "SELECT * FROM fit_items WHERE post_id=? AND input_key=?", (row["id"], key)
                 ).fetchone()
                 if saved and saved["status"] == "done":
-                    _publish(db, state, row, json.loads(saved["entry"]), json.loads(saved["fit"]))
+                    previous = json.loads(saved["fit"])
+                    if revision is not None:
+                        previous["answer_revision"] = revision
+                    _publish(db, state, row, json.loads(saved["entry"]), previous)
                     cached.append((task, "done", "기존 평가"))
                     continue
                 if row["id"] < 0 and not doc["lines"]:
@@ -440,7 +435,8 @@ def _batch(path, state_path, tasks, profile, fixed_profile, runner, slots, direc
                     task,
                     key,
                     row["fingerprint"],
-                    dict(id=row["id"], version=stable_hash(jd_input(doc)), **jd_input(doc)),
+                    dict(id=row["id"], version=version, **jd,
+                         **({"answer_facts": facts, "answer_revision": revision} if facts else {})),
                 )
                 if saved and saved["status"] in {"running", "uncertain"}:
                     prev = saved["attempt_id"]
@@ -452,7 +448,8 @@ def _batch(path, state_path, tasks, profile, fixed_profile, runner, slots, direc
                     continue
                 # Measure the exact numbered prompt using the JD and profile locked in for this attempt.
                 # A single oversized JD still runs alone with every source line intact.
-                if overflow or (docs and len(fit_hermes.prompt(profile, [*docs, item[-1]])) > maximum):
+                if overflow or (docs and (facts or "answer_facts" in docs[0]
+                                         or len(fit_hermes.prompt(profile, [*docs, item[-1]])) > maximum)):
                     overflow.append(task)
                     continue
                 docs.append(item[-1])
@@ -505,6 +502,8 @@ def _batch(path, state_path, tasks, profile, fixed_profile, runner, slots, direc
             try:
                 if runner:
                     result = runner(attempt, profile, docs)
+                    if "answer_facts" in docs[0] and result is not None:
+                        result = fit_hermes.private_receipt(result, profile, docs[0])
                     fit_hermes.atomic_json(directory / (attempt + ".json"), result)
                 else:
                     fit_hermes.run(attempt, profile, docs, directory, (fd, guard.fileno()))
@@ -542,12 +541,16 @@ def _complete(db, state, attempt, items, profile, fixed_profile, result, finish)
             try:
                 if not entry:
                     raise ValueError(result.get("error") or "평가 응답에서 공고 누락 또는 중복")
-                fit = validate_entry(entry, doc, profile)
+                fit = validate_entry(entry, doc, {**profile, **doc.get("answer_facts", {})})
+                if "answer_revision" in doc:
+                    fit["answer_revision"] = doc["answer_revision"]
                 outcome, message = "done", "평가 완료"
             except (ValueError, KeyError, TypeError, IndexError) as error:
                 message = str(error)
-        with db:
+        with state, db:
             db.execute("BEGIN IMMEDIATE")
+            if post_id > 0:
+                state.execute("BEGIN IMMEDIATE")
             row = _post(db, post_id)
             saved = db.execute(
                 "SELECT status,attempt_id FROM fit_items WHERE post_id=? AND input_key=?", (post_id, key)
@@ -573,7 +576,8 @@ def _complete(db, state, attempt, items, profile, fixed_profile, result, finish)
                 active = db.execute(
                     "SELECT input_key FROM fit_current WHERE post_id=?", (post_id,)
                 ).fetchone()
-                if active and active[0] == key and current_jd and _key(current_doc, latest_profile) == key:
+                answers, _ = _answer_facts(state, post_id, doc["version"])
+                if active and active[0] == key and current_jd and _versioned_key(db, current_doc, latest_profile, answers) == key:
                     _publish(db, state, row, entry, fit)
                 else:
                     outcome, message = "skipped", "평가 중 입력이 변경되었습니다."
@@ -735,8 +739,9 @@ def scheduled_review(
                 docs.append(doc)
                 versions[row["id"]] = row["fingerprint"]
     checked = verifier(docs) if docs else {}
-    with closing(_db(jobs_path)) as db, closing(_db(state_path)) as state, db:
+    with closing(_db(jobs_path)) as db, closing(_db(state_path)) as state, state, db:
         db.execute("BEGIN IMMEDIATE")
+        state.execute("BEGIN IMMEDIATE")
         saved = db.execute("SELECT digest,delivered FROM outbox WHERE id=?", (execution_id,)).fetchone()
         if saved:
             return "[SILENT]" if saved["delivered"] else saved["digest"]
@@ -744,6 +749,9 @@ def scheduled_review(
             return "[SILENT]"
         reviews = []
         current = profile if explicit else read_profile()
+        inactive = {r[0] for r in state.execute(
+            "SELECT post_id FROM job_state WHERE status IN ('applied','archived')"
+        )} if _exists(state, "job_state") else set()
         for t in tasks:
             row = db.execute(
                 """SELECT p.* FROM posts p JOIN fit_delivery d ON d.post_id=p.id
@@ -752,7 +760,9 @@ def scheduled_review(
             ).fetchone()
             if not row:
                 continue
-            key = _key(json.loads(row["document"]), current)
+            document = json.loads(row["document"])
+            answers, _ = _answer_facts(state, row["id"], stable_hash(jd_input(document)))
+            key = _versioned_key(db, document, current, answers)
             saved = db.execute(
                 """SELECT entry,fit FROM fit_items JOIN fit_current USING(post_id,input_key)
                     WHERE post_id=? AND input_key=? AND status='done'""",
@@ -764,7 +774,9 @@ def scheduled_review(
                 review = _publish(
                     db, state, row, entry, json.loads(saved["fit"]), live, use_previous_check=False
                 )
-                reviews.append(review)
+                answered_questions = {fact.partition("\n")[0] for fact in answers.values()}
+                if row["id"] not in inactive and review[3].get("question") not in answered_questions:
+                    reviews.append(review)
                 if review[3]["availability"] == "unknown":
                     open_fit = {**review[3], "availability": "open"}
                     if recommendation_group(review_decision(entry["decision"], open_fit), open_fit):
@@ -772,7 +784,7 @@ def scheduled_review(
                 db.execute(
                     "UPDATE fit_delivery SET execution_id=? WHERE post_id=?", (execution_id, row["id"])
                 )
-        digest = review_digest(reviews, dashboard_url)
+        digest = review_digest(reviews, dashboard_url, timing=lambda doc: _timing(state, doc))
         if digest != "[SILENT]":
             db.execute(
                 "INSERT INTO outbox(id,digest,attempts) VALUES(?,?,?)",

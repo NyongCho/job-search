@@ -7,7 +7,7 @@ import json
 import os
 import sqlite3
 import time
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError
@@ -159,6 +159,8 @@ def save_document(db, doc):
             fit["fingerprint"] = fingerprint
             db.execute("UPDATE posts SET fit_review=? WHERE id=?", (json.dumps(fit, ensure_ascii=False), post_id))
     else:
+        if has_table(db, "fit_current"):
+            db.execute("DELETE FROM fit_current WHERE post_id=?", (post_id,))
         clear_fit = ",fit_review=NULL" if has_fit_column(db) else ""
         clear_stamp = "" if has_table(db, "fit_delivery") else ",reviewed_at=NULL"
         db.execute(f"""UPDATE posts SET document=?,fingerprint=?,decision=NULL,reason=NULL,
@@ -280,7 +282,9 @@ def _claim_review(db, execution_id, entries, digest, dashboard_url):
     return None
 
 
-def record_reviews(path, entries, digest=None, execution_id=None, *, dashboard_url=None):
+def record_reviews(path, entries, digest=None, execution_id=None, *, dashboard_url=None, state_path=None):
+    from . import fit_work
+
     if not isinstance(entries, list) or not entries or not all(isinstance(entry, dict) for entry in entries):
         raise ValueError("Review file must be a nonempty JSON array of objects")
     assessed = any("assessment" in entry for entry in entries)
@@ -292,8 +296,13 @@ def record_reviews(path, entries, digest=None, execution_id=None, *, dashboard_u
         if not assessed:
             raise ValueError("--dashboard-url requires an assessed review")
         dashboard_url = dashboard_origin(dashboard_url)
-    with closing(connect(path)) as db, db:
+    configured_state = state_path or os.environ.get("DASHBOARD_STATE_DB")
+    private = Path(configured_state) if configured_state else Path(path).parent / "dashboard/dashboard.sqlite"
+    state_db = closing(fit_work._db(private, "ro")) if configured_state or private.exists() else nullcontext()
+    with state_db as state, closing(connect(path)) as db, db:
         db.execute("BEGIN IMMEDIATE")
+        if state is not None:
+            state.execute("BEGIN")
         fit_column = has_fit_column(db)
         if assessed and not fit_column:
             raise ValueError("Run migrate-fit before recording assessed reviews")
@@ -315,6 +324,11 @@ def record_reviews(path, entries, digest=None, execution_id=None, *, dashboard_u
                 raise ValueError(f"Unknown post or JD changed since review: {post_id}")
             seen.add(post_id)
             doc = json.loads(row["document"])
+            if state and has_table(state, "review_answers") and state.execute(
+                "SELECT 1 FROM review_answers WHERE post_id=? AND jd_version=? LIMIT 1",
+                (post_id, fit_work.stable_hash(jd_input(doc))),
+            ).fetchone():
+                raise ValueError("답변이 저장된 공고는 채용함의 새로고침에서 현재 답변을 반영해 평가하세요.")
             reason, lines = entry.get("reason", ""), entry.get("evidence_lines", [])
             if decision not in ("recommend", "exclude", "needs_review") or not isinstance(reason, str) or not reason.strip():
                 raise ValueError(f"Invalid decision/reason for {post_id}")
@@ -327,11 +341,16 @@ def record_reviews(path, entries, digest=None, execution_id=None, *, dashboard_u
                 availability = entry.get("availability")
                 if availability not in ("open", "closed", "unknown"):
                     raise ValueError(f"Invalid availability for {post_id}")
-                fit.update(availability=availability, fingerprint=row["fingerprint"], reviewed_at=reviewed_at)
+                fit.update(availability=availability, assessment_decision=decision,
+                           fingerprint=row["fingerprint"], reviewed_at=reviewed_at)
                 decision = review_decision(decision, fit)
                 if decision == "recommend" and entry.get("apply_url") is not None:
                     fit["apply_url"] = checked_link(entry["apply_url"])
-                reviews.append((doc, entry, decision, fit))
+                inactive = state and has_table(state, "job_state") and state.execute(
+                    "SELECT 1 FROM job_state WHERE post_id=? AND status IN ('applied','archived')", (post_id,)
+                ).fetchone()
+                if not inactive:
+                    reviews.append((doc, entry, decision, fit))
             if decision == "recommend":
                 wake_logos = True
             if decision != "needs_review" and not lines:
@@ -344,8 +363,10 @@ def record_reviews(path, entries, digest=None, execution_id=None, *, dashboard_u
             if fit_column:
                 db.execute("UPDATE posts SET fit_review=? WHERE id=?",
                            (json.dumps(fit, ensure_ascii=False) if fit else None, post_id))
+            if has_table(db, "fit_current"):
+                fit_work.cache_manual_review(db, post_id, entry, fit)
         if assessed:
-            digest = review_digest(reviews, dashboard_url)
+            digest = review_digest(reviews, dashboard_url, timing=lambda doc: fit_work._timing(state, doc))
         if digest is not None and digest != "[SILENT]":
             db.execute("INSERT INTO outbox(id,digest,attempts) VALUES(?,?,?)",
                        (execution_id, digest, json.dumps([execution_id])))
@@ -411,6 +432,7 @@ def main():
     show.add_argument("ids", type=int, nargs="+")
     review = sub.add_parser("review")
     review.add_argument("file", type=Path)
+    review.add_argument("--state", type=Path, help="Private dashboard state database")
     review.add_argument("--digest", type=Path)
     review.add_argument("--execution-id")
     review.add_argument("--dashboard-url", help="HTTPS dashboard origin for assessed deliveries")
@@ -447,7 +469,7 @@ def main():
                         for e in entries)):
             raise ValueError("Recommendations require --digest FILE --execution-id ID for delivery recovery")
         digest = record_reviews(args.db, entries, args.digest.read_text() if args.digest else None, args.execution_id,
-                                dashboard_url=args.dashboard_url)
+                                dashboard_url=args.dashboard_url, state_path=args.state)
         if not args.digest and digest is not None:
             print(digest)
             return

@@ -15,11 +15,13 @@ from .card_metadata import create_deadline_tables, has_table
 from .company_logos import logo_references, signal_logo_worker
 from .logo_scope import TRACKED_STATUSES
 from .job_availability import KST, ROLLING, availability, document_version
-from .job_fit import group_before_closure, profile_jd, read_fit, recommendation_group, stable_hash
+from .job_fit import group_before_closure, jd_input, profile_jd, read_fit, recommendation_group, stable_hash
+from .review_answers import answer_statuses
+from .review_routing import EVALUATION_ERROR, PENDING, question_if_open, route_review
 from .job_sources import source_locator, source_name
 
 STATUSES = {"unmarked", "interested", "preparing", "applied", "archived"}
-VIEWS = ("recommended", "interested", "preparing", "applied", "archived", "needs_review", "expired")
+VIEWS = ("recommended", "interested", "preparing", "applied", "archived", "needs_review", "processing_hold", "expired")
 PAGE_SIZE = 30
 LIST_SORTS = {"reviewed": "최근 검토순", "deadline": "마감 임박순", "company": "기업 이름순", "fit": "적합도순"}
 FIT_GROUPS = ("preferred", "outside", "legacy", "question")
@@ -87,6 +89,7 @@ def check_refresh_schema(jobs_db, state_db):
         state.execute("SELECT request_id FROM refresh_receipts LIMIT 0")
         state.execute("SELECT locator,modified_at,listing_modified_at FROM job_linked_deadlines LIMIT 0")
         state.execute("SELECT post_id,input_key FROM profile_fits LIMIT 0")
+        state.execute("SELECT post_id,jd_version,question,answer,run_id FROM review_answers LIMIT 0")
 
 
 def init_state_db(jobs_db: Path, state_db: Path) -> None:
@@ -156,7 +159,16 @@ def _deadline_overrides(db, post_id=None):
     return {r["post_id"]: dict(r) for r in db.execute("SELECT * FROM job_deadline_overrides" + where, args)}
 
 
-def _job(row, state, cached_availability=None, override=None, logo_version=None, *, refresh_scope=None):
+def _failed_evaluations(db, post_id=None):
+    if not has_table(db, "fit_current") or not has_table(db, "fit_items"):
+        return set()
+    where, args = (" AND post_id=?", (post_id,)) if post_id is not None else ("", ())
+    return {row[0] for row in db.execute("""SELECT post_id FROM fit_current JOIN fit_items USING(post_id,input_key)
+        WHERE status IN ('failed','uncertain')""" + where, args)}
+
+
+def _job(row, state, cached_availability=None, override=None, logo_version=None, *,
+         refresh_scope=None, evaluation_error=False, answers=None):
     document = _json(row["document"], None)
     error = not isinstance(document, dict)
     doc = document if isinstance(document, dict) else {}
@@ -167,32 +179,67 @@ def _job(row, state, cached_availability=None, override=None, logo_version=None,
     decision = row["decision"]
     group = recommendation_group(decision, fit)
     previous_group = group_before_closure(fit)
-    timing = None
-    if previous_group:
-        timing = availability(doc, cached_availability, override=override)
-        if not timing["is_expired"] and timing["deadline_kind"] != "unknown":
-            decision, group = fit["assessment_decision"], previous_group
-        elif not timing["is_expired"] and (fit.get("opening_check") or {}).get("status") == "closed":
-            timing["is_expired"] = True
+    timing = availability(doc if row["id"] > 0 else {}, cached_availability, override=override)
+    evidence = _json(row["evidence_lines"], [])
+    if not isinstance(evidence, list):
+        evidence = []
+    review_doc = {**doc, "evidence_lines": evidence}
+    routing_fit = fit
+    if fit and fit.get("availability") in {"unknown", "closed"}:
+        checked = timestamp(timing["availability_checked_at"]) or ""
+        changed = timestamp(doc.get("modified_gmt")) or ""
+        reviewed = timestamp(fit.get("reviewed_at")) or ""
+        revised_window = (not timing["is_expired"] and timing["deadline_kind"] != "unknown"
+                          and (timing["deadline_manual"] or checked >= reviewed or changed > reviewed))
+        original = fit.get("assessment_decision")
+        if fit["availability"] == "closed":
+            if not original and question_if_open(review_doc, "needs_review", fit, row["reason"] or ""):
+                previous_group = "question"
+            elif original == "needs_review" and previous_group is None:
+                previous_group = "hold"
+            if original and revised_window:
+                decision, group = original, previous_group
+                routing_fit = {**fit, "availability": "open"}
+            else:
+                timing["is_expired"] = True
+        elif revised_window and safe_url(fit.get("apply_url") or doc.get("apply_url")):
+            routing_fit = {**fit, "availability": "open"}
+            decision = original or decision
+            group = recommendation_group(decision, routing_fit)
     if fit is None and decision == "recommend":
         group = "legacy"
+    if row["id"] < 0 or state.get("status") in {"applied", "archived"}:
+        review = {"route": None, "reason": "", "questions": []}
+    else:
+        review = route_review(review_doc, decision, routing_fit, timing,
+                              reason=row["reason"] or "", evaluation_error=evaluation_error)
+    if answers and not timing["is_expired"] and review["route"]:
+        saved = answers.get(stable_hash(jd_input(doc)), {})
+        matching = [saved[q] for q in review["questions"] if q in saved]
+        if matching or (saved and decision is None and review["reason"] in {PENDING, EVALUATION_ERROR}):
+            statuses = matching or list(saved.values())
+            if evaluation_error or "failed" in statuses:
+                message = "답변을 반영하는 중 평가 오류가 발생했어요."
+            elif "queued" in statuses or "running" in statuses:
+                message = "답변을 저장했어요. 이 공고의 재평가를 기다리고 있어요."
+            else:
+                message = "저장한 답변으로 재평가한 뒤에도 추가 확인이 필요해요."
+            review = {"route": "hold", "reason": message, "questions": []}
+    if review["route"] == "question":
+        group = "question"
+    elif review["route"] == "hold" or group == "question":
+        group = None
     base = {"id": row["id"], "fingerprint": row["fingerprint"], "title": title,
             "reason": row["reason"] or "", "status": state.get("status", "unmarked"),
-            "decision": decision, "fit_group": group, "group_before_closure": previous_group}
+            "decision": decision, "fit_group": group, "group_before_closure": previous_group,
+            "review_route": review["route"], "review_reason": review["reason"],
+            "review_questions": review["questions"], "is_expired": timing["is_expired"]}
     if refresh_scope is not None:
-        view, needle = refresh_scope
-        # Only expiration views need to parse deadline text, and only for candidate rows.
-        base["is_expired"] = view == "expired"
-        if view in {"recommended", "expired"} and _in_scope(base, view, needle):
-            base["is_expired"] = (timing or availability(doc, cached_availability, override=override))["is_expired"]
         return base
     company, separator, role = title.partition("｜")
     lines = doc.get("lines", [])
     if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
         lines, error = [], True
-    evidence = _json(row["evidence_lines"], [])
-    if not isinstance(evidence, list):
-        evidence = []
     evidence = [n for n in evidence if type(n) is int and 1 <= n <= len(lines)]
     images = doc.get("images", [])
     if not isinstance(images, list):
@@ -201,8 +248,13 @@ def _job(row, state, cached_availability=None, override=None, logo_version=None,
     seen = timestamp(state.get("seen_reviewed_at"))
     source_kind = source_name(doc)
     display_decision = "below_threshold" if decision == "recommend" and group is None else decision
+    fit = routing_fit
+    if fit and fit.get("question") and not review["questions"]:
+        fit = {**fit, "question": ""}
+    if review["route"]:
+        display_decision = "needs_review" if review["route"] == "question" else "processing_hold"
     return {
-        **(timing or availability(doc if row["id"] > 0 else {}, cached_availability, override=override)),
+        **timing,
         **base,
         "company": company.strip() if separator else "기업명 미기재",
         "role": role.strip() if separator else title,
@@ -260,14 +312,15 @@ def _matches(item, view):
     active = item["status"] not in {"applied", "archived"}
     recommended = item["fit_group"] in ("preferred", "outside", "legacy")
     if view == "expired":
-        return active and item["is_expired"] and (recommended or item.get("group_before_closure") in {"preferred", "outside"}
-                                                  or item["status"] in {"interested", "preparing"})
+        return active and item["is_expired"] and (recommended or item["decision"] in (None, "needs_review")
+            or item.get("group_before_closure") in {"preferred", "outside", "question", "hold"}
+            or item["status"] in {"interested", "preparing"})
     if view == "recommended":
         return active and not item["is_expired"] and recommended
-    if view == "question":
-        return active and not item["is_expired"] and item["fit_group"] == "question"
-    if view == "needs_review":
-        return active and (item["decision"] == "needs_review" or item["fit_group"] == "question")
+    if view in {"question", "needs_review"}:
+        return active and item["review_route"] == "question"
+    if view == "processing_hold":
+        return active and item["review_route"] == "hold"
     return item["status"] == view
 
 
@@ -322,7 +375,7 @@ def _deadline_order(item, now):
 
 def _in_scope(item, view, needle):
     return ((_matches(item, view) or (view == "recommended" and _matches(item, "question")))
-            and (not needle or needle in (item["title"] + " " + item["reason"]).casefold()))
+            and (not needle or needle in (" ".join([item["title"], item["reason"], item["review_reason"], *item["review_questions"]])).casefold()))
 
 
 def _filtered_jobs(jobs_db, state_db, view, q, *, for_refresh=False):
@@ -331,10 +384,18 @@ def _filtered_jobs(jobs_db, state_db, view, q, *, for_refresh=False):
     source, state = _validate_paths(jobs_db, state_db)
     needle = q.strip().casefold()
     with closing(_connect(source, "ro")) as db:
+        failed = _failed_evaluations(db)
         if for_refresh:
             columns = {row["name"] for row in db.execute("PRAGMA table_info(posts)")}
             fit_column = "fit_review" if "fit_review" in columns else "NULL AS fit_review"
-            rows = db.execute(f"SELECT id,fingerprint,document,reason,decision,reviewed_at,{fit_column} FROM posts").fetchall()
+            where = ""
+            if view in {"recommended", "needs_review"}:
+                where = " WHERE decision IN ('recommend','needs_review')"
+                if "fit_review" in columns:
+                    where += """ OR CASE WHEN json_valid(fit_review)
+                                THEN json_extract(fit_review,'$.availability') END='closed'"""
+            rows = db.execute(f"""SELECT id,fingerprint,document,reason,decision,evidence_lines,
+                                  reviewed_at,{fit_column} FROM posts""" + where).fetchall()
             checkpoint, logos = None, {}
         else:
             rows = db.execute("SELECT * FROM posts").fetchall()
@@ -345,14 +406,20 @@ def _filtered_jobs(jobs_db, state_db, view, q, *, for_refresh=False):
         profiles = db.execute("SELECT * FROM profile_posts").fetchall()
         profile_fits = ({r["post_id"]: r for r in db.execute("SELECT * FROM profile_fits")}
                         if profiles and has_table(db, "profile_fits") else {})
+        answers = answer_statuses(db)
         availability_rows = _availability_rows(db)
         overrides = _deadline_overrides(db)
         stages = {}
         for row in (() if for_refresh else db.execute("SELECT * FROM application_stages")):
             stages.setdefault(row["post_id"], []).append(row)
+    if for_refresh and view in STATUSES:
+        marked = {key for key, value in states.items() if value["status"] == view}
+        rows = [row for row in rows if row["id"] in marked]
+        profiles = [row for row in profiles if row["id"] in marked]
     # The current personal corpus is small (~1,000); parse once, never hold a source lock while rendering.
     items = [_job(row, states.get(row["id"], {}), availability_rows.get(row["id"]), overrides.get(row["id"]),
-                  logos.get(row["id"]), refresh_scope=(view, needle) if for_refresh else None)
+                  logos.get(row["id"]), refresh_scope=(view, needle) if for_refresh else None,
+                  evaluation_error=row["id"] in failed, answers=answers.get(row["id"]))
              for row in rows]
     items += [_profile_job(row, states.get(row["id"], {}), overrides.get(row["id"]),
                            profile_fits.get(row["id"])) for row in profiles]
@@ -420,18 +487,21 @@ def get_job(jobs_db: Path, state_db: Path, post_id: int):
     with closing(_connect(source, "ro")) as db:
         row = db.execute("SELECT * FROM posts WHERE id=?", (post_id,)).fetchone()
         logo = logo_references(db).get(post_id) if row else None
+        failed = post_id in _failed_evaluations(db, post_id) if row else False
     with closing(_connect(state, "ro")) as db:
         personal = db.execute("SELECT * FROM job_state WHERE post_id=?", (post_id,)).fetchone()
         profile = db.execute("SELECT * FROM profile_posts WHERE id=?", (post_id,)).fetchone() if post_id < 0 else None
         saved_fit = (db.execute("SELECT * FROM profile_fits WHERE post_id=?", (post_id,)).fetchone()
                      if profile is not None and has_table(db, "profile_fits") else None)
         stages = db.execute("SELECT * FROM application_stages WHERE post_id=?", (post_id,)).fetchall()
+        answers = answer_statuses(db, post_id).get(post_id)
         cached = _availability_rows(db, post_id).get(post_id)
         override = _deadline_overrides(db, post_id).get(post_id)
     if row is None and profile is None:
         return None
     personal = dict(personal) if personal else {}
-    item = _profile_job(profile, personal, override, saved_fit) if profile is not None else _job(row, personal, cached, override, logo)
+    item = _profile_job(profile, personal, override, saved_fit) if profile is not None else _job(
+        row, personal, cached, override, logo, evaluation_error=failed, answers=answers)
     return _with_progress(item, stages)
 
 
@@ -501,6 +571,7 @@ def set_deadline(jobs_db, state_db, post_id, data):
             doc = {}
         else:
             doc = read_job_document(source, post_id)
+        answers = answer_statuses(db, post_id).get(post_id)
         cached = _availability_rows(db, post_id).get(post_id)
         result = availability(doc, cached, override=override)
         if override is None:

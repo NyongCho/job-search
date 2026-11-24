@@ -151,9 +151,31 @@ class RefreshTests(unittest.TestCase):
             return [posting(int(i), categories=[collect_jobs.CLOSED]) for i in ids], 1
 
         report = refresh(self.source, self.state, closed_posts, self.now)
-        self.assertEqual(report["expired_in_checked"], [1])
+        # The second question already had a confirmed closure and retains its original decision.
+        self.assertEqual(report["expired_in_checked"], [1, 2])
         self.assertTrue(store.get_job(self.source, self.state, 1)["is_expired"])
         self.assertEqual(store.list_jobs(self.source, self.state)["question_total"], 0)
+
+    def test_periodic_refresh_checks_old_applicant_question_and_leaves_employer_hold(self):
+        posts = [posting(i, content="<p>채용 요건</p><p>서비스 장애 대응 경험이 필수입니다.</p>") for i in (1, 2)]
+        collect_jobs.collect(self.source, lambda _: (posts, 1), self.now)
+        docs = collect_jobs.get_posts(self.source, [1, 2])
+        for doc in docs:
+            entry = {"id": doc["id"], "fingerprint": doc["fingerprint"], "decision": "needs_review",
+                     "reason": "장애 대응을 직접 담당했나요?", "evidence_lines": [2]}
+            if doc["id"] == 2:
+                entry.update(assessment=assessment(criterion("경험", "work", "unknown", line=2),
+                             question="회사에서 장애 대응 경험을 인정해 주나요?"), availability="open")
+            collect_jobs.record_reviews(self.source, [entry], execution_id=f"initial-{doc['id']}")
+        requests = []
+        def opened(url):
+            requests.extend(parse_qs(urlsplit(url).query)["include"][0].split(","))
+            return [posting(int(i), content="<p>지원 마감 2099-05-21</p>") for i in requests], 1
+
+        refresh(self.source, self.state, opened, self.now)
+        self.assertEqual(requests, ["1"])
+        self.assertEqual(store.get_job(self.source, self.state, 1)["review_route"], "question")
+        self.assertEqual(store.get_job(self.source, self.state, 2)["review_route"], "hold")
 
     def test_periodic_refresh_preserves_unmigrated_recommendation_and_saved_job(self):
         with closing(sqlite3.connect(self.source)) as db, db:

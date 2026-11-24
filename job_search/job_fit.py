@@ -72,11 +72,14 @@ def evaluate_fit(assessment: dict, *, line_count: int) -> dict:
     criteria = _distinct_criteria(assessment["criteria"], line_count)
     raw_question = assessment.get("question")
     question = "" if raw_question is None else _string(raw_question, "question", allow_empty=True)
+    owner = assessment.get("question_owner")
+    if owner is not None and owner not in ("applicant", "employer", "system"):
+        raise ValueError("Invalid fit question_owner")
     if len(question.splitlines()) > 1:
         raise ValueError("Fit question must be a single line")
     unknown = [item for item in criteria if item["status"] == "unknown"]
     if (complete and eligibility != "ineligible" and not question
-            and any(item["category"] == "required" for item in unknown)):
+            and owner not in ("employer", "system") and any(item["category"] == "required" for item in unknown)):
         raise ValueError("A question is required for unknown required experience")
 
     earned = Fraction(0)
@@ -123,7 +126,7 @@ def evaluate_fit(assessment: dict, *, line_count: int) -> dict:
             "criteria": criteria, "breakdown": breakdown, "possible": possible,
             "earned": float(earned) if complete and not unknown else None,
             "score": None if reason else float(100 * earned / possible), "hold_reason": reason,
-            "question": question}
+            "question": question, **({"question_owner": owner} if owner else {})}
 
 
 def recommendation_group(decision: str, fit: dict | None) -> str | None:
@@ -196,3 +199,98 @@ def jd_input(doc):
              for line in doc.get("lines", [])]
     return {"title": doc.get("title", ""), "lines": lines, "images": images,
             "source": doc.get("jd_source") or doc.get("url", "")}
+
+
+def validate_entry(entry, doc, profile):
+    if entry.get("version") != doc["version"] or type(entry.get("id")) is not int:
+        raise ValueError("JD 버전 불일치")
+    if entry.get("decision") not in {"recommend", "needs_review", "exclude"}:
+        raise ValueError("지원 판정 누락")
+    if any(not isinstance(entry.get(k), str) or not entry[k].strip() for k in ("reason", "required_summary")):
+        raise ValueError("판정 요약 누락")
+    assessment = entry.get("assessment")
+    lines = doc["lines"]
+    fit = evaluate_fit(assessment, line_count=len(lines))
+    evidence_lines = entry.get("evidence_lines")
+    if (
+        not isinstance(evidence_lines, list)
+        or (not evidence_lines and entry["decision"] != "needs_review")
+        or any(type(i) is not int or not 1 <= i <= len(lines) for i in evidence_lines)
+    ):
+        raise ValueError("JD 근거 행 오류")
+    for item in assessment["criteria"]:
+        refs, quotes, ids = item["evidence_lines"], item.get("quotes"), item.get("profile_ids")
+        if (
+            not isinstance(quotes, list)
+            or len(refs) != len(quotes)
+            or any(
+                not isinstance(q, str) or not q.strip() or q not in lines[n - 1] for n, q in zip(refs, quotes)
+            )
+        ):
+            raise ValueError("JD 인용문 불일치")
+        if (
+            not isinstance(ids, list)
+            or any(not isinstance(k, str) or k not in profile for k in ids)
+            or (not ids and item["status"] != "unknown")
+        ):
+            raise ValueError("경력 근거 불일치")
+    if (
+        fit["complete"]
+        and fit["eligibility"] == "eligible"
+        and entry["decision"] != "exclude"
+        and not fit["question"]
+        and fit.get("question_owner") not in {"system", "employer"}
+    ):
+        gaps = sorted(
+            (
+                item
+                for item in fit["criteria"]
+                if item["status"] == "unknown" and item["category"] in ("work", "preferred")
+            ),
+            key=lambda item: (item["category"] != "work", min(item["evidence_lines"])),
+        )
+        for item in gaps:
+            label = " ".join(item["label"].split())
+            if re.fullmatch(
+                r"(?:핵심\s*)?업무|(?:우대|직무)\s*(?:요건|사항|조건)|(?:공고|원문)\s*(?:확인|접근)|"
+                r"(?:(?:접수|채용|지원)\s*)?마감(?:일|시각)?|채용\s*일정|근무지|급여|고용\s*형태",
+                label,
+            ):
+                continue
+            if re.search(r"미기재|미공개|(?:원문|공고|요건)\s*(?:정보\s*)?(?:없음|확인 불가)", label):
+                continue
+            fit["question_owner"] = "applicant"
+            fit["question"] = f"공고에 나온 ‘{label}’ 요건과 관련해 직접 수행한 업무나 프로젝트가 있나요?"
+            break
+    return fit
+
+
+def private_answer_entry(entry, profile, doc):
+    """Keep verified JD text and structured judgments from an answer-based evaluation."""
+    fit = validate_entry(entry, doc, {**profile, **doc["answer_facts"]})
+    assessment = {k: fit[k] for k in ("version", "complete", "preference", "eligibility")}
+    criteria, labels, keys = [], [], {}
+    for item in entry["assessment"]["criteria"]:
+        # Quotes and profile references were checked against this JD and this job's available facts.
+        source = item["quotes"][0]
+        label = item["label"] if item["label"] in source else source
+        key = keys.setdefault(item["key"], f"criterion-{len(keys) + 1}")
+        safe = {k: item[k] for k in ("category", "status", "evidence_lines", "quotes", "profile_ids",
+                                    "months", "required_months") if k in item}
+        criteria.append(dict(safe, key=key, label=label, evidence="지원 근거와 대조했습니다."))
+        if item["status"] == "unknown":
+            labels.append(label)
+    assessment["criteria"] = criteria
+    owner = fit.get("question_owner")
+    submitted = {fact.partition("\n")[0] for fact in doc["answer_facts"].values()}
+    if fit["question"] in submitted:
+        assessment.update(question=fit["question"], question_owner="applicant")
+    elif fit["question"] and owner not in {"system", "employer"} and labels:
+        assessment.update(question=f"공고의 ‘{labels[0]}’ 요건과 관련해 직접 수행한 경험이 있나요?",
+                          question_owner="applicant")
+    else:
+        assessment["question_owner"] = owner or "system"
+    summary = " · ".join(dict.fromkeys(c["label"] for c in criteria if c["category"] == "required"))
+    return dict(id=doc["id"], version=doc["version"], decision=entry["decision"],
+        reason="공고 요건과 지원자 답변을 대조했습니다.", evidence_lines=entry["evidence_lines"],
+        required_summary=summary or "공고의 명시 요건을 확인했습니다.", assessment=assessment)
