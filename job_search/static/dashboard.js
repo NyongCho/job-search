@@ -392,26 +392,30 @@ function retryRefresh(message) {
 function progressSummary(counts) {
   const finished = counts.done + counts.failed + counts.skipped;
   const total = finished + counts.running + counts.queued;
-  let state = "완료";
-  if (!total) state = "대상 없음";
-  else if (counts.running) state = "처리 중";
-  else if (counts.queued) state = "대기 중";
-  else if (counts.failed) state = counts.failed === total ? "전체 실패" : "일부 실패";
+  let state, outcome;
+  if (counts.running || counts.queued) {
+    state = counts.running ? "처리 중" : "대기 중";
+    outcome = "active";
+  } else if (counts.failed) {
+    state = counts.failed === total ? "전체 실패" : "일부 실패";
+    outcome = "failed";
+  } else if (counts.done) {
+    state = counts.skipped ? "완료" : "성공";
+    outcome = "complete";
+  } else {
+    state = total ? "모두 해당 없음" : "대상 없음";
+    outcome = "empty";
+  }
 
   const parts = [];
   for (const [key, label] of [["running","처리 중"], ["queued","대기"], ["done","성공"], ["skipped","해당 없음"], ["failed","실패"]]) {
     if (counts[key]) parts.push(`${label} ${counts[key]}`);
   }
-  return {state, total, finished, details: parts.join(" · ") || state};
+  return {state, outcome, total, finished, details: parts.join(" · ")};
 }
 
 function setText(element, value) {
   if (element.textContent !== value) element.textContent = value;
-}
-
-function setProgress(bar, summary) {
-  bar.max = summary.total || 1;
-  bar.value = summary.finished;
 }
 
 const taskStates = {queued: "대기 중", running: "처리 중", done: "성공", failed: "실패", skipped: "건너뜀"};
@@ -439,24 +443,34 @@ function showProgress() {
     if (individual && !run.post_tasks) continue;
     const counts = individual ? showPostTasks(panel, run.post_tasks) : run.counts;
     const summary = progressSummary(counts);
-    const complete = summary.finished === summary.total;
-    const progressKey = `${run.id}/${individual ? "post" : "list"}`;
-    const signature = individual ? JSON.stringify(run.post_tasks) : [run.cursor, counts.running, counts.queued].join("/");
-    if (lastProgress.get(progressKey)?.signature !== signature) lastProgress.set(progressKey, {signature, at: now});
-    const minutes = Math.floor((now - lastProgress.get(progressKey).at) / 60000);
-    const elapsed = !complete && minutes ? ` · ${minutes}분간 변동 없음` : "";
+    const bar = panel.querySelector("[data-run-bar]");
+    const active = summary.outcome === "active";
+    bar.hidden = !active;
+    panel.dataset.outcome = summary.outcome;
     setText(panel.querySelector("[data-run-state]"), summary.state);
-    const pending = complete ? "" : ` · 실행 중 ${counts.running} · 대기 ${counts.queued}`;
-    setText(panel.querySelector("[data-run-total]"), `작업 ${summary.finished}/${summary.total}개 처리${pending}${elapsed}`);
-    setProgress(panel.querySelector("[data-run-bar]"), summary);
-    panel.dataset.outcome = complete && counts.failed ? "failed" : complete ? "complete" : "active";
+    const progressKey = `${run.id}/${individual ? "post" : "list"}`;
+    let total = `작업 ${summary.total}개`;
+    if (active) {
+      bar.max = summary.total;
+      bar.value = summary.finished;
+      const signature = individual ? JSON.stringify(run.post_tasks) : [run.cursor, counts.running, counts.queued].join("/");
+      if (lastProgress.get(progressKey)?.signature !== signature) lastProgress.set(progressKey, {signature, at: now});
+      const minutes = Math.floor((now - lastProgress.get(progressKey).at) / 60000);
+      total = `작업 ${summary.finished}/${summary.total}개 처리 · 실행 중 ${counts.running} · 대기 ${counts.queued}`;
+      if (minutes) total += ` · ${minutes}분간 변동 없음`;
+    } else {
+      lastProgress.delete(progressKey);
+      if (summary.details) total += ` · ${summary.details}`;
+    }
+    setText(panel.querySelector("[data-run-total]"), total);
     for (const part of panel.querySelectorAll("[data-kind]")) {
       const counts = run.by_kind[part.dataset.kind];
       const value = progressSummary(counts);
       part.dataset.failed = String(counts.failed > 0);
-      setText(part.querySelector("[data-kind-count]"), `${value.finished}/${value.total}`);
-      setText(part.querySelector("[data-kind-status]"), value.details);
-      setProgress(part.querySelector("progress"), value);
+      const count = part.querySelector("[data-kind-count]");
+      count.hidden = !active;
+      if (active) setText(count, `${value.finished}/${value.total}`);
+      setText(part.querySelector("[data-kind-status]"), value.details || value.state);
     }
   }
 }

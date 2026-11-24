@@ -16,25 +16,25 @@
   <div data-refresh-panels>{% for run in runs|sort(attribute='id') %}
     {% set fit_only = run.by_kind.fit.values()|sum > 0 and not run.by_kind.deadline.values()|sum and not run.by_kind.logo.values()|sum %}
     <section class="refresh-run" data-run-id="{{ run.id }}"{% if individual %} data-post-results{% endif %} aria-label="새로고침 작업 {{ run.id }}">
-      <div class="refresh-summary"><strong>{{ '적합도 재평가' if fit_only else '이 공고 새로고침' if individual else '목록 새로고침' if run.list_scope else '개별 공고 새로고침' }}{% if runs|length > 1 %} #{{ run.id }}{% endif %}</strong>
+      <div class="refresh-summary">
+        <strong>{{ '적합도 재평가' if fit_only else '이 공고 새로고침' if individual else '목록 새로고침' if run.list_scope else '개별 공고 새로고침' }}{% if runs|length > 1 %} #{{ run.id }}{% endif %}</strong>
         <span class="refresh-badge" data-run-state role="status"></span>
-        <span class="refresh-total" data-run-total></span>
         <a href="{{ url_for('refresh_status', run=run.id, view='usage') }}" target="_blank" rel="noopener" aria-label="새로고침 {{ run.id }} 모델 사용량 (새 탭)">{{ '목록 모델 사용량' if individual and run.list_scope else '모델 사용량' }}</a>
       </div>
-      <progress data-run-bar value="0" max="1" aria-label="전체 작업 처리 진행률"></progress>
+      <p class="refresh-total" data-run-total></p>
+      <progress data-run-bar hidden aria-label="전체 작업 처리 진행률"></progress>
       {% set kinds = [('deadline','마감'),('logo','기업 로고'),('fit','적합도')] %}
       {% if individual %}
       <dl class="refresh-task-list">{% for key,label in kinds if key in run.post_tasks %}
         <div data-task="{{ key }}"><dt>{{ label }}</dt><dd><strong data-task-status></strong><span data-task-message></span></dd></div>
       {% endfor %}</dl>
-      {% else %}
-      <div class="refresh-kinds">{% for key,label in kinds if not fit_only or key == 'fit' %}
+      {% elif run.counts.values()|sum %}
+      <dl class="refresh-kinds">{% for key,label in kinds if not fit_only or key == 'fit' %}
         <div class="refresh-kind" data-kind="{{ key }}">
-          <div><strong>{{ label }}</strong><span data-kind-count></span></div>
-          <progress value="0" max="1" aria-label="{{ label }} 처리 진행률"></progress>
-          <small data-kind-status></small>
+          <dt>{{ label }} <span data-kind-count></span></dt>
+          <dd data-kind-status></dd>
         </div>{% endfor %}
-      </div>
+      </dl>
       {% endif %}
     </section>{% endfor %}</div>
 </div>

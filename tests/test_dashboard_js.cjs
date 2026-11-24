@@ -334,11 +334,13 @@ test('the same run paints list totals and each selected job task with its own re
   paint();
   assert.equal(list.querySelector('[data-run-state]').textContent, '처리 중');
   assert.equal(list.querySelector('[data-run-total]').textContent, '작업 4/6개 처리 · 실행 중 1 · 대기 1');
-  assert.deepEqual(list.querySelector('[data-run-bar]'), {max: 6, value: 4});
-  assert.equal(list.rows[0].querySelector('progress').value, 2);
+  assert.deepEqual(list.querySelector('[data-run-bar]'), {hidden: false, max: 6, value: 4});
+  assert.equal(list.rows[0].querySelector('[data-kind-count]').textContent, '2/2');
+  assert.equal(list.rows[0].querySelector('[data-kind-count]').hidden, false);
   assert.equal(list.rows[1].querySelector('[data-kind-status]').textContent, '처리 중 1 · 실패 1');
   assert.equal(detail.querySelector('[data-run-state]').textContent, '전체 실패');
-  assert.equal(detail.querySelector('[data-run-total]').textContent, '작업 3/3개 처리');
+  assert.equal(detail.querySelector('[data-run-total]').textContent, '작업 3개 · 실패 3');
+  assert.equal(detail.querySelector('[data-run-bar]').hidden, true);
   assert.deepEqual(detail.rows.map(row => row.querySelector('[data-task-status]').textContent), ['실패','실패','실패']);
   assert.deepEqual(detail.rows.map(row => row.querySelector('[data-task-message]').textContent),
     ['원본 공고 미확인','이미지 수집 실패','Hermes가 적합도 평가를 시작하지 못했어요.']);
@@ -350,13 +352,36 @@ test('the same run paints list totals and each selected job task with its own re
   run.post_tasks.logo = {status: 'queued', message: ''};
   run.post_tasks.fit = {status: 'running', message: ''};
   paint();
+  assert.deepEqual(detail.querySelector('[data-run-bar]'), {hidden: false, max: 3, value: 1});
   assert.deepEqual(detail.rows.map(row => row.querySelector('[data-task-status]').textContent), ['실패','대기 중','처리 중']);
   assert.equal(detail.rows[2].querySelector('[data-task-message]').textContent, '');
   run.post_tasks.logo = {status: 'skipped', message: '확인된 기업 로고가 없어요.'};
   run.post_tasks.fit = {status: 'done', message: '기존 평가'};
   paint();
   assert.equal(detail.querySelector('[data-run-state]').textContent, '일부 실패');
+  assert.equal(detail.querySelector('[data-run-total]').textContent, '작업 3개 · 성공 1 · 해당 없음 1 · 실패 1');
+  assert.equal(detail.querySelector('[data-run-bar]').hidden, true);
   assert.deepEqual(detail.rows.map(row => row.querySelector('[data-task-status]').textContent), ['실패','건너뜀','성공']);
+
+  run.counts = counts({failed: 3, done: 2, skipped: 1});
+  run.by_kind.logo = counts({failed: 1, skipped: 1});
+  run.by_kind.fit = counts({failed: 1, done: 1});
+  paint();
+  assert.equal(list.querySelector('[data-run-bar]').hidden, true);
+  assert.ok(list.rows.every(row => row.querySelector('[data-kind-count]').hidden));
+  assert.deepEqual(list.rows.map(row => row.querySelector('[data-kind-status]').textContent),
+    ['성공 1 · 실패 1', '해당 없음 1 · 실패 1', '성공 1 · 실패 1']);
+});
+
+test('terminal summaries distinguish no targets, all skipped, and successful work', () => {
+  const summarize = vm.runInNewContext(script + '\n;progressSummary;', {document: {querySelector() { return null; }}});
+  const counts = {done: 0, failed: 0, skipped: 0, running: 0, queued: 0};
+  for (const [changes, state] of [
+    [{}, '대상 없음'], [{skipped: 3}, '모두 해당 없음'], [{done: 1}, '성공'],
+    [{done: 2, skipped: 1}, '완료'], [{queued: 1}, '대기 중'],
+  ]) {
+    assert.equal(summarize({...counts, ...changes}).state, state);
+  }
 });
 
 test('an empty destination tab polls until active work can no longer change its cards or totals', async () => {
