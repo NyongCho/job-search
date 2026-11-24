@@ -68,6 +68,14 @@ class PosterReviewTests(unittest.TestCase):
         old = {**doc, "images": [{"url": image["url"], "alt": ""}]}
         self.assertEqual(fit_work.jd_input(old), fit_work.jd_input(doc))
 
+    def test_replaced_image_with_same_transcription_has_a_new_answer_scope(self):
+        from job_search.job_fit import jd_input
+        doc = self.enrich(self.jobs, self.read())
+        doc["poster_evidence"]["images"] = [{"url": self.url, "sha256": "a" * 64}]
+        first = jd_input(doc)
+        doc["poster_evidence"]["images"][0]["sha256"] = "b" * 64
+        self.assertNotEqual(first, jd_input(doc))
+
     def test_old_delivery_is_reassessed_without_another_digest(self):
         from job_search.poster_review import prepare_post
         with sqlite3.connect(self.jobs) as db:

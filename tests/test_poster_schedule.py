@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -5,7 +6,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from job_search import collect_jobs, dashboard_store, fit_work, poster_evidence
+from job_search import collect_jobs, dashboard_store, fit_work, poster_evidence, refresh_queue, refresh_worker, review_answers
 from tests.test_collect_jobs import posting
 from tests.test_fit_work import response
 
@@ -129,6 +130,73 @@ class PosterScheduleTests(unittest.TestCase):
         self.run_schedule("legacy")
         self.assertEqual(self.prepared, [2])
         self.assertEqual(set(self.assessed), {2, 4})
+
+    def test_source_answer_survives_ocr_for_only_the_same_job_and_keeps_its_delivery_receipt(self):
+        from tests.test_job_fit import assessment, criterion
+
+        self.seed([1, 2], delivered=[1])
+        raw = posting(1, '<p>운영 장애 대응 경험이 필수입니다.</p><img src="https://example.org/poster-1.png">'
+                         '<p>지원 마감 2099-12-31</p><a href="https://example.org/apply/1">지원하러 가기</a>')
+        raw["modified_gmt"] = "2026-11-15T00:00:00"
+        collect_jobs.collect(self.jobs, lambda _: ([raw], 1))
+        refresh_worker.migrate(self.jobs, self.state, schema_only=True)
+        doc = collect_jobs.get_posts(self.jobs, [1])[0]
+        question = "운영 장애에 직접 대응한 경험이 있나요?"
+        answer = "이 공고에만 제공하는 합성 테스트 응답"
+        entry = dict(id=1, fingerprint=doc["fingerprint"], decision="needs_review", reason="운영 장애 경험 확인",
+                     evidence_lines=[1], assessment=assessment(criterion("운영 장애 대응", "required", "unknown"),
+                     question=question), availability="open", deadline="2099-12-31", apply_url=doc["apply_url"],
+                     required_summary="운영 장애 대응")
+        collect_jobs.record_reviews(self.jobs, [entry], execution_id="legacy")
+        run_id = review_answers.submit(self.jobs, self.state, 1, doc["fingerprint"], question, answer)
+        batches = []
+
+        def evaluate(attempt, profile, docs):
+            batches.append([d["id"] for d in docs])
+            result = response(attempt, profile, docs)
+            for d, e in zip(docs, result["entries"]):
+                if d["id"] == 1:
+                    self.assertIn("서비스 운영", d["lines"][-1])
+                    self.assertEqual(d.get("answer_facts"), {"A0001": question + "\n" + answer})
+                    e["decision"] = "needs_review"
+                    e["assessment"]["question"] = question
+                    e["assessment"]["criteria"][0].update(status="unknown", profile_ids=[])
+                else:
+                    self.assertNotIn("answer_facts", d)
+            return result
+
+        digest = fit_work.scheduled_review(self.jobs, self.state, "with-answer", profile=self.profile,
+                                           runner=evaluate, verifier=lambda _: {})
+        self.assertEqual(batches, [[1], [2]])
+        self.assertEqual(digest.count("100.0점"), 1)
+        self.assertNotIn(question, digest)
+        # A worker processing the original form after the scheduled run reuses the same private fit.
+        tasks = refresh_queue.claim(self.state, "fit", 5)
+        def finish(task, status, message):
+            self.assertEqual(status, "done", message)
+            refresh_queue.finish(self.state, task, status, message)
+        fit_work.refresh_fit_tasks(self.jobs, self.state, tasks, finish, profile=self.profile,
+                                   runner=lambda *_: self.fail("이미 평가한 답변으로 반복 호출"))
+        detail = dashboard_store.get_job(self.jobs, self.state, 1)
+        self.assertEqual((detail["review_route"], detail["review_questions"]), ("hold", []))
+        self.assertEqual(detail["fit"]["answer_revision"], run_id)
+        self.assertEqual(review_answers.submit(self.jobs, self.state, 1, detail["fingerprint"], question, answer), run_id)
+        with sqlite3.connect(self.jobs) as db:
+            self.assertEqual(db.execute("SELECT execution_id FROM fit_delivery WHERE post_id=1").fetchone(), ("legacy",))
+            self.assertNotIn(answer, "\n".join(db.iterdump()))
+        # The provider replaced the poster at the same URL and the requirements changed.
+        with closing(collect_jobs.connect(self.jobs)) as db, db:
+            changed = json.loads(db.execute("SELECT document FROM posts WHERE id=1").fetchone()[0])
+            changed["lines"][-1] = "운영 장애 대응 실무 5년 이상 필수"
+            image = changed["poster_evidence"]["images"][0]
+            image.update(sha256="1" * 64)
+            image["lines"][-1]["text"] = changed["lines"][-1]
+            collect_jobs.save_document(db, changed)
+        def new_requirements(attempt, profile, docs):
+            self.assertNotIn("answer_facts", docs[0])
+            return response(attempt, profile, docs)
+        fit_work.refresh_fit_tasks(self.jobs, self.state, [{"id": "changed", "post_id": 1}], lambda *_: None,
+                                   profile=self.profile, runner=new_requirements, poster_ids=[])
 
     def test_explicit_backfill_keeps_its_fixed_ids(self):
         self.seed([1, 2, 3, 4])

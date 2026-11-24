@@ -44,6 +44,8 @@ REASONS = {
 TRANSIENT = {"pillow_unavailable", "tesseract_unavailable", "language_unavailable", "ocr_timeout", "ocr_failed"}
 _DETAILS = re.compile(r"담당\s*업무|주요\s*업무|자격\s*(?:요건|조건)|지원\s*자격|우대\s*사항|"
                       r"필수\s*(?:자격|요건)|responsibilities|requirements|qualifications", re.I)
+_ROLE_TEXT = re.compile(r"업무|이런 일을|하게 될 일|you will|responsibilit", re.I)
+_REQUIREMENT_TEXT = re.compile(r"경험|경력|학력|학위|자격|보유한 분|qualification|experience", re.I)
 _IMAGE_REFERENCE = re.compile(r"(?:이미지|포스터|첨부|아래|하단|다음\s*표).{0,24}(?:참조|참고|확인)|see (?:the )?(?:poster|image|attachment)", re.I)
 
 
@@ -58,6 +60,8 @@ def poster_candidates(doc):
     text = " ".join(line.strip() for line in source.get("source_lines", doc.get("lines", []))
                     if isinstance(line, str) and line.strip() and line not in labels)
     if not _IMAGE_REFERENCE.search(text):
+        if len(text) >= 80 and _ROLE_TEXT.search(text) and _REQUIREMENT_TEXT.search(text):
+            return []
         headings = _DETAILS.findall(text)
         if headings and (len(text) >= 80 or (len(text) >= 24 and len(headings) >= 2)):
             return []

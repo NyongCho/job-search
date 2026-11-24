@@ -91,6 +91,15 @@ class PosterEvidenceTests(unittest.TestCase):
         self.assertEqual(self.enrich(doc), doc)
         self.fetch.assert_not_called()
 
+    def test_text_jd_in_conversational_korean_does_not_read_a_product_photo(self):
+        doc = {**posting(), "lines": [
+            "합류하게 되면 이런 일을 하게 됩니다", "재무 관련 서류 관리와 전사 비용전표 처리를 하게 돼요.",
+            "해당 부서의 기타 사무 보조 업무도 담당해요.",
+            "이런 경험을 가지신 분을 찾고 있어요", "전문 학사 이상의 학력을 가진 분을 원해요.",
+            "관련 업무 경험이나 ERP 사용 경험이 있는 분이라면 더욱 좋아요."]}
+        self.assertEqual(self.enrich(doc), doc)
+        self.fetch.assert_not_called()
+
     def test_long_pointer_with_two_headings_still_reads_poster(self):
         doc = {**posting(), "lines": ["모집 분야별 담당 업무 및 자격 요건은 아래를 참고하시기 바랍니다."]}
         self.assertEqual(self.enrich(doc)["poster_evidence"]["status"], "ready")

@@ -43,6 +43,9 @@ def create_tables(db):
     for statement in (
         """CREATE TABLE IF NOT EXISTS refresh_runs (
             id INTEGER PRIMARY KEY, scope TEXT NOT NULL, signature TEXT NOT NULL, created REAL NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS review_answers (
+            post_id INTEGER NOT NULL, jd_version TEXT NOT NULL, question TEXT NOT NULL, answer TEXT NOT NULL,
+            run_id INTEGER NOT NULL REFERENCES refresh_runs(id), PRIMARY KEY(post_id,jd_version,question))""",
         """CREATE TABLE IF NOT EXISTS refresh_receipts (
             request_id TEXT PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES refresh_runs(id))""",
         """CREATE TABLE IF NOT EXISTS refresh_groups (
@@ -152,9 +155,9 @@ def claim(path, kind, limit, *, now=None):
         tasks = db.execute("""SELECT w.id,w.post_id,g.version,w.kind,d.id AS source_work_id,d.status AS source_status,
             coalesce(w.fit_run_id,(SELECT min(run_id) FROM refresh_members m WHERE m.group_id=g.id)) AS run_id
             FROM refresh_work w JOIN refresh_groups g ON g.id=w.group_id
-            JOIN refresh_work d ON d.group_id=g.id AND d.kind='deadline'
+            LEFT JOIN refresh_work d ON d.group_id=g.id AND d.kind='deadline'
             WHERE w.kind=? AND w.status='queued' AND w.ready_at<=?
-            AND (w.kind<>'fit' OR d.status NOT IN ('queued','running'))
+            AND (w.kind<>'fit' OR d.id IS NULL OR d.status NOT IN ('queued','running'))
             ORDER BY w.ready_at,w.id LIMIT ?""", (kind, time.time() if now is None else now, limit)).fetchall()
         db.executemany("UPDATE refresh_work SET status='running' WHERE id=?", ((t["id"],) for t in tasks))
         return [dict(t) for t in tasks]
