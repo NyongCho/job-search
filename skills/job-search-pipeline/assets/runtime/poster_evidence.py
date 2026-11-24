@@ -120,8 +120,9 @@ def _source(cache, url, revision):
         saved = _load(path)
         if saved.get("sha256") or saved.get("retry_after", 0) > time.time():
             return saved
+        timeout_seconds = 40 if "retry_after" in saved else 12
         try:
-            final_url, data, _ = fetch_public(url, deadline=time.monotonic() + 12, limit=MAX_BYTES)
+            final_url, data, _ = fetch_public(url, deadline=time.monotonic() + timeout_seconds, limit=MAX_BYTES)
         except (ValueError, OSError):
             saved = {"retry_after": time.time() + RETRY_SECONDS}
         else:

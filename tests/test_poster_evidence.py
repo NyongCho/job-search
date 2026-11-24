@@ -104,6 +104,58 @@ class PosterEvidenceTests(unittest.TestCase):
         doc = {**posting(), "lines": ["모집 분야별 담당 업무 및 자격 요건은 아래를 참고하시기 바랍니다."]}
         self.assertEqual(self.enrich(doc)["poster_evidence"]["status"], "ready")
 
+    def test_slow_poster_recovers_once_after_cached_failure_expires(self):
+        clock = self.enterContext(patch.object(evidence, "time"))
+        clock.time.return_value = 1000
+        clock.monotonic.return_value = 200
+        budgets = []
+
+        def slow_fetch(url, *, deadline, limit):
+            self.assertEqual((url, limit), (URL, 16 * 1024 * 1024))
+            budgets.append(deadline - clock.monotonic())
+            if budgets[-1] < 29.8:
+                raise TimeoutError
+            return URL, b"poster", "image/jpeg"
+
+        self.fetch.side_effect = slow_fetch
+        failed = self.enrich(posting())
+        image, = failed["poster_evidence"]["images"]
+        self.assertEqual((image["reason_code"], image["retry_after"]), ("download_failed", 1600))
+        clock.time.return_value = 1599
+        self.assertEqual(self.enrich(failed, allow_model=True), failed)
+        self.assertEqual(budgets, [12])
+        self.local.assert_not_called()
+
+        clock.time.return_value = 1600
+        with ThreadPoolExecutor(2) as pool:
+            ready, concurrent = pool.map(self.enrich, [failed, failed])
+        self.assertEqual(ready["poster_evidence"]["status"], "ready")
+        self.assertEqual(concurrent, ready)
+        self.assertEqual(self.enrich(posting()), ready)
+        self.assertEqual(budgets, [12, 40])
+        self.local.assert_called_once()
+        self.model.assert_not_called()
+
+    def test_failed_slow_retry_restarts_cooldown_and_new_revision_starts_fast(self):
+        clock = self.enterContext(patch.object(evidence, "time"))
+        clock.time.return_value = 1000
+        clock.monotonic.return_value = 0
+        self.fetch.side_effect = TimeoutError
+        doc = posting()
+        urls = [f"{URL}?page={page}" for page in range(1, 6)]
+        doc["images"] = [{"url": url} for url in urls]
+        self.enrich(doc)
+        clock.time.return_value = 1600
+        failed = self.enrich(doc)
+        self.assertEqual([im["retry_after"] for im in failed["poster_evidence"]["images"]], [2200] * 4)
+        clock.time.return_value = 2199
+        self.assertEqual(self.enrich(doc, allow_model=True), failed)
+        self.enrich({**doc, "modified_gmt": "2026-04-02"})
+        attempts = [(call.args[0], call.kwargs["deadline"]) for call in self.fetch.call_args_list]
+        self.assertEqual(attempts, [(url, budget) for budget in (12, 40, 12) for url in urls[:4]])
+        self.local.assert_not_called()
+        self.model.assert_not_called()
+
     def test_download_failure_is_stable_and_does_not_hide_another_image(self):
         doc = posting()
         doc["images"].append({"url": "https://example.org/second.jpg"})
