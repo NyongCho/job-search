@@ -26,6 +26,11 @@ function wireScroll() {
       if (!detail && matchMedia("(max-width: 640px)").matches) window.scrollTo(0, position.page || 0);
     } catch { storage.remove(key); }
   }
+  // The return link's fragment can arrive before the shell has any job rows.
+  if (!detail && dashboard?.dataset.view === "recommended" && /^#job--?\d+$/.test(location.hash) &&
+      (document.activeElement === document.body || document.activeElement === list)) {
+    (document.getElementById(location.hash.slice(1)) || list).focus();
+  }
   window.addEventListener("pagehide", () => {
     if (getComputedStyle(list).display !== "none") {
       storage.set(`job-list:${list.dataset.scrollKey}`, JSON.stringify({ list: list.scrollTop, page: window.scrollY }));
@@ -283,9 +288,10 @@ function syncList(next) {
   }
   list.dataset.scrollKey = next.dataset.scrollKey;
   list.dataset.page = next.dataset.page;
+  delete list.dataset.loadFailed;
   list.setAttribute("aria-busy", "false");
   if (list.contains(focused) && document.activeElement !== focused) focused.focus({preventScroll: true});
-  if (!focused.isConnected && (focusedPage || rows.includes(focused))) {
+  if (!focused.isConnected && (focusedPage || rows.includes(focused) || focused.hasAttribute("data-list-retry"))) {
     const link = [...list.querySelectorAll(".pagination a")].find(node => node.getAttribute("aria-label") === focusedPage);
     (link || anchor || list).focus({preventScroll: true});
   }
@@ -354,11 +360,25 @@ function refreshMessage(message) {
 
 async function refreshScreen() {
   needsSnapshot = true;
+  const retry = list?.querySelector("[data-list-retry]");
+  if (retry) {
+    list.setAttribute("aria-busy", "true");
+    retry.setAttribute("aria-disabled", "true");
+    if (!retry.hidden) list.querySelector("[data-list-load-status]").textContent = "추천 공고를 다시 불러오는 중…";
+  }
   try {
     await readCurrentScreen(applySnapshot);
   } catch {
     if (pageActive) {
-      retryRefresh("화면을 불러오지 못했어요. 연결을 다시 확인할게요.");
+      const inlineError = retry?.isConnected;
+      if (inlineError) {
+        list.dataset.loadFailed = "";
+        list.setAttribute("aria-busy", "false");
+        list.querySelector("[data-list-load-status]").textContent = "추천 공고를 불러오지 못했어요. 연결을 확인해 주세요.";
+        retry.hidden = false;
+        retry.removeAttribute("aria-disabled");
+      }
+      retryRefresh(inlineError && !detail ? "" : "화면을 불러오지 못했어요. 연결을 다시 확인할게요.");
       schedulePoll(pollDelay);
     }
   }
@@ -523,6 +543,9 @@ async function poll() {
 }
 
 if (dashboard) {
+  document.querySelector("[data-list-retry]")?.addEventListener("click", () => {
+    if (list.getAttribute("aria-busy") === "false") schedulePoll(0);
+  });
   for (const button of document.querySelectorAll("[data-refresh]")) {
     button.addEventListener("click", async () => {
       button.disabled = true;
