@@ -69,6 +69,22 @@ class PosterOcrTests(unittest.TestCase):
         self.assertEqual((result["status"], result["reason"]), ("uncertain", "ambiguous_layout"))
         self.assertIn({"text": "학사 이상", "bbox": [695, 120, 250, 22]}, result["lines"])
 
+    def test_text_between_two_fragments_blocks_a_false_table_gutter(self):
+        rows = []
+        for y in (120, 180):
+            rows.extend([(35, y, "지원자격", 96), (316, y, "흐린 글자", 35),
+                         (650, y, "업무 경험", 95)])
+        rows.append((35, 300, "필수 경력 5년", 70))
+        result = run_engine(poster((1600, 1200)), rows)
+        self.assertEqual((result["status"], result["reason"]), ("uncertain", "uncertain_number"))
+
+    def test_unrelated_horizontal_gaps_on_different_rows_do_not_establish_columns(self):
+        rows = [(35, 100, "담당업무", 96), (650, 100, "서비스 개발", 95),
+                (680, 175, "채용절차", 97), (1250, 175, "서류전형", 93),
+                (35, 300, "지원자격 전산 경력 3년", 65)]
+        result = run_engine(poster((1600, 1200)), rows)
+        self.assertEqual((result["status"], result["reason"]), ("uncertain", "uncertain_number"))
+
     def test_disagreeing_original_crop_never_confirms_a_requirement(self):
         result = run_engine(poster(), CLEAR + [(35, 340, "관련 경력 3년 이상 필수", 94)],
                             [(0, 0, "관련 경력 8년 이상 필수", 97)])
@@ -83,6 +99,12 @@ class PosterOcrTests(unittest.TestCase):
         self.assertEqual([r for r in result["lines"] if r["text"] == "지원 안내"],
                          [{"text": "지원 안내", "bbox": [50, 1940, 250, 22]}])
         self.assertIn({"text": "분산 데이터베이스 구축 경험 우대", "bbox": [50, 2300, 250, 22]}, result["lines"])
+
+    def test_written_mandatory_condition_is_evidence_without_a_section_heading(self):
+        rows = [(30, 40, "Cleaning crew wanted", 97),
+                (30, 100, "Clean customer sites overnight.", 95),
+                (30, 160, "Applicants must provide their own transportation.", 96)]
+        self.assertEqual(run_engine(poster(), rows)["status"], "ready")
 
     def test_low_quality_non_jd_text_cannot_become_ready(self):
         result = run_engine(poster(), [(35, 50, "모집요강", 70), (35, 100, "000", 15)])

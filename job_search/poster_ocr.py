@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import time
+from bisect import bisect_left, bisect_right
 from datetime import date
 from itertools import groupby
 from urllib.parse import unquote, urlsplit
@@ -22,7 +23,8 @@ DECORATION = re.compile(
     r"|로고|아이콘|공유하기|버튼", re.I
 )
 JOB_DETAILS = re.compile(
-    r"업무|직무|경력|자격|필수|우대|담당|요건|responsibilit|requir|qualification|experience", re.I
+    r"업무|직무|경력|자격|필수|우대|담당|요건|responsibilit|requir|qualification|experience"
+    r"|(?:you|applicants?|candidates?)must(?:have|hold|possess|provide|beableto)", re.I
 )
 TECHNICAL_TERM = re.compile(r"(?<![A-Za-z0-9])(?:B2B|B2C|HTML5)(?![A-Za-z0-9])", re.I)
 LIST_PREFIX = re.compile(r"^\s*(?:\(\d{1,2}\)|\d{1,2}[.)])\s*(?=[가-힣A-Za-z])")
@@ -91,24 +93,33 @@ def _tsv_lines(raw, scale, offset, width):
     return lines
 
 
-def _has_columns(lines, width):
-    # Repeated, horizontally separated cells on the same baseline have ambiguous ownership.
-    first_pair = None
-    for i, row in enumerate(lines):
-        x, y, w, h = row["bbox"]
+def _has_columns(cells, width):
+    # Only adjacent pieces of text can bound a gutter. Even a misread word occupies pixels.
+    tops = [box[1] for box, _ in cells]
+    max_height = max((box[3] for box, _ in cells), default=0)
+    gaps = []
+    for (x, y, w, h), legible in cells:
+        if not legible:
+            continue
+        start, stop = bisect_left(tops, y - max_height), bisect_right(tops, y + h)
+        neighbors = [(box, good) for box, good in cells[start:stop]
+                     if box[0] >= x + w and min(y + h, box[1] + box[3]) - max(y, box[1]) >= min(h, box[3]) * 0.35]
+        if not neighbors:
+            continue
+        (ox, oy, _, oh), other_legible = min(neighbors, key=lambda entry: entry[0][0])
         center = y + h / 2
-        for other in lines[i + 1:]:
-            ox, oy, ow, oh = other["bbox"]
-            if oy > y + h:
-                break
-            if abs(oy + oh / 2 - center) > min(h, oh) * 0.48:
-                continue
-            if max(ox - x - w, x - ox - ow) < width * 0.05:
-                continue
-            if first_pair is None:
-                first_pair = center
-            elif abs(center - first_pair) > h:
+        if not other_legible or abs(oy + oh / 2 - center) > min(h, oh) * 0.48:
+            continue
+        left, right = x + w, ox
+        if right - left < width * 0.05:
+            continue
+        # Consecutive body rows share empty horizontal coordinates. Unrelated gaps elsewhere do not.
+        for prior_left, prior_right, prior_y, prior_h in reversed(gaps):
+            distance = abs(center - prior_y)
+            if (max(h, prior_h) < distance <= 7 * max(h, prior_h)
+                    and min(right, prior_right) - max(left, prior_left) >= width * 0.025):
                 return True
+        gaps.append((left, right, center, h))
     return False
 
 
@@ -135,7 +146,7 @@ def _is_metadata(text):
 
 def _judge(rows, width, confirm_number):
     rows.sort(key=lambda r: (r[0]["bbox"][1], r[0]["bbox"][0]))
-    credible, metadata, numeric = [], [], []
+    credible, metadata, numeric, cells = [], [], [], []
     dropped_detail = False
     for raw, avg, worst, number_score in rows:
         text = LIST_PREFIX.sub("", raw["text"])
@@ -144,11 +155,13 @@ def _judge(rows, width, confirm_number):
             text = year[1]
         if _is_metadata(text):
             metadata.append(raw)
+            cells.append((raw["bbox"], False))
             continue
         line = {**raw, "text": text}
         if text != raw["text"]:
             line["source_text"] = raw["text"]
         legible = avg >= 80 and worst >= 45 and re.search(r"[가-힣A-Za-z]", text)
+        cells.append((raw["bbox"], legible and len(re.findall(r"[가-힣A-Za-z]", text)) >= 2))
         if legible:
             credible.append(line)
         elif JOB_DETAILS.search(re.sub(r"\s+", "", text)):
@@ -161,7 +174,7 @@ def _judge(rows, width, confirm_number):
                         and avg >= 90 and worst >= 70 and number_score >= 90)
             numeric.append((line, raw, reliable))
     compact = [re.sub(r"\s+", "", line["text"]) for line, *_ in rows]
-    if _has_columns(credible, width) or any(TABLE_HEADER.search(line) for line in compact):
+    if _has_columns(cells, width) or any(TABLE_HEADER.search(line) for line in compact):
         return _result("uncertain", "ambiguous_layout", credible, metadata)
     if len(numeric) > MAX_NUMBER_CHECKS or any(not reliable for _, _, reliable in numeric):
         return _result("uncertain", "uncertain_number", credible, metadata)

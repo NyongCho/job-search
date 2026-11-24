@@ -11,7 +11,7 @@
   "poster_backfill.py": "1277ce0155ed313742d048fa5aadf08aa1ca38e63eda75396167fa0ce37f8ee2",
   "poster_evidence.py": "23f8b4505315119a5028d04f7c56162356898f89cab514f3357f7431e49169fb",
   "poster_model.py": "d0b756fbeb182cb2d9d10198a3bdfd93e1109ccca7bd2fa20f059fe99840f518",
-  "poster_ocr.py": "33227dc776b2f1a73a483256efc4e910d53c01d31536c98da7a8e1cf3e1b8437",
+  "poster_ocr.py": "bfd915cb4c7c48bb340fcbb93a4c64e21182a4ca2b7b65b695d156700dcf1322",
   "poster_review.py": "7ad00de1b1359f2c21d90d7a787f2cb4920cdd99c85548365a5b63dc5664ec9a",
   "posting_checks.py": "67cb6eef5f81a44d12ada59eb394d4085e9f2d1e120ae7b8c6dd0e4f761f40a1",
   "prototype_job_evidence.py": "b3a351a7e144fb82c1e618aeb1ac898881f1b03c5cf87f416c61f0419a0ee61a",
