@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
 from prototype_job_evidence import Document
-from job_availability import _stamp
+from job_availability import CLOSED_TEXT, _stamp, has_jd_content, source_document
+from job_fit import jd_input
+from poster_ocr import is_candidate
 
 INTHISWORK_API = "https://inthiswork.com/wp-json/wp/v2/posts"
 _GREENHOUSE = {"boards.greenhouse.io", "job-boards.greenhouse.io"}
@@ -137,6 +139,54 @@ class SourcePosting:
     organization: str
     modified: str | None = None
 
+
+
+_SOURCE_NOTICE = re.compile(
+    r"(?:상세(?:한)?(?:내용|사항)은?)?(?:(?:채용)?공고|본문|원문|첨부(?:된)?|파일|이미지|포스터|아래|참조|참고|에서|을|를|의|\s)+"
+    r"(?:(?:참조|참고|확인)(?:바랍니다|하세요|해주세요|해주시기바랍니다)?|(?:찾을|확인할|읽을)수없습니다|없음)?[.!]?"
+)
+
+
+def has_review_text(doc):
+    labels = {item.get("text") for item in doc.get("links", []) if isinstance(item, dict)}
+    title = doc.get("title") or ""
+    labels.update((title, *title.split("｜")))
+    for line in jd_input(doc)["lines"]:
+        if not isinstance(line, str) or not line.strip() or line.strip() in labels:
+            continue
+        compact = "".join(line.split()).rstrip(".!：:")
+        if (not any(char.isalpha() for char in compact) or compact in {"마감", "마감일", "마감일시", "접수기간", "지원기간"}
+                or CLOSED_TEXT.fullmatch(line.strip()) or _SOURCE_NOTICE.fullmatch(compact)):
+            continue
+        return True
+    return False
+
+
+def official_jd(doc, locator, posting):
+    """Replace the body only after the adapter verified this employer and role."""
+    body = posting.body
+    if not has_jd_content({"lines": body.lines, "images": body.images, "links": body.links}):
+        return None
+    lines = list(body.lines)
+    for image in body.images:
+        alt = (image.get("alt") or "").strip()
+        if alt and alt not in lines and not role_key(alt).endswith(("로고", "logo")):
+            lines.append(alt)
+    base = source_document(doc)
+    fresh = {
+        **base, "lines": lines, "images": body.images,
+        "jd_source": {"source": locator.source, "url": locator.url, "original_id": locator.original_id},
+        "jd_organization": posting.organization,
+        "content_status": "text_available" if len("".join(lines)) >= 80 else "needs_review",
+    }
+    if not any(is_candidate(image) for image in body.images) and not has_review_text({**fresh, "links": body.links}):
+        return None
+    if source_name(doc) == "inthiswork":
+        fresh["listing_lines"] = base.get("listing_lines", base.get("lines", []))
+        fresh["listing_images"] = base.get("listing_images", base.get("images", []))
+    if posting.modified:
+        fresh["jd_modified_gmt"] = posting.modified
+    return fresh
 
 def _next_data(page):
     match = re.search(r"""<script\b[^>]*\bid=["']__NEXT_DATA__["'][^>]*>(.*?)</script\s*>""", page, re.S | re.I)

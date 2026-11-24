@@ -18,7 +18,7 @@ from .card_metadata import create_logo_tables, has_table
 from .company_logos import enqueue_logo, signal_logo_worker
 from .evidence import Document, application_link
 from .fit_digest import checked_link, dashboard_origin, review_decision, review_digest
-from .job_availability import _stamp, has_jd_content
+from .job_availability import _stamp, has_jd_content, source_document
 from .job_fit import evaluate_fit, jd_input, read_fit
 from .job_sources import INTHISWORK_API, linked_job_locator
 
@@ -124,10 +124,17 @@ def _job_links(doc):
 
 
 def preserve_jd(previous, listing):
-    if (previous.get("title") != listing["title"] or previous.get("url") != listing["url"]
-            or has_jd_content(listing) or not has_jd_content(previous)):
-        return listing
     origin = previous.get("jd_source")
+    if previous.get("poster_evidence") and not origin:
+        # A removed or replaced listing poster no longer supports the old OCR lines.
+        return previous if source_document(previous) == listing else listing
+    if (previous.get("title") != listing["title"] or previous.get("url") != listing["url"]
+            or not has_jd_content(previous)):
+        return listing
+    if has_jd_content(listing):
+        from .poster_evidence import poster_candidates
+        if not origin or not poster_candidates(listing):
+            return listing
     links = _job_links(listing)
     if origin:
         if (not isinstance(origin, dict) or not origin.get("url")
@@ -138,7 +145,7 @@ def preserve_jd(previous, listing):
         new_roles = {role for url in links if (role := linked_job_locator(listing, url))}
         if old_roles and new_roles and old_roles != new_roles:
             return listing
-    fields = ("lines", "images", "content_status", "jd_source", "jd_organization", "jd_modified_gmt")
+    fields = ("lines", "images", "content_status", "jd_source", "jd_organization", "jd_modified_gmt", "poster_evidence")
     return {**listing, "listing_lines": listing["lines"], "listing_images": listing["images"],
             **{key: previous[key] for key in fields if key in previous}}
 

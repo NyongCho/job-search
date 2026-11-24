@@ -77,8 +77,22 @@ def has_jd_content(doc):
     )
 
 
+def source_document(doc):
+    """Remove derived transcription when comparing the source or interpreting a deadline."""
+    evidence = doc.get("poster_evidence") if isinstance(doc, dict) else None
+    if not isinstance(evidence, dict) or not isinstance(evidence.get("source_lines"), list):
+        return doc
+    source = doc.copy()
+    del source["poster_evidence"]
+    source["lines"] = evidence["source_lines"]
+    if "source_content_status" in evidence:
+        source["content_status"] = evidence["source_content_status"]
+    return source
+
+
 def inspect_document(doc):
-    lines = doc.get("listing_lines", doc.get("lines", []))
+    source = source_document(doc)
+    lines = source.get("listing_lines", source.get("lines", []))
     if not isinstance(lines, list) or not all(isinstance(x, str) for x in lines):
         lines = []
     published = _stamp(doc.get("published_gmt"))
@@ -112,7 +126,7 @@ def inspect_document(doc):
 
 
 def document_version(doc):
-    return hashlib.sha256(json.dumps(doc, sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(source_document(doc), sort_keys=True).encode()).hexdigest()
 
 
 def _automatic(doc, cached):

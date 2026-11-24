@@ -18,7 +18,7 @@ from urllib.parse import unquote, urlsplit
 
 import fit_hermes
 from fit_digest import checked_link, dashboard_origin, review_decision, review_digest
-from job_availability import _stamp, availability, deadline_view
+from job_availability import _stamp, availability, deadline_view, source_document
 from job_fit import evaluate_fit, jd_input, profile_jd, read_fit, recommendation_group, stable_hash, validate_entry
 
 DEFAULT_BATCH_SIZE = 3
@@ -106,6 +106,17 @@ def _answer_facts(state, post_id, jd_version):
     return facts, max((row[2] for row in rows), default=None)
 
 
+def _bind_poster_answers(state, doc, version):
+    """Bind an answer about the same source to its first readable transcription."""
+    if (doc.get("poster_evidence") or {}).get("status") != "ready" or not _exists(state, "review_answers"):
+        return
+    source_version = stable_hash(jd_input(source_document(doc)))
+    if source_version != version:
+        # Move once. A later change to the poster's requirements must not inherit that answer again.
+        state.execute("""UPDATE OR IGNORE review_answers SET jd_version=? WHERE post_id=? AND jd_version=?""",
+                      (version, doc["id"], source_version))
+
+
 def _key(doc, profile, answers=None):
     parts = [RUBRIC, stable_hash(jd_input(doc)), stable_hash(profile)]
     if answers:
@@ -164,8 +175,9 @@ def migrate(jobs_path, state_path, *, profile=None):
             db.execute("INSERT INTO metadata VALUES('fit_s0',?)", (stable_hash(profile),))
             for row in db.execute("SELECT * FROM posts"):
                 db.execute(
-                    "INSERT INTO fit_delivery(post_id,execution_id) VALUES(?,?)",
-                    (row["id"], "legacy" if row["decision"] or row["reviewed_at"] else None),
+                    """INSERT INTO fit_delivery(post_id,execution_id) SELECT ?,
+                    CASE WHEN ? OR EXISTS (SELECT 1 FROM metadata WHERE key=?) THEN 'legacy' END""",
+                    (row["id"], bool(row["decision"] or row["reviewed_at"]), "poster_legacy_receipt:" + str(row["id"])),
                 )
                 fit = read_fit(row)
                 if fit:
@@ -337,6 +349,7 @@ def _publish(db, state, row, entry, fit, verified=None, *, use_previous_check=Tr
             row["id"],
         ),
     )
+    db.execute("DELETE FROM metadata WHERE key=?", ("poster_fit:" + str(row["id"]),))
     return doc, {**entry, "deadline": deadline}, decision, fit
 
 
@@ -360,6 +373,8 @@ def _slot(directory, count):
 
 
 def _batch(path, state_path, tasks, profile, fixed_profile, runner, slots, directory, finish):
+    from poster_review import hold_reason
+
     attempt = uuid.uuid4().hex
     maximum = int(os.environ.get("FIT_INPUT_CHAR_LIMIT", "60000"))
     with (
@@ -382,12 +397,20 @@ def _batch(path, state_path, tasks, profile, fixed_profile, runner, slots, direc
                     cached.append((task, "skipped", "공고가 존재하지 않습니다."))
                     continue
                 doc = json.loads(row["document"])
+                if row["id"] > 0 and (reason := hold_reason(doc)):
+                    cached.append((task, "skipped", reason))
+                    continue
                 jd = jd_input(doc)
                 version = stable_hash(jd)
-                if task.get("version", "").startswith("answer:") and task["version"] != "answer:" + version:
-                    cached.append((task, "skipped", "답변 이후 공고 내용이 변경됐어요."))
-                    continue
+                _bind_poster_answers(state, doc, version)
                 facts, revision = _answer_facts(state, row["id"], version)
+                if task.get("version", "").startswith("answer:") and task["version"] != "answer:" + version:
+                    # The form's original group can finish only if its receipt now belongs to this JD.
+                    if not facts or not state.execute("""SELECT 1 FROM review_answers
+                            WHERE post_id=? AND jd_version=? AND run_id=?""",
+                            (row["id"], version, task.get("run_id"))).fetchone():
+                        cached.append((task, "skipped", "답변 이후 공고 내용이 변경됐어요."))
+                        continue
                 key = _versioned_key(db, doc, profile, facts)
                 current = db.execute(
                     "SELECT input_key FROM fit_current WHERE post_id=?", (row["id"],)
@@ -599,8 +622,11 @@ def _complete(db, state, attempt, items, profile, fixed_profile, result, finish)
 
 
 def refresh_fit_tasks(
-    jobs_path, state_path, tasks, finish, *, profile=None, runner=None, batch_size=None, concurrency=None
+    jobs_path, state_path, tasks, finish, *, profile=None, runner=None, batch_size=None, concurrency=None,
+    poster_ids=None,
 ):
+    from poster_review import prepare_post
+
     fixed = profile is not None
     profile = read_profile() if profile is None else profile
     migrate(jobs_path, state_path, profile=profile)
@@ -616,8 +642,24 @@ def refresh_fit_tasks(
     def run_batch(work):
         path, group = work
         while group:
-            pending = _batch(path, state_path, group[:size], profile, fixed, runner, slots, directory, finish)
-            group = pending + group[size:]
+            batch, group = group[:size], group[size:]
+            ready = []
+            for task in batch:
+                reason = ""
+                if task["post_id"] > 0 and (poster_ids is None or task["post_id"] in poster_ids):
+                    try:
+                        reason = prepare_post(jobs_path, state_path, task["post_id"],
+                                              check_official=task.get("source_status") != "done")
+                    except (OSError, ValueError):
+                        finish(task, "failed", "채용 포스터의 원문을 준비하지 못했습니다.")
+                        continue
+                if reason:
+                    finish(task, "skipped", reason)
+                else:
+                    ready.append(task)
+            if ready:
+                pending = _batch(path, state_path, ready, profile, fixed, runner, slots, directory, finish)
+                group = pending + group
 
     if slots == 1:
         for group in groups:
@@ -675,7 +717,7 @@ def verify_openings(documents, *, fetch_page=None, fetch=None):
                 doc.get("apply_url")
                 and JOB_CATEGORIES.intersection(doc["categories"])
                 and (
-                    jd_input(doc) == jd_input(groups[i][1])
+                    jd_input(doc) == jd_input(source_document(groups[i][1]))
                     or (groups[i][1].get("jd_source") and doc["apply_url"] == groups[i][1].get("apply_url"))
                 )
             ):
@@ -691,6 +733,38 @@ def verify_openings(documents, *, fetch_page=None, fetch=None):
     return result
 
 
+def _scheduled_targets(db, state_path, execution_id):
+    from poster_backfill import select_posts
+    from poster_review import hold_reason
+
+    # A retry (including recovery before delivery) must use the same OCR budget and assessment inputs.
+    key = "poster_schedule:" + execution_id
+    saved = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+    if saved:
+        return json.loads(saved[0])
+    with closing(_db(state_path, "ro")) as state:
+        posters = [item["id"] for item in select_posts(db, state, limit=2, oldest_first=True)]
+    targets = posters.copy()
+    rows = db.execute("""SELECT post_id,document FROM fit_delivery JOIN posts ON posts.id=post_id
+        WHERE execution_id IS NULL OR EXISTS (SELECT 1 FROM metadata WHERE key='poster_fit:' || post_id)
+        ORDER BY attempted_at,post_id""")
+    for post_id, document in rows:
+        if post_id in posters:
+            continue
+        try:
+            doc = json.loads(document)
+            if not isinstance(doc, dict) or hold_reason(doc):
+                continue
+        except (AttributeError, KeyError, TypeError, ValueError):
+            # A malformed legacy JD must not block the other postings in this run.
+            continue
+        targets.append(post_id)
+        if len(targets) >= 100:
+            break
+    db.execute("INSERT INTO metadata VALUES(?,?)", (key, json.dumps([targets, posters])))
+    return targets, posters
+
+
 def scheduled_review(
     jobs_path,
     state_path,
@@ -702,6 +776,8 @@ def scheduled_review(
     ids=None,
     verifier=verify_openings,
 ):
+    from poster_review import hold_reason
+
     if dashboard_url:
         dashboard_url = dashboard_origin(dashboard_url)
     explicit = profile is not None
@@ -714,19 +790,18 @@ def scheduled_review(
             return "[SILENT]" if saved["delivered"] else saved["digest"]
         if db.execute("SELECT 1 FROM metadata WHERE key=?", ("fit_delivery:" + execution_id,)).fetchone():
             return "[SILENT]"
-        targets = db.execute(
-            """SELECT post_id FROM fit_delivery WHERE execution_id IS NULL AND
-            (? IS NULL OR post_id IN (SELECT value FROM json_each(?))) ORDER BY attempted_at,post_id LIMIT 100""",
-            (None if ids is None else 1, json.dumps(ids)),
-        ).fetchall()
-        target_ids = list(dict.fromkeys(ids))[:100] if ids is not None else [r[0] for r in targets]
+        if ids is None:
+            target_ids, poster_ids = _scheduled_targets(db, state_path, execution_id)
+        else:
+            target_ids, poster_ids = list(dict.fromkeys(ids))[:100], None
         db.execute(
             "UPDATE fit_delivery SET attempted_at=? WHERE post_id IN (SELECT value FROM json_each(?))",
             (time.time(), json.dumps(target_ids)),
         )
     tasks = [dict(id=f"cron:{execution_id}:{post_id}", post_id=post_id, version="") for post_id in target_ids]
     refresh_fit_tasks(
-        jobs_path, state_path, tasks, lambda *args: None, profile=profile if explicit else None, runner=runner
+        jobs_path, state_path, tasks, lambda *args: None, profile=profile if explicit else None, runner=runner,
+        poster_ids=poster_ids,
     )
     # Network verification runs outside SQLite write locks. The fingerprint is checked again before delivery.
     docs, versions = [], {}
@@ -761,6 +836,8 @@ def scheduled_review(
             if not row:
                 continue
             document = json.loads(row["document"])
+            if hold_reason(document):
+                continue
             answers, _ = _answer_facts(state, row["id"], stable_hash(jd_input(document)))
             key = _versioned_key(db, document, current, answers)
             saved = db.execute(
@@ -791,6 +868,7 @@ def scheduled_review(
                 (execution_id, digest, json.dumps([execution_id])),
             )
         db.execute("INSERT INTO metadata VALUES(?,?)", ("fit_delivery:" + execution_id, "1"))
+        db.execute("DELETE FROM metadata WHERE key=?", ("poster_schedule:" + execution_id,))
         return digest
 
 

@@ -68,12 +68,11 @@ def parse_entries(text):
     return json.loads(fenced[1] if fenced else stripped)
 
 
-def run(attempt, profile, docs, directory, lock_fds):
+def run_adapter(adapter, args, *, payload, lock_fds=(), stdout=subprocess.DEVNULL, timeout=None):
     home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
     repo = Path(os.environ.get("HERMES_REPO", home / "hermes-agent"))
     resolver = repo / "venv/bin/python"
     python = os.environ.get("HERMES_PYTHON") or (str(resolver) if resolver.exists() else sys.executable)
-    adapter = str(Path(__file__).resolve())
     lock_fds = (lock_fds,) if isinstance(lock_fds, int) else lock_fds
     # Managed Hermes selects its own dependency generation and Python ABI before imports.
     # The first interpreter resolves the launch command only and leaves stdin untouched.
@@ -84,21 +83,28 @@ def run(attempt, profile, docs, directory, lock_fds):
         "code=\"sys.argv.pop(0); runpy.run_path(sys.argv[0],run_name='__main__')\"); "
         "os.execv(command[0],command)"
     )
-    private = any(doc.get("answer_facts") for doc in docs)
-    command = [python, "-c", launcher, adapter, str(directory), attempt]
-    if private:
-        command.append("--private")
-    subprocess.run(
-        command,
-        input=json.dumps([profile, docs], ensure_ascii=False) if private else prompt(profile, docs),
+    return subprocess.run(
+        [python, "-c", launcher, str(adapter), *args],
+        input=payload,
         text=True,
         cwd=repo,
         env={**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(repo)},
-        stdout=subprocess.DEVNULL,
+        stdout=stdout,
+        timeout=timeout,
         stderr=subprocess.DEVNULL,
         pass_fds=lock_fds,
         check=True,
     )
+
+
+def run(attempt, profile, docs, directory, lock_fds):
+    args = [str(directory), attempt]
+    if any(doc.get("answer_facts") for doc in docs):
+        args.append("--private")
+        payload = json.dumps([profile, docs], ensure_ascii=False)
+    else:
+        payload = prompt(profile, docs)
+    run_adapter(Path(__file__).resolve(), args, payload=payload, lock_fds=lock_fds)
 
 
 def private_receipt(result, profile, doc):

@@ -46,3 +46,6 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# Public poster originals and durable model receipts next to a jobs database
+*.posters/
