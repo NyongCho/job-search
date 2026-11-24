@@ -326,34 +326,40 @@ blockquote { margin: 14px 0; border-left: 2px solid #c6d9ce; padding: 3px 0 3px 
 .refresh-run { padding: 10px 14px; background: white; border: 1px solid var(--line); border-radius: 10px; }
 .refresh-run + .refresh-run { margin-top: 6px; }
 .main-shell > .refresh-status { max-height: 32vh; overflow-y: auto; flex-shrink: 0; }
-.refresh-summary, .refresh-kind > div { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-.refresh-summary a { margin-left: auto; text-decoration: underline; white-space: nowrap; }
-.refresh-total, .refresh-kind { font-variant-numeric: tabular-nums; }
+.refresh-summary { display: flex; align-items: baseline; gap: 4px 8px; flex-wrap: wrap; }
+.refresh-summary > strong { font-size: 14px; }
+.refresh-summary a { margin-left: auto; color: #505e69; text-decoration: underline; white-space: nowrap; }
+.refresh-total { margin: 4px 0 0; font-size: 13px; font-variant-numeric: tabular-nums; }
 .refresh-badge { padding: 1px 7px; border-radius: 4px; background: #e9f1f8; color: #285078; font-weight: 650; }
 .refresh-run[data-outcome="complete"] .refresh-badge { background: var(--teal-light); color: #15594d; }
 .refresh-run[data-outcome="failed"] .refresh-badge { background: #fae9dd; color: #783e13; }
-.refresh-kinds { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 8px; }
+.refresh-run[data-outcome="empty"] .refresh-badge { background: #eef1f3; color: #4e5965; }
+.refresh-kinds { display: grid; grid-template-columns: repeat(auto-fit, minmax(0, 1fr)); gap: 12px; margin: 8px 0 0; border-top: 1px solid var(--line); padding-top: 8px; }
+.refresh-kind { font-variant-numeric: tabular-nums; }
+.refresh-kind dt { font-weight: 650; }
+.refresh-kind [data-kind-count] { margin-left: 4px; color: #505e69; font-weight: 400; }
+.refresh-kind dd { margin: 2px 0 0; word-break: keep-all; overflow-wrap: anywhere; }
+.refresh-kind[data-failed="true"] dt { color: #96481f; }
 .refresh-task-list { margin: 8px 0 0; }
 .refresh-task-list > div { display: grid; grid-template-columns: 5em minmax(0, 1fr); padding: 6px 0; border-top: 1px solid var(--line); }
 .refresh-task-list dt { font-weight: 650; }
-.refresh-task-list dd { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 8px; margin: 0; }
+.refresh-task-list dd { display: grid; grid-template-columns: 4em minmax(0, 1fr); align-items: baseline; column-gap: 8px; margin: 0; }
 .refresh-task-list [data-task-message] { color: #505e69; overflow-wrap: anywhere; }
 .refresh-task-list [data-state="failed"] strong { color: #96481f; }
 .refresh-task-list [data-state="done"] strong { color: #15594d; }
-.refresh-kind > div { justify-content: space-between; gap: 4px; }
-.refresh-kind small { display: block; color: #505e69; font-size: 11px; }
-.refresh-run progress { display: block; width: 100%; height: 5px; margin: 5px 0; border: 0; border-radius: 4px; overflow: hidden; appearance: none; background: #e6ebea; color: var(--teal); }
-.refresh-run > progress { height: 8px; margin-top: 8px; }
+.refresh-run progress:not([hidden]) { display: block; width: 100%; height: 4px; margin: 6px 0 0; border: 0; border-radius: 4px; overflow: hidden; appearance: none; background: #e6ebea; color: var(--teal); }
 .refresh-run progress::-webkit-progress-bar { background: #e6ebea; }
-.refresh-run[data-outcome="failed"] > progress, .refresh-kind[data-failed="true"] { --bar-color: #a65c1f; }
-.refresh-run progress::-webkit-progress-value { background: var(--bar-color, var(--teal)); }
-.refresh-run progress::-moz-progress-bar { background: var(--bar-color, var(--teal)); }
+.refresh-run progress::-webkit-progress-value { background: var(--teal); }
+.refresh-run progress::-moz-progress-bar { background: var(--teal); }
 .usage-report { margin: 32px auto; width: min(480px, 90%); }
 .usage-report dl { padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: white; }
 .usage-report dl div { display: flex; justify-content: space-between; padding: 7px 0; }
 .usage-report dd { font-weight: 650; font-variant-numeric: tabular-nums; }
 @media (max-width: 640px) {
   .skeleton-card { padding: 20px 18px; }
+  .refresh-kinds { grid-template-columns: 1fr; gap: 4px; }
+  .refresh-kind { display: grid; grid-template-columns: minmax(7em, auto) 1fr; gap: 8px; align-items: baseline; }
+  .refresh-kind dd { margin: 0; }
   .has-detail .main-shell > .refresh-status { display: none; }
   .job-detail > .refresh-status:has([data-refresh-status]:not(:empty)), .job-detail > .refresh-status:has(a) { display: block; margin: 10px 0; }
 }

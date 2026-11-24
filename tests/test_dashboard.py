@@ -111,6 +111,16 @@ class WebTests(unittest.TestCase):
         baselines = json.loads(unescape(re.search(r"data-runs='([^']+)'", html)[1]))
         self.assertEqual([item["id"] for item in baselines], [run.json["id"]])
 
+    def test_refresh_has_one_overall_bar_and_names_each_task_in_both_panes(self):
+        run = self.post("/refreshes", {}, self.csrf()).json
+        page = self.get("/jobs/1", headers={**self.identity, "X-Dashboard-Snapshot": "1"}).get_data(as_text=True)
+        listing, detail = page.split('<article id="job-detail"', 1)
+        for pane, field in [(listing, "kind"), (detail, "task")]:
+            with self.subTest(field=field):
+                self.assertEqual(pane.count("<progress"), 1)
+                self.assertEqual(re.findall(fr'data-{field}="([^"]+)"', pane), ["deadline", "logo", "fit"])
+                self.assertIn(f'href="/refreshes/{run["id"]}?view=usage"', pane)
+
     def test_expired_tab_observes_a_pending_recommendation_entering_the_list(self):
         from job_search.refresh_job_availability import write_facts
 
@@ -307,6 +317,15 @@ class WebTests(unittest.TestCase):
         self.assertIn("답변을 저장했어요", detail)
         self.assertNotIn('class="review-answer-form"', detail)
         self.assertNotIn(fields["answer"], detail)
+
+    def test_answer_reevaluation_only_displays_fit_in_both_panes(self):
+        action, fields = self.answer_form()
+        self.client.post(action, base_url=self.base, headers=self.identity, data=fields)
+        snapshot = self.get("/jobs/5?view=processing_hold",
+                            headers={**self.identity, "X-Dashboard-Snapshot": "1"}).get_data(as_text=True)
+        self.assertIn("적합도 재평가", snapshot)
+        self.assertEqual(re.findall(r'data-kind="([^"]+)"', snapshot), ["fit"])
+        self.assertEqual(re.findall(r'data-task="([^"]+)"', snapshot), ["fit"])
 
     def test_answer_form_rejects_unauthorized_invalid_and_stale_submissions(self):
         action, fields = self.answer_form()
