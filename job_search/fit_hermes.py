@@ -58,12 +58,11 @@ def parse_entries(text):
     return json.loads(fenced[1] if fenced else stripped)
 
 
-def run(attempt, profile, docs, directory, lock_fds):
+def run_adapter(adapter, args, *, payload, lock_fds=(), stdout=subprocess.DEVNULL, timeout=None):
     home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
     repo = Path(os.environ.get("HERMES_REPO", home / "hermes-agent"))
     resolver = repo / "venv/bin/python"
     python = os.environ.get("HERMES_PYTHON") or (str(resolver) if resolver.exists() else sys.executable)
-    adapter = str(Path(__file__).resolve())
     lock_fds = (lock_fds,) if isinstance(lock_fds, int) else lock_fds
     # Managed Hermes selects its own dependency generation and Python ABI before imports.
     # The first interpreter resolves the launch command only and leaves stdin untouched.
@@ -74,17 +73,22 @@ def run(attempt, profile, docs, directory, lock_fds):
         "code=\"sys.argv.pop(0); runpy.run_path(sys.argv[0],run_name='__main__')\"); "
         "os.execv(command[0],command)"
     )
-    subprocess.run(
-        [python, "-c", launcher, adapter, str(directory), attempt],
-        input=prompt(profile, docs),
+    return subprocess.run(
+        [python, "-c", launcher, str(adapter), *args],
+        input=payload,
         text=True,
         cwd=repo,
         env={**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(repo)},
-        stdout=subprocess.DEVNULL,
+        stdout=stdout,
+        timeout=timeout,
         stderr=subprocess.DEVNULL,
         pass_fds=lock_fds,
         check=True,
     )
+
+
+def run(attempt, profile, docs, directory, lock_fds):
+    run_adapter(Path(__file__).resolve(), [str(directory), attempt], payload=prompt(profile, docs), lock_fds=lock_fds)
 
 
 def recover(directory, attempt):

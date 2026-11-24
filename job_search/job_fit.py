@@ -194,5 +194,10 @@ def jd_input(doc):
               and not (company and logo_alt.fullmatch(str(im.get("alt", "")).strip()))]
     lines = ["" if isinstance(line,str) and _CALENDAR_LINE.fullmatch(line.strip()) else line
              for line in doc.get("lines", [])]
-    return {"title": doc.get("title", ""), "lines": lines, "images": images,
-            "source": doc.get("jd_source") or doc.get("url", "")}
+    # Layout hints filter decorative assets during OCR. A hint alone does not change the JD.
+    images = [{k: v for k, v in im.items() if k not in ("width", "height")} for im in images]
+    jd = {"title": doc.get("title", ""), "lines": lines, "images": images,
+          "source": doc.get("jd_source") or doc.get("url", "")}
+    if evidence := doc.get("poster_evidence"):
+        jd["poster_status"] = evidence.get("status")
+    return jd
